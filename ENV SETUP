@@ -1,0 +1,17 @@
+TESTMODERECIPIENT = (
+    os.getenv("TESTMODERECIPIENT")
+    or os.getenv("CLOCKINALERTTESTEMAIL")
+    or os.getenv("CLOCKINROLLUPTESTEMAIL")
+    or "alerts@example.com"
+)
+
+STATUSEMAILRECIPIENT = (
+    os.getenv("STATUSEMAILRECIPIENT")
+    or os.getenv("CLOCKINALERTSTATUSEMAIL")
+    or "alerts@example.com"
+)
+
+PRODRECIPIENTS = [
+    "user1@example.com",
+    "user2@example.com",
+]

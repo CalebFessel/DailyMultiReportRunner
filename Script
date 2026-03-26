@@ -1,0 +1,1528 @@
+"""
+Daily Multi-Report Runner
+
+Generates a bundle of operational Excel reports (OTP, staffing, vehicle,
+and utilization) for a configurable midnight-to-midnight reporting window.
+
+Configuration is provided via environment variables (see README for details).
+"""
+
+import os
+import sys
+import ssl
+import re
+import logging
+from datetime import datetime, timedelta, time
+from pathlib import Path
+from email.message import EmailMessage
+from zoneinfo import ZoneInfo
+
+import pyodbc
+import pandas as pd
+import smtplib
+
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
+
+# Optional dotenv (for local development)
+try:
+    from dotenv import load_dotenv
+
+    # Example path; override via standard dotenv discovery if preferred
+    load_dotenv(r".env")
+except ImportError:
+    pass
+
+# ============================================================
+# BASIC LOGGING (will be reconfigured per run by setup_logging)
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+
+# =============================
+# WINDOW HELPERS
+# =============================
+def window_midnight(report_end_date=None, now_dt=None):
+    """
+    Returns (window_start, window_end) for a midnight → midnight reporting window.
+
+    - Default behavior (no CLI date): run for yesterday (00:00 → today 00:00).
+    - Backfill behavior: if CLI YYYY-MM-DD is provided, that day 00:00 → next day 00:00.
+    """
+    if now_dt is None:
+        now_dt = datetime.now()
+    if report_end_date is None:
+        day = now_dt.date() - timedelta(days=1)
+    else:
+        day = report_end_date
+    window_start = datetime.combine(day, time(0, 0))
+    window_end = window_start + timedelta(days=1)
+    return window_start, window_end
+
+
+def parse_cli_end_date(argv):
+    """
+    Parses an optional YYYY-MM-DD date from argv, ignoring flags like --no-email.
+    Returns a date or None.
+    """
+    for arg in argv[1:]:
+        if arg.startswith("-"):
+            continue
+        try:
+            return datetime.strptime(arg.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+    return None
+
+
+def has_flag(argv, flag: str) -> bool:
+    flag = flag.lower()
+    return any(a.lower() == flag for a in argv[1:])
+
+
+# =============================
+# CONFIG
+# =============================
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "Reports")
+APPEND_DIR = os.path.join(OUTPUT_DIR, "Append")  # append output folder
+
+RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "14"))
+APPEND_RETENTION_DAYS = int(os.getenv("APPEND_RETENTION_DAYS", "730"))  # default: 2 years
+
+DB_DSN = os.getenv("DB_DSN") or os.getenv("TS_DSN", "MyReportingDSN")
+
+TEST_MODE = os.getenv("TEST_MODE", "false").strip().lower() in ("1", "true", "yes", "y")
+TEST_MODE_RECIPIENT = (
+    os.getenv("TEST_MODE_RECIPIENT")
+    or os.getenv("REPORT_TEST_EMAIL")
+    or "reports-test@example.com"
+)
+
+STATUS_EMAIL_RECIPIENT = (
+    os.getenv("STATUS_EMAIL_RECIPIENT")
+    or os.getenv("REPORT_STATUS_EMAIL")
+    or "reports-status@example.com"
+)
+
+PROD_RECIPIENTS = [
+    "user1@example.com",
+    "user2@example.com",
+    "user3@example.com",
+]
+
+EMAIL_SUBJECT = "Daily Reports Bundle - {date}{test_suffix}"
+EXCEL_TABLE_STYLE = os.getenv("EXCEL_TABLE_STYLE", "TableStyleMedium9")
+
+OTP_EXCLUDED_COST_CENTERS = (
+    "CPR",
+    "Training and Other Services",
+    "Admin - Non Providers",
+)
+ENABLE_OTP_RECONCILIATION_SHEET = True
+
+# =============================
+# PARAM / MARKER HELPERS
+# =============================
+def _sql_marker_count(sql: str) -> int:
+    """Count ODBC positional parameters ('?') in the SQL string."""
+    return sql.count("?")
+
+
+def _normalize_params(params):
+    """
+    Normalize params into a list.
+    Accepts: None, scalar, tuple/list.
+    """
+    if params is None:
+        return []
+    if isinstance(params, (list, tuple)):
+        return list(params)
+    return [params]
+
+
+def _expand_params_to_markers(sql: str, params, label: str = "SQL"):
+    """
+    Ensure params length matches number of '?' markers in sql.
+
+    Rules:
+    - If markers == 0 -> []
+    - If params length matches -> params
+    - If params is length 1 and markers > 1 -> repeat
+    - If markers divisible by len(params) -> repeat pattern
+    - Else: raise
+    """
+    markers = _sql_marker_count(sql)
+    p = _normalize_params(params)
+    if markers == 0:
+        return []
+    if len(p) == markers:
+        return p
+    if len(p) == 1 and markers > 1:
+        return p * markers
+    if len(p) > 0 and markers % len(p) == 0:
+        return p * (markers // len(p))
+    raise ValueError(f"[{label}] Parameter mismatch: SQL markers={markers}, params_len={len(p)}")
+
+
+# =============================
+# SQL - OTP (MySQL-compatible)
+# =============================
+def build_sql_otp_queries():
+    """
+    Dedup strategy:
+    - Build a leg-level base rowset (may have multiple rows per run_id).
+    - Create a deterministic pick_key: pickup_time + leg.id (tie-break).
+    - For each run_id, choose MIN(pick_key), join back to get exactly one row per run_id.
+    """
+    sql_otp_base = r"""
+    SELECT
+        ep.run_id,
+        rev.unit_id,
+        rev.calltype_id,
+        rev.pickup_time,
+        ep.field_value,
+        CONCAT(
+            DATE_FORMAT(rev.pickup_time,'%Y%m%d%H%i%s'),
+            '-',
+            LPAD(leg.id, 10, '0')
+        ) AS pick_key
+    FROM cad_trip_legs leg
+    INNER JOIN cad_trip_legs_rev rev
+        ON rev.leg_id = leg.id AND rev.rev = leg.rev
+    /* Pre-filter ePCR to the same reporting window using a date field */
+    INNER JOIN (
+        SELECT
+            r.id AS run_id,
+            r.run_num,
+            v.field_value
+        FROM epcr_v2_runs r
+        INNER JOIN epcr_v2_custom_configs cfg
+            ON cfg.id = r.config_id
+           AND cfg.field_table_id = 3
+        INNER JOIN (
+            SELECT run_id, MIN(field_value) AS field_value
+            FROM epcr_v2_values
+            WHERE field_id = 549
+            GROUP BY run_id
+        ) v ON v.run_id = r.id
+        WHERE r.deleted = 0
+          AND STR_TO_DATE(v.field_value, '%Y-%m-%d %H:%i:%s') >= ?
+          AND STR_TO_DATE(v.field_value, '%Y-%m-%d %H:%i:%s') < ?
+    ) ep
+        ON ep.run_num = leg.run_number
+    WHERE rev.pickup_time >= ?
+      AND rev.pickup_time < ?
+      AND rev.last_status_id IN (2,3,4,5,6,7)
+    """
+
+    sql_otp_dedup = r"""
+    SELECT
+        b.run_id,
+        b.unit_id,
+        b.calltype_id,
+        b.pickup_time,
+        b.field_value
+    FROM ({base}) b
+    INNER JOIN (
+        SELECT run_id, MIN(pick_key) AS min_pick_key
+        FROM ({base}) x
+        GROUP BY run_id
+    ) d
+        ON d.run_id = b.run_id AND d.min_pick_key = b.pick_key
+    """.format(base=sql_otp_base)
+
+    sql_uniq_cc = r"""
+    SELECT stsa.unit_id, MIN(su.cost_center_id) AS cost_center_id
+    FROM sched_template_shift_assignments stsa
+    INNER JOIN sched_units su ON su.id = stsa.unit_id
+    WHERE stsa.deleted = 0
+    GROUP BY stsa.unit_id
+    """
+
+    sql_scored = r"""
+    SELECT
+        one.run_id,
+        one.unit_id,
+        one.calltype_id,
+        CASE
+            WHEN one.pickup_time IS NULL OR one.field_value IS NULL THEN 'Missing Data'
+            WHEN TIMESTAMPDIFF(
+                MINUTE,
+                one.pickup_time,
+                STR_TO_DATE(one.field_value, '%Y-%m-%d %H:%i:%s')
+            ) BETWEEN -10 AND 10 THEN 'On Time'
+            WHEN TIMESTAMPDIFF(
+                MINUTE,
+                one.pickup_time,
+                STR_TO_DATE(one.field_value, '%Y-%m-%d %H:%i:%s')
+            ) < -10 THEN 'Early'
+            ELSE 'Late'
+        END AS status
+    FROM ({dedup}) one
+    """.format(dedup=sql_otp_dedup)
+
+    excluded_list = ",".join("'" + x.replace("'", "''") + "'" for x in OTP_EXCLUDED_COST_CENTERS)
+
+    sql_by_calltype = r"""
+    SELECT
+        COALESCE(TRIM(cc.name), 'No Cost Center Assigned') AS cost_center,
+        COALESCE(calltype.name, 'Unknown Call Type') AS call_type,
+        COUNT(*) AS total_runs,
+        SUM(s.status = 'Early') AS early_runs,
+        SUM(s.status = 'On Time') AS on_time_runs,
+        SUM(s.status = 'Late') AS late_runs,
+        ROUND(
+            100 * (SUM(s.status = 'On Time') + SUM(s.status = 'Early')) / COUNT(*),
+            2
+        ) AS on_time_percentage
+    FROM ({scored}) s
+    LEFT JOIN ({uniq_cc}) ucc ON ucc.unit_id = s.unit_id
+    LEFT JOIN cost_centers cc ON cc.id = ucc.cost_center_id
+    LEFT JOIN sched_unit_types calltype ON calltype.id = s.calltype_id
+    WHERE (cc.name IS NULL OR cc.name NOT IN ({excluded}))
+    GROUP BY
+        COALESCE(TRIM(cc.name), 'No Cost Center Assigned'),
+        COALESCE(calltype.name, 'Unknown Call Type')
+    ORDER BY cost_center, on_time_percentage DESC;
+    """.format(scored=sql_scored, uniq_cc=sql_uniq_cc, excluded=excluded_list)
+
+    sql_by_costcenter = r"""
+    SELECT
+        COALESCE(TRIM(cc.name), 'No Cost Center Assigned') AS cost_center,
+        COUNT(*) AS total_runs,
+        SUM(s.status = 'Early') AS early_runs,
+        SUM(s.status = 'On Time') AS on_time_runs,
+        SUM(s.status = 'Late') AS late_runs,
+        ROUND(
+            100 * (SUM(s.status = 'On Time') + SUM(s.status = 'Early')) / COUNT(*),
+            2
+        ) AS on_time_percentage
+    FROM ({scored}) s
+    LEFT JOIN ({uniq_cc}) ucc ON ucc.unit_id = s.unit_id
+    LEFT JOIN cost_centers cc ON cc.id = ucc.cost_center_id
+    WHERE (cc.name IS NULL OR cc.name NOT IN ({excluded}))
+    GROUP BY COALESCE(TRIM(cc.name), 'No Cost Center Assigned')
+    ORDER BY on_time_percentage DESC;
+    """.format(scored=sql_scored, uniq_cc=sql_uniq_cc, excluded=excluded_list)
+
+    return sql_by_calltype, sql_by_costcenter
+
+
+SQL_OTP_BY_CALLTYPE, SQL_OTP_BY_COSTCENTER = build_sql_otp_queries()
+
+# =============================
+# SQL - Staffing Report (Backfill-ready)
+# =============================
+SQL_STAFFING_ACTIVE_NOW = r"""
+SELECT
+    u.name AS shift_profile,
+    cc.name AS cost_center,
+    stsa.start_time,
+    stsa.end_time,
+    COUNT(DISTINCT stsa.user_id) AS crew_count,
+    GROUP_CONCAT(
+        DISTINCT CONCAT(users.first_name, ' ', users.last_name, ' (ID ', users.user_id, ')')
+        SEPARATOR '\n'
+    ) AS crew_members
+FROM ems_app.sched_template_shift_assignments stsa
+JOIN ems_app.users
+    ON users.user_id = stsa.user_id
+JOIN ems_app.sched_units u
+    ON u.id = stsa.unit_id
+JOIN ems_app.cost_centers cc
+    ON cc.id = u.cost_center_id
+JOIN ems_app.sched_unit_personnel sup
+    ON sup.unit_id = u.id
+JOIN ems_app.sched_unit_certification_templates suct
+    ON suct.id = sup.certification_template_id
+WHERE
+    stsa.deleted = '0'
+    AND stsa.published = 'true'
+    AND stsa.user_id IS NOT NULL
+    AND (stsa.timeoff_type IS NULL OR stsa.timeoff_type NOT IN ('absent', 'noshow', 'lwop'))
+    AND ? BETWEEN stsa.start_time AND stsa.end_time
+    AND cc.name NOT LIKE '%Dispatch%'
+    AND cc.name NOT LIKE '%CPR%'
+    AND cc.name NOT LIKE '%Training%'
+    AND cc.name NOT LIKE '%Admin%'
+    AND suct.id NOT IN (101, 102, 103, 104)
+GROUP BY
+    u.id, stsa.start_time, stsa.end_time
+HAVING
+    COUNT(DISTINCT stsa.user_id) > 2
+ORDER BY
+    cost_center, shift_profile, stsa.start_time;
+"""
+
+SQL_STAFFING_TOMORROW = r"""
+SELECT
+    u.name AS shift_profile,
+    cc.name AS cost_center,
+    stsa.start_time,
+    stsa.end_time,
+    COUNT(DISTINCT stsa.user_id) AS crew_count,
+    GROUP_CONCAT(
+        DISTINCT CONCAT(users.first_name, ' ', users.last_name, ' (ID ', users.user_id, ')')
+        SEPARATOR '\n'
+    ) AS crew_members
+FROM ems_app.sched_template_shift_assignments stsa
+JOIN ems_app.users
+    ON users.user_id = stsa.user_id
+JOIN ems_app.sched_units u
+    ON u.id = stsa.unit_id
+JOIN ems_app.cost_centers cc
+    ON cc.id = u.cost_center_id
+JOIN ems_app.sched_unit_personnel sup
+    ON sup.unit_id = u.id
+JOIN ems_app.sched_unit_certification_templates suct
+    ON suct.id = sup.certification_template_id
+WHERE
+    stsa.deleted = '0'
+    AND stsa.published = 'true'
+    AND stsa.user_id IS NOT NULL
+    AND (stsa.timeoff_type IS NULL OR stsa.timeoff_type NOT IN ('absent', 'noshow', 'lwop'))
+    AND DATE(stsa.start_time) = ?
+    AND cc.name NOT LIKE '%Dispatch%'
+    AND cc.name NOT LIKE '%CPR%'
+    AND cc.name NOT LIKE '%Training%'
+    AND cc.name NOT LIKE '%Admin%'
+    AND suct.id NOT IN (101, 102, 103, 104)
+GROUP BY
+    u.id, stsa.start_time, stsa.end_time
+HAVING
+    COUNT(DISTINCT stsa.user_id) > 2
+ORDER BY
+    cost_center, shift_profile, stsa.start_time;
+"""
+
+# =============================
+# SQL - Vehicle & UHU
+# (structure preserved, IDs anonymized)
+# =============================
+SQL_VEH_SUMMARY = r"""
+SELECT
+    (SELECT COUNT(*)
+     FROM sched_vehicles v
+     WHERE v.status IN (37, 38)
+       AND v.deleted = 0
+       AND v.status <> 39
+       AND v.id NOT IN (1001, 1002, 1003)
+       AND (
+           v.status_reason NOT LIKE '%duplicate%'
+           AND v.status_reason NOT LIKE '%retired%'
+           AND v.status_reason NOT LIKE '%disposed%'
+           AND v.status_reason NOT LIKE '%test%'
+           AND v.status_reason NOT LIKE 'Equipment:%'
+       )
+    ) AS total_trucks,
+    (SELECT COUNT(*)
+     FROM sched_vehicles v
+     WHERE v.status = 37
+       AND v.deleted = 0
+       AND v.status <> 39
+       AND v.id NOT IN (1001, 1002, 1003)
+       AND (
+           v.status_reason NOT LIKE '%duplicate%'
+           AND v.status_reason NOT LIKE '%retired%'
+           AND v.status_reason NOT LIKE '%disposed%'
+           AND v.status_reason NOT LIKE '%test%'
+           AND v.status_reason NOT LIKE 'Equipment:%'
+       )
+    ) AS in_service_trucks,
+    (SELECT COUNT(*)
+     FROM sched_vehicles v
+     WHERE v.status = 38
+       AND v.deleted = 0
+       AND v.status <> 39
+       AND v.id NOT IN (1001, 1002, 1003)
+       AND (
+           v.status_reason NOT LIKE '%duplicate%'
+           AND v.status_reason NOT LIKE '%retired%'
+           AND v.status_reason NOT LIKE '%disposed%'
+           AND v.status_reason NOT LIKE '%test%'
+           AND v.status_reason NOT LIKE 'Equipment:%'
+       )
+    ) AS out_of_service_trucks,
+    (SELECT COUNT(DISTINCT stsa.vehicle_id)
+     FROM sched_template_shift_assignments stsa
+     JOIN sched_units u ON u.id = stsa.unit_id
+     JOIN sched_vehicles v ON v.id = stsa.vehicle_id
+     WHERE DATE(stsa.start_time) = ?
+       AND stsa.vehicle_id IS NOT NULL
+       AND stsa.vehicle_id NOT IN (1001, 1002, 1003)
+       AND u.name NOT LIKE '%dispatch%'
+       AND u.name NOT LIKE '%communications%'
+       AND v.status = 37
+       AND v.deleted = 0
+       AND v.status <> 39
+       AND (
+           v.status_reason NOT LIKE '%duplicate%'
+           AND v.status_reason NOT LIKE '%retired%'
+           AND v.status_reason NOT LIKE '%disposed%'
+           AND v.status_reason NOT LIKE '%test%'
+           AND v.status_reason NOT LIKE 'Equipment:%'
+       )
+    ) AS trucks_used_today,
+    (SELECT COUNT(*)
+     FROM sched_vehicles v
+     WHERE v.status = 37
+       AND v.deleted = 0
+       AND v.status <> 39
+       AND v.id NOT IN (1001, 1002, 1003)
+       AND (
+           v.status_reason NOT LIKE '%duplicate%'
+           AND v.status_reason NOT LIKE '%retired%'
+           AND v.status_reason NOT LIKE '%disposed%'
+           AND v.status_reason NOT LIKE '%test%'
+           AND v.status_reason NOT LIKE 'Equipment:%'
+       )
+       AND v.id NOT IN (
+           SELECT DISTINCT stsa.vehicle_id
+           FROM sched_template_shift_assignments stsa
+           JOIN sched_units u ON u.id = stsa.unit_id
+           JOIN sched_vehicles v2 ON v2.id = stsa.vehicle_id
+           WHERE DATE(stsa.start_time) = ?
+             AND stsa.vehicle_id IS NOT NULL
+             AND stsa.vehicle_id NOT IN (1001, 1002, 1003)
+             AND u.name NOT LIKE '%dispatch%'
+             AND u.name NOT LIKE '%communications%'
+             AND v2.status = 37
+             AND v2.deleted = 0
+             AND v2.status <> 39
+             AND (
+                 v2.status_reason NOT LIKE '%duplicate%'
+                 AND v2.status_reason NOT LIKE '%retired%'
+                 AND v2.status_reason NOT LIKE '%disposed%'
+                 AND v2.status_reason NOT LIKE '%test%'
+                 AND v2.status_reason NOT LIKE 'Equipment:%'
+             )
+       )
+    ) AS unused_in_service_trucks,
+    (SELECT COUNT(*)
+     FROM sched_template_shift_assignments stsa
+     JOIN sched_shift_assignments ssa ON ssa.shift_id = stsa.id
+     JOIN sched_units u ON u.id = stsa.unit_id
+     WHERE DATE(stsa.start_time) = ?
+       AND stsa.vehicle_id IS NULL
+       AND ssa.user_id IS NOT NULL
+       AND u.name NOT LIKE '%dispatch%'
+       AND u.name NOT LIKE '%communications%'
+    ) AS shifts_missing_trucks;
+"""
+
+SQL_VEH_UNUSED_IN_SERVICE_LIST = r"""
+SELECT
+    v.id AS vehicle_id,
+    v.name AS vehicle_name,
+    cc.name AS owned_by_cost_center,
+    v.status_reason
+FROM sched_vehicles v
+LEFT JOIN cost_centers cc ON cc.id = v.cost_center_id
+WHERE v.status = 37
+  AND v.deleted = 0
+  AND v.status <> 39
+  AND v.id NOT IN (1001, 1002, 1003)
+  AND (
+      v.status_reason NOT LIKE '%duplicate%'
+      AND v.status_reason NOT LIKE '%retired%'
+      AND v.status_reason NOT LIKE '%disposed%'
+      AND v.status_reason NOT LIKE '%test%'
+      AND v.status_reason NOT LIKE 'Equipment:%'
+  )
+  AND v.id NOT IN (
+      SELECT DISTINCT stsa.vehicle_id
+      FROM sched_template_shift_assignments stsa
+      JOIN sched_units su ON su.id = stsa.unit_id
+      JOIN sched_vehicles v2 ON v2.id = stsa.vehicle_id
+      WHERE DATE(stsa.start_time) = ?
+        AND stsa.vehicle_id IS NOT NULL
+        AND stsa.vehicle_id NOT IN (1001, 1002, 1003)
+        AND su.name NOT LIKE '%dispatch%'
+        AND su.name NOT LIKE '%communications%'
+        AND v2.status = 37
+        AND v2.deleted = 0
+        AND v2.status <> 39
+        AND (
+            v2.status_reason NOT LIKE '%duplicate%'
+            AND v2.status_reason NOT LIKE '%retired%'
+            AND v2.status_reason NOT LIKE '%disposed%'
+            AND v2.status_reason NOT LIKE '%test%'
+            AND v2.status_reason NOT LIKE 'Equipment:%'
+        )
+  )
+ORDER BY v.name;
+"""
+
+SQL_VEH_IN_USE_TODAY = r"""
+SELECT
+    v.id AS vehicle_id,
+    v.name AS vehicle_name,
+    ss.name AS shift_profile,
+    cc.name AS cost_center,
+    MIN(stsa.start_time) AS start_time,
+    MAX(stsa.end_time) AS end_time
+FROM sched_template_shift_assignments stsa
+JOIN sched_schedules ss ON ss.id = stsa.schedule_id
+JOIN cost_centers cc ON cc.id = ss.cost_center_id
+JOIN sched_vehicles v ON v.id = stsa.vehicle_id
+WHERE DATE(stsa.start_time) = ?
+  AND v.status = 37
+  AND v.deleted = 0
+  AND v.id NOT IN (1001, 1002, 1003)
+  AND (
+      v.status_reason NOT LIKE '%duplicate%'
+      AND v.status_reason NOT LIKE '%retired%'
+      AND v.status_reason NOT LIKE '%disposed%'
+      AND v.status_reason NOT LIKE '%test%'
+      AND v.status_reason NOT LIKE 'Equipment:%'
+  )
+  AND stsa.user_id IS NOT NULL
+GROUP BY v.id, v.name, ss.name, cc.name
+ORDER BY start_time, vehicle_name;
+"""
+
+SQL_VEH_ALL_IN_SERVICE = r"""
+SELECT
+    v.id AS vehicle_id,
+    v.name AS vehicle_name,
+    cc.name AS owned_by_cost_center,
+    v.status,
+    v.status_reason
+FROM sched_vehicles v
+LEFT JOIN cost_centers cc ON cc.id = v.cost_center_id
+WHERE v.status = 37
+  AND v.deleted = 0
+  AND v.status <> 39
+  AND v.id NOT IN (1001, 1002, 1003)
+  AND (
+      v.status_reason NOT LIKE '%duplicate%'
+      AND v.status_reason NOT LIKE '%retired%'
+      AND v.status_reason NOT LIKE '%disposed%'
+      AND v.status_reason NOT LIKE '%test%'
+      AND v.status_reason NOT LIKE 'Equipment:%'
+  )
+ORDER BY v.name;
+"""
+
+SQL_VEH_OUT_OF_SERVICE = r"""
+SELECT
+    v.id AS vehicle_id,
+    v.name AS vehicle_name,
+    owned_cc.name AS owned_by_cost_center,
+    v.odometer AS current_odometer,
+    v.odometer_type,
+    wo.odometer_started,
+    wo.odometer_completed,
+    v.status_reason,
+    oos.oos_since,
+    CASE
+        WHEN oos.oos_since IS NULL THEN NULL
+        ELSE DATEDIFF(?, DATE(oos.oos_since))
+    END AS total_days_out_of_service,
+    wo_cc.name AS work_order_station
+FROM sched_vehicles v
+LEFT JOIN cost_centers owned_cc ON owned_cc.id = v.cost_center_id
+LEFT JOIN (
+    SELECT veh_id, MAX(date) AS oos_since
+    FROM sched_vehicles_status_log
+    WHERE status_id = 38
+    GROUP BY veh_id
+) oos ON oos.veh_id = v.id
+LEFT JOIN (
+    SELECT wo1.*
+    FROM vm_work_orders wo1
+    JOIN (
+        SELECT vehicle_id, MAX(id) AS max_id
+        FROM vm_work_orders
+        GROUP BY vehicle_id
+    ) x ON x.vehicle_id = wo1.vehicle_id AND x.max_id = wo1.id
+) wo ON wo.vehicle_id = v.id
+LEFT JOIN cost_centers wo_cc ON wo_cc.id = wo.cost_center_id
+WHERE v.status = 38
+  AND v.deleted = 0
+  AND v.id NOT IN (1001, 1002, 1003)
+  AND (
+      v.status_reason NOT LIKE '%duplicate%'
+      AND v.status_reason NOT LIKE '%retired%'
+      AND v.status_reason NOT LIKE '%disposed%'
+      AND v.status_reason NOT LIKE '%test%'
+      AND v.status_reason NOT LIKE 'Equipment:%'
+  )
+ORDER BY v.name;
+"""
+
+SQL_UHU_BY_COST_CENTER = r"""
+SELECT
+    cc.id AS cost_center_id,
+    cc.name AS cost_center_name,
+    ROUND(SUM(sp.scheduled_hours), 2) AS scheduled_hours,
+    ROUND(SUM(sp.loaded_hours), 2) AS loaded_hours,
+    SUM(sp.total_runs) AS total_runs,
+    CASE
+        WHEN SUM(sp.total_runs) = 0 THEN 0
+        ELSE ROUND(SUM(sp.loaded_hours) / SUM(sp.total_runs), 3)
+    END AS hours_per_run,
+    CASE
+        WHEN SUM(sp.scheduled_hours) = 0 THEN 0
+        ELSE ROUND(SUM(sp.loaded_hours) / SUM(sp.scheduled_hours), 3)
+    END AS uhu_ratio
+FROM (
+    SELECT
+        prof.schedule_id,
+        prof.shift_profile_name,
+        prof.scheduled_hours,
+        COALESCE(ld.loaded_hours, 0) AS loaded_hours,
+        COALESCE(ld.total_runs, 0) AS total_runs
+    FROM (
+        SELECT
+            x.schedule_id,
+            x.shift_profile_name,
+            SUM(x.overlap_minutes) / 60 AS scheduled_hours
+        FROM (
+            SELECT
+                stsa.schedule_id,
+                ss.name AS shift_profile_name,
+                stsa.unit_id,
+                stsa.start_time,
+                stsa.end_time,
+                GREATEST(
+                    0,
+                    TIMESTAMPDIFF(
+                        MINUTE,
+                        GREATEST(stsa.start_time, ?),
+                        LEAST(stsa.end_time, ?)
+                    )
+                ) AS overlap_minutes
+            FROM sched_template_shift_assignments stsa
+            JOIN sched_schedules ss
+                ON ss.id = stsa.schedule_id
+            WHERE
+                stsa.user_id > 0
+                AND stsa.deleted = '0'
+                AND stsa.schedule_type = 'template'
+                AND ss.name NOT LIKE '%Dispatch%'
+                AND ss.name NOT LIKE '%Comm%'
+                AND ss.name NOT LIKE '%Call%'
+                AND stsa.end_time > ?
+                AND stsa.start_time < ?
+            GROUP BY
+                stsa.schedule_id,
+                ss.name,
+                stsa.unit_id,
+                stsa.start_time,
+                stsa.end_time
+        ) x
+        GROUP BY x.schedule_id, x.shift_profile_name
+    ) prof
+    LEFT JOIN (
+        SELECT
+            t.schedule_id,
+            t.shift_profile_name,
+            SUM(t.leg_minutes) / 60 AS loaded_hours,
+            COUNT(*) AS total_runs
+        FROM (
+            SELECT
+                leg.id AS leg_id,
+                MIN(stsa.schedule_id) AS schedule_id,
+                MIN(ss.name) AS shift_profile_name,
+                (COALESCE(cu.est_trip_duration,0) + COALESCE(cu.shifted_amount,0)) AS leg_minutes
+            FROM cad_trip_legs leg
+            JOIN cad_trip_legs_rev rev
+                ON rev.leg_id = leg.id
+               AND rev.rev = leg.rev
+            JOIN cad_trip_leg_shift_assignments sa
+                ON sa.leg_id = leg.id
+            JOIN sched_template_shift_assignments stsa
+                ON stsa.id = sa.shift_assignment_id
+            JOIN sched_schedules ss
+                ON ss.id = stsa.schedule_id
+            LEFT JOIN cad_unit_schedules cu
+                ON cu.leg_id = leg.id
+               AND cu.block_id IS NULL
+            WHERE
+                rev.deleted = 0
+                AND rev.last_status_id IN (1,2,3,4,5,6,7)
+                AND stsa.user_id > 0
+                AND stsa.deleted = '0'
+                AND stsa.schedule_type = 'template'
+                AND ss.name NOT LIKE '%Dispatch%'
+                AND ss.name NOT LIKE '%Comm%'
+                AND ss.name NOT LIKE '%Call%'
+                AND rev.pickup_time >= ?
+                AND rev.pickup_time < ?
+            GROUP BY leg.id
+        ) t
+        GROUP BY t.schedule_id, t.shift_profile_name
+    ) ld
+        ON ld.schedule_id = prof.schedule_id
+) sp
+JOIN sched_schedules ss
+    ON ss.id = sp.schedule_id
+JOIN cost_centers cc
+    ON cc.id = ss.cost_center_id
+GROUP BY cc.id, cc.name
+ORDER BY uhu_ratio DESC;
+"""
+
+SQL_UHU_BY_SHIFT_PROFILE = r"""
+SELECT
+    sp.work_date,
+    cc.id AS cost_center_id,
+    cc.name AS cost_center_name,
+    sp.schedule_id,
+    sp.shift_profile_name,
+    ROUND(sp.scheduled_hours, 2) AS scheduled_hours,
+    ROUND(sp.loaded_hours, 2) AS loaded_hours,
+    sp.total_runs,
+    CASE
+        WHEN sp.total_runs = 0 THEN 0
+        ELSE ROUND(sp.loaded_hours / sp.total_runs, 3)
+    END AS hours_per_run,
+    CASE
+        WHEN sp.scheduled_hours = 0 THEN 0
+        ELSE ROUND(sp.loaded_hours / sp.scheduled_hours, 3)
+    END AS uhu_ratio
+FROM (
+    SELECT
+        DATE(?) AS work_date,
+        prof.schedule_id,
+        prof.shift_profile_name,
+        prof.scheduled_hours,
+        COALESCE(ld.loaded_hours, 0) AS loaded_hours,
+        COALESCE(ld.total_runs, 0) AS total_runs
+    FROM (
+        SELECT
+            x.schedule_id,
+            x.shift_profile_name,
+            SUM(x.overlap_minutes) / 60 AS scheduled_hours
+        FROM (
+            SELECT
+                stsa.schedule_id,
+                ss.name AS shift_profile_name,
+                stsa.unit_id,
+                stsa.start_time,
+                stsa.end_time,
+                GREATEST(
+                    0,
+                    TIMESTAMPDIFF(
+                        MINUTE,
+                        GREATEST(stsa.start_time, ?),
+                        LEAST(stsa.end_time, ?)
+                    )
+                ) AS overlap_minutes
+            FROM sched_template_shift_assignments stsa
+            JOIN sched_schedules ss ON ss.id = stsa.schedule_id
+            WHERE
+                stsa.user_id > 0
+                AND stsa.deleted = '0'
+                AND stsa.schedule_type = 'template'
+                AND ss.name NOT LIKE '%Dispatch%'
+                AND ss.name NOT LIKE '%Comm%'
+                AND ss.name NOT LIKE '%Call%'
+                AND stsa.end_time > ?
+                AND stsa.start_time < ?
+            GROUP BY
+                stsa.schedule_id, ss.name, stsa.unit_id, stsa.start_time, stsa.end_time
+        ) x
+        GROUP BY x.schedule_id, x.shift_profile_name
+    ) prof
+    LEFT JOIN (
+        SELECT
+            t.schedule_id,
+            t.shift_profile_name,
+            SUM(t.leg_minutes) / 60 AS loaded_hours,
+            COUNT(*) AS total_runs
+        FROM (
+            SELECT
+                leg.id AS leg_id,
+                MIN(stsa.schedule_id) AS schedule_id,
+                MIN(ss.name) AS shift_profile_name,
+                (COALESCE(cu.est_trip_duration,0) + COALESCE(cu.shifted_amount,0)) AS leg_minutes
+            FROM cad_trip_legs leg
+            JOIN cad_trip_legs_rev rev
+                ON rev.leg_id = leg.id AND rev.rev = leg.rev
+            JOIN cad_trip_leg_shift_assignments sa
+                ON sa.leg_id = leg.id
+            JOIN sched_template_shift_assignments stsa
+                ON stsa.id = sa.shift_assignment_id
+            JOIN sched_schedules ss
+                ON ss.id = stsa.schedule_id
+            LEFT JOIN cad_unit_schedules cu
+                ON cu.leg_id = leg.id AND cu.block_id IS NULL
+            WHERE
+                rev.deleted = 0
+                AND rev.last_status_id IN (1,2,3,4,5,6,7)
+                AND stsa.user_id > 0
+                AND stsa.deleted = '0'
+                AND stsa.schedule_type = 'template'
+                AND ss.name NOT LIKE '%Dispatch%'
+                AND ss.name NOT LIKE '%Comm%'
+                AND ss.name NOT LIKE '%Call%'
+                AND rev.pickup_time >= ?
+                AND rev.pickup_time < ?
+            GROUP BY leg.id
+        ) t
+        GROUP BY t.schedule_id, t.shift_profile_name
+    ) ld
+        ON ld.schedule_id = prof.schedule_id
+) sp
+JOIN sched_schedules sched ON sched.id = sp.schedule_id
+JOIN cost_centers cc ON cc.id = sched.cost_center_id
+ORDER BY uhu_ratio DESC, sp.shift_profile_name;
+"""
+
+# =============================
+# LOGGING SETUP
+# =============================
+def setup_logging(output_dir: str, run_date_str: str) -> str:
+    log_dir = os.path.join(output_dir, "logs")
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    log_path = os.path.join(log_dir, f"DailyReports_{run_date_str}.log")
+
+    # Reconfigure handlers for this run
+    for h in list(logging.getLogger().handlers):
+        logging.getLogger().removeHandler(h)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        encoding="utf-8",
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(log_path), logging.StreamHandler(sys.stdout)],
+    )
+    return log_path
+
+
+# =============================
+# EXCEL HELPERS (TABLES)
+# =============================
+def _sanitize_table_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_]", "_", str(name))
+    if not cleaned or not re.match(r"^[A-Za-z_]", cleaned):
+        cleaned = f"T_{cleaned}"
+    return cleaned[:200]
+
+
+def _autofit_columns(ws, max_width=60):
+    for col_idx in range(1, ws.max_column + 1):
+        letter = get_column_letter(col_idx)
+        best = 0
+        for row_idx in range(1, ws.max_row + 1):
+            v = ws.cell(row=row_idx, column=col_idx).value
+            if v is None:
+                continue
+            best = max(best, len(str(v)))
+        if best > 0:
+            ws.column_dimensions[letter].width = min(max_width, best + 2)
+
+
+def add_table_to_sheet(ws, table_name: str, style_name: str = EXCEL_TABLE_STYLE):
+    if ws.max_row < 2 or ws.max_column < 1:
+        return False
+    last_col = get_column_letter(ws.max_column)
+    last_row = ws.max_row
+    ref = f"A1:{last_col}{last_row}"
+    tname = _sanitize_table_name(table_name)
+    table = Table(displayName=tname, ref=ref)
+    style = TableStyleInfo(
+        name=style_name,
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    table.tableStyleInfo = style
+    ws.add_table(table)
+    ws.freeze_panes = "A2"
+    _autofit_columns(ws)
+    return True
+
+
+def write_df_sheet_with_table(writer, df: pd.DataFrame, sheet_name: str, table_name: str):
+    df.to_excel(writer, sheet_name=sheet_name, index=False)
+    ws = writer.book[sheet_name]
+    add_table_to_sheet(ws, table_name=table_name, style_name=EXCEL_TABLE_STYLE)
+
+
+# =============================
+# APPEND HELPERS
+# =============================
+def _safe_sheet_name(s: str) -> str:
+    # Excel sheet names max 31, no []:*?/\
+    s = re.sub(r"[\[\]\:\*\?\/\\]", "_", str(s))
+    return s[:31] if len(s) > 31 else s
+
+
+def _append_to_workbook_xlsx(
+    append_path: str,
+    sheet_name: str,
+    df_new: pd.DataFrame,
+    dedupe_keys=None,
+    snapshot_date_value=None,
+    snapshot_col: str = "snapshot_date",
+):
+    """
+    Append df_new to append_path/sheet_name, de-duping on keys if provided.
+    - If append file doesn't exist -> create
+    - If sheet doesn't exist -> create
+    - Adds snapshot_date column if snapshot_date_value provided and column missing
+    - Prunes old rows if snapshot_date or work_date column exists (APPEND_RETENTION_DAYS)
+    """
+    Path(os.path.dirname(append_path)).mkdir(parents=True, exist_ok=True)
+
+    df = df_new.copy()
+
+    if snapshot_date_value is not None and snapshot_col not in df.columns:
+        df.insert(0, snapshot_col, snapshot_date_value)
+
+    sheet_name = _safe_sheet_name(sheet_name)
+
+    existing = None
+    if os.path.exists(append_path):
+        try:
+            existing = pd.read_excel(append_path, sheet_name=sheet_name, engine="openpyxl")
+        except ValueError:
+            existing = None
+        except Exception:
+            existing = None
+
+    if existing is None:
+        combined = df
+    else:
+        combined = pd.concat([existing, df], ignore_index=True, sort=False)
+
+    if dedupe_keys:
+        present_keys = [k for k in dedupe_keys if k in combined.columns]
+        if present_keys:
+            combined = combined.drop_duplicates(subset=present_keys, keep="last")
+
+    cutoff_date = datetime.now().date() - timedelta(days=APPEND_RETENTION_DAYS)
+
+    if snapshot_col in combined.columns:
+        sd = pd.to_datetime(combined[snapshot_col], errors="coerce").dt.date
+        combined = combined.loc[(sd.isna()) | (sd >= cutoff_date)].copy()
+    elif "work_date" in combined.columns:
+        wd = pd.to_datetime(combined["work_date"], errors="coerce").dt.date
+        combined = combined.loc[(wd.isna()) | (wd >= cutoff_date)].copy()
+
+    if os.path.exists(append_path):
+        with pd.ExcelWriter(
+            append_path,
+            engine="openpyxl",
+            mode="a",
+            if_sheet_exists="replace",
+        ) as writer:
+            write_df_sheet_with_table(
+                writer,
+                combined,
+                sheet_name=sheet_name,
+                table_name=f"APPEND_{sheet_name}",
+            )
+    else:
+        with pd.ExcelWriter(append_path, engine="openpyxl", mode="w") as writer:
+            write_df_sheet_with_table(
+                writer,
+                combined,
+                sheet_name=sheet_name,
+                table_name=f"APPEND_{sheet_name}",
+            )
+
+
+# =============================
+# DB / EMAIL / HOUSEKEEPING
+# =============================
+def get_db_connection():
+    conn_str = f"DSN={DB_DSN};"
+    logging.info(f"Connecting using {conn_str}")
+    return pyodbc.connect(conn_str)
+
+
+def send_email(subject, body, recipients, attachments=None):
+    smtp_server = os.getenv("SMTP_SERVER", "smtp.example.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASS") or os.getenv("SMTP_PASSWORD")
+    smtp_from = os.getenv("SMTP_FROM", smtp_user)
+    ehlo_host = os.getenv("SMTP_EHLO_HOST", "alerts.example.com")
+
+    if not smtp_user or not smtp_password:
+        raise RuntimeError("Missing SMTP_USER/SMTP_PASS (or SMTP_PASSWORD) in environment variables")
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = smtp_from
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(body)
+
+    for path in (attachments or []):
+        with open(path, "rb") as f:
+            msg.add_attachment(
+                f.read(),
+                maintype="application",
+                subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                filename=os.path.basename(path),
+            )
+
+    with smtplib.SMTP(smtp_server, smtp_port, timeout=30, local_hostname=ehlo_host) as server:
+        code, resp = server.ehlo()
+        logging.info(f"EHLO response: {code} {resp!r}")
+        logging.info(f"ESMTP features: {server.esmtp_features}")
+        if code != 250:
+            raise RuntimeError(f"EHLO failed ({code}): {resp!r}")
+        if not server.has_extn("starttls"):
+            raise RuntimeError(f"STARTTLS not offered. Features: {server.esmtp_features}")
+
+        server.starttls(context=ssl.create_default_context())
+        server.ehlo()
+        server.login(smtp_user, smtp_password)
+        server.send_message(msg)
+
+
+def cleanup_old_files():
+    cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
+    for f in Path(OUTPUT_DIR).glob("*.xlsx"):
+        if datetime.fromtimestamp(f.stat().st_mtime) < cutoff:
+            try:
+                f.unlink()
+                logging.info(f"Deleted old file: {f}")
+            except Exception as e:
+                logging.warning(f"Failed to delete {f}: {e}")
+
+
+def run_one_report(name, fn):
+    logging.info(f"--- Running: {name} ---")
+    try:
+        rows_info, out_path = fn()
+        logging.info(f"--- OK: {name}\n {rows_info}\n {out_path} ---")
+        return True, rows_info, out_path, None
+    except Exception as e:
+        logging.error(f"--- FAIL: {name}\n {e} ---", exc_info=True)
+        return False, "", None, str(e)
+
+
+# =============================
+# REPORTS (WITH TABLES) + APPEND
+# =============================
+def report_companywide_otp(window_start, window_end, run_date_str):
+    conn = get_db_connection()
+    try:
+        otp_params = _expand_params_to_markers(
+            SQL_OTP_BY_CALLTYPE, [window_start, window_end], label="OTP_CALLTYPE"
+        )
+        df_calltype = pd.read_sql_query(SQL_OTP_BY_CALLTYPE, conn, params=otp_params)
+
+        otp_params2 = _expand_params_to_markers(
+            SQL_OTP_BY_COSTCENTER, [window_start, window_end], label="OTP_COSTCENTER"
+        )
+        df_costcenter = pd.read_sql_query(SQL_OTP_BY_COSTCENTER, conn, params=otp_params2)
+    finally:
+        conn.close()
+
+    recon = None
+    if ENABLE_OTP_RECONCILIATION_SHEET:
+        ct = (
+            df_calltype.groupby("cost_center", as_index=False)["total_runs"]
+            .sum()
+            .rename(columns={"total_runs": "calltype_sum"})
+        )
+        cc = df_costcenter[["cost_center", "total_runs"]].rename(
+            columns={"total_runs": "costcenter_total"}
+        )
+        recon = ct.merge(cc, on="cost_center", how="outer").fillna(0)
+        recon["diff"] = recon["calltype_sum"] - recon["costcenter_total"]
+        bad = recon[recon["diff"] != 0]
+        if not bad.empty:
+            logging.warning("OTP reconciliation mismatch found:\n%s", bad.to_string(index=False))
+
+    out_path = os.path.join(OUTPUT_DIR, f"CompanyWide_OTP_{run_date_str}.xlsx")
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        write_df_sheet_with_table(
+            writer, df_calltype, "OTP by Call Type", f"OTP_CallType_{run_date_str}"
+        )
+        write_df_sheet_with_table(
+            writer, df_costcenter, "OTP by Cost Center", f"OTP_CostCenter_{run_date_str}"
+        )
+        if recon is not None:
+            write_df_sheet_with_table(
+                writer, recon, "OTP Reconciliation", f"OTP_Recon_{run_date_str}"
+            )
+
+    append_path = os.path.join(APPEND_DIR, "CompanyWide_OTP_APPEND.xlsx")
+    _append_to_workbook_xlsx(
+        append_path,
+        "OTP by Call Type",
+        df_calltype,
+        dedupe_keys=["snapshot_date", "cost_center", "call_type"],
+        snapshot_date_value=run_date_str,
+    )
+    _append_to_workbook_xlsx(
+        append_path,
+        "OTP by Cost Center",
+        df_costcenter,
+        dedupe_keys=["snapshot_date", "cost_center"],
+        snapshot_date_value=run_date_str,
+    )
+    if recon is not None:
+        _append_to_workbook_xlsx(
+            append_path,
+            "OTP Reconciliation",
+            recon,
+            dedupe_keys=["snapshot_date", "cost_center"],
+            snapshot_date_value=run_date_str,
+        )
+
+    return f"CallType={len(df_calltype)}, CostCenter={len(df_costcenter)}", out_path
+
+
+def report_staffing(run_asof_dt, tomorrow_date, run_date_str):
+    conn = get_db_connection()
+    try:
+        staffing_params = _expand_params_to_markers(
+            SQL_STAFFING_ACTIVE_NOW, [run_asof_dt], label="STAFFING_ACTIVE_NOW"
+        )
+        df_now = pd.read_sql_query(SQL_STAFFING_ACTIVE_NOW, conn, params=staffing_params)
+
+        tmr_params = _expand_params_to_markers(
+            SQL_STAFFING_TOMORROW, [tomorrow_date], label="STAFFING_TOMORROW"
+        )
+        df_tmr = pd.read_sql_query(SQL_STAFFING_TOMORROW, conn, params=tmr_params)
+    finally:
+        conn.close()
+
+    out_path = os.path.join(OUTPUT_DIR, f"Staffing_Report_{run_date_str}.xlsx")
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        write_df_sheet_with_table(
+            writer, df_now, "Active Now", f"Staffing_ActiveNow_{run_date_str}"
+        )
+        write_df_sheet_with_table(
+            writer, df_tmr, "Tomorrow", f"Staffing_Tomorrow_{run_date_str}"
+        )
+
+    append_path = os.path.join(APPEND_DIR, "Staffing_Report_APPEND.xlsx")
+    _append_to_workbook_xlsx(
+        append_path,
+        "Active Now",
+        df_now,
+        dedupe_keys=["snapshot_date", "cost_center", "shift_profile", "start_time", "end_time"],
+        snapshot_date_value=run_date_str,
+    )
+    _append_to_workbook_xlsx(
+        append_path,
+        "Tomorrow",
+        df_tmr,
+        dedupe_keys=["snapshot_date", "cost_center", "shift_profile", "start_time", "end_time"],
+        snapshot_date_value=run_date_str,
+    )
+
+    return f"ActiveNow={len(df_now)}, Tomorrow={len(df_tmr)}", out_path
+
+
+def report_daily_vehicle_overview(run_date, run_date_str):
+    conn = get_db_connection()
+    try:
+        df_summary = pd.read_sql_query(SQL_VEH_SUMMARY, conn, params=[run_date, run_date, run_date])
+        df_inuse = pd.read_sql_query(SQL_VEH_IN_USE_TODAY, conn, params=[run_date])
+        df_unused = pd.read_sql_query(SQL_VEH_UNUSED_IN_SERVICE_LIST, conn, params=[run_date])
+        df_all_in = pd.read_sql_query(SQL_VEH_ALL_IN_SERVICE, conn)
+        df_oos = pd.read_sql_query(SQL_VEH_OUT_OF_SERVICE, conn, params=[run_date])
+    finally:
+        conn.close()
+
+    out_path = os.path.join(OUTPUT_DIR, f"Daily_Vehicle_Overview_{run_date_str}.xlsx")
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        write_df_sheet_with_table(
+            writer, df_summary, "Summary", f"Veh_Summary_{run_date_str}"
+        )
+        write_df_sheet_with_table(
+            writer, df_inuse, "In Use", f"Veh_InUse_{run_date_str}"
+        )
+        write_df_sheet_with_table(
+            writer, df_unused, "Unused In Service", f"Veh_Unused_{run_date_str}"
+        )
+        write_df_sheet_with_table(
+            writer, df_all_in, "All In Service", f"Veh_AllIn_{run_date_str}"
+        )
+        write_df_sheet_with_table(
+            writer, df_oos, "Out Of Service", f"Veh_OOS_{run_date_str}"
+        )
+
+    append_path = os.path.join(APPEND_DIR, "Daily_Vehicle_Overview_APPEND.xlsx")
+    _append_to_workbook_xlsx(
+        append_path,
+        "Summary",
+        df_summary,
+        dedupe_keys=["snapshot_date"],
+        snapshot_date_value=run_date_str,
+    )
+    _append_to_workbook_xlsx(
+        append_path,
+        "In Use",
+        df_inuse,
+        dedupe_keys=["snapshot_date", "vehicle_id", "start_time", "end_time"],
+        snapshot_date_value=run_date_str,
+    )
+    _append_to_workbook_xlsx(
+        append_path,
+        "Unused In Service",
+        df_unused,
+        dedupe_keys=["snapshot_date", "vehicle_id"],
+        snapshot_date_value=run_date_str,
+    )
+    _append_to_workbook_xlsx(
+        append_path,
+        "All In Service",
+        df_all_in,
+        dedupe_keys=["snapshot_date", "vehicle_id"],
+        snapshot_date_value=run_date_str,
+    )
+    _append_to_workbook_xlsx(
+        append_path,
+        "Out Of Service",
+        df_oos,
+        dedupe_keys=["snapshot_date", "vehicle_id", "oos_since"],
+        snapshot_date_value=run_date_str,
+    )
+
+    rows_info = (
+        f"Summary={len(df_summary)}, InUse={len(df_inuse)}, "
+        f"Unused={len(df_unused)}, InService={len(df_all_in)}, OOS={len(df_oos)}"
+    )
+    return rows_info, out_path
+
+
+def report_uhu_by_cost_center(window_start, window_end, run_date, run_date_str):
+    conn = get_db_connection()
+    try:
+        params = [window_start, window_end, window_start, window_end, window_start, window_end]
+        df = pd.read_sql_query(SQL_UHU_BY_COST_CENTER, conn, params=params)
+    finally:
+        conn.close()
+
+    df.insert(0, "work_date", run_date)
+
+    out_path = os.path.join(OUTPUT_DIR, f"Daily_UHU_By_Cost_Center_{run_date_str}.xlsx")
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        write_df_sheet_with_table(
+            writer, df, "UHU by Cost Center", f"UHU_CostCenter_{run_date_str}"
+        )
+
+    append_path = os.path.join(APPEND_DIR, "Daily_UHU_By_Cost_Center_APPEND.xlsx")
+    keys = ["work_date", "cost_center_id"] if "cost_center_id" in df.columns else [
+        "work_date",
+        "cost_center_name",
+    ]
+    _append_to_workbook_xlsx(
+        append_path,
+        "UHU by Cost Center",
+        df,
+        dedupe_keys=keys,
+        snapshot_date_value=None,
+    )
+
+    return f"Rows={len(df)}", out_path
+
+
+def report_uhu_by_shift_profile(window_start, window_end, run_date, run_date_str):
+    conn = get_db_connection()
+    try:
+        params = [run_date, window_start, window_end, window_start, window_end, window_start, window_end]
+        df = pd.read_sql_query(SQL_UHU_BY_SHIFT_PROFILE, conn, params=params)
+    finally:
+        conn.close()
+
+    out_path = os.path.join(OUTPUT_DIR, f"Daily_UHU_By_Shift_Profile_{run_date_str}.xlsx")
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        write_df_sheet_with_table(
+            writer, df, "UHU by Shift Profile", f"UHU_ShiftProfile_{run_date_str}"
+        )
+
+    append_path = os.path.join(APPEND_DIR, "Daily_UHU_By_Shift_Profile_APPEND.xlsx")
+    keys = ["work_date", "schedule_id"] if "schedule_id" in df.columns else [
+        "work_date",
+        "shift_profile_name",
+    ]
+    _append_to_workbook_xlsx(
+        append_path,
+        "UHU by Shift Profile",
+        df,
+        dedupe_keys=keys,
+        snapshot_date_value=None,
+    )
+
+    return f"Rows={len(df)}", out_path
+
+
+# =============================
+# MAIN
+# =============================
+def main():
+    tz = ZoneInfo("America/New_York")
+    now_local = datetime.now(tz)
+    now_local_naive = now_local.replace(tzinfo=None)
+
+    report_end_date = parse_cli_end_date(sys.argv)
+
+    window_start, window_end = window_midnight(report_end_date, now_dt=now_local_naive)
+
+    metrics_date = window_start.date()
+    metrics_date_str = metrics_date.isoformat()
+
+    if report_end_date is None:
+        staffing_asof = now_local_naive
+        staffing_tomorrow_date = now_local.date() + timedelta(days=1)
+        vehicle_date = now_local.date()
+    else:
+        staffing_asof = window_end - timedelta(seconds=1)
+        staffing_tomorrow_date = metrics_date + timedelta(days=1)
+        vehicle_date = metrics_date
+
+    staffing_date_str = staffing_asof.date().isoformat()
+    vehicle_date_str = vehicle_date.isoformat()
+
+    no_email = has_flag(sys.argv, "--no-email")
+
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    Path(APPEND_DIR).mkdir(parents=True, exist_ok=True)
+
+    log_path = setup_logging(OUTPUT_DIR, metrics_date_str)
+
+    logging.info("=== Daily Multi-Report Runner Started ===")
+    logging.info("NOW_LOCAL=%s", now_local.isoformat())
+    logging.info("Window: %s -> %s | METRICS_DATE=%s", window_start, window_end, metrics_date_str)
+    logging.info("STAFFING asof=%s | STAFFING tomorrow=%s", staffing_asof, staffing_tomorrow_date)
+    logging.info("VEHICLE date=%s", vehicle_date)
+    logging.info("DB_DSN=%s | TEST_MODE=%s", DB_DSN, TEST_MODE)
+    logging.info("APPEND_DIR=%s", APPEND_DIR)
+
+    reports = [
+        ("CompanyWide OTP", lambda: report_companywide_otp(window_start, window_end, metrics_date_str)),
+        ("Staffing Report", lambda: report_staffing(staffing_asof, staffing_tomorrow_date, staffing_date_str)),
+        ("Daily Vehicle Overview", lambda: report_daily_vehicle_overview(vehicle_date, vehicle_date_str)),
+        ("UHU by Cost Center", lambda: report_uhu_by_cost_center(window_start, window_end, metrics_date, metrics_date_str)),
+        ("UHU by Shift Profile", lambda: report_uhu_by_shift_profile(window_start, window_end, metrics_date, metrics_date_str)),
+    ]
+
+    results = []
+    attachments = []
+
+    for name, fn in reports:
+        ok, rows_info, path, err = run_one_report(name, fn)
+        results.append((name, ok, rows_info, path, err))
+        if ok and path:
+            attachments.append(path)
+
+    lines = [
+        f"Daily Reports Bundle - {metrics_date_str}",
+        f"Window: {window_start} -> {window_end}",
+        f"Output Folder: {OUTPUT_DIR}",
+        f"Append Folder: {APPEND_DIR}",
+        f"Log File: {log_path}",
+        "",
+    ]
+
+    for name, ok, rows_info, path, err in results:
+        if ok:
+            lines.append(f"✅ {name}: {rows_info}")
+            lines.append(f"  {path}")
+        else:
+            lines.append(f"❌ {name}: FAILED")
+            lines.append(f"  {err}")
+        lines.append("")
+
+    body = "\n".join(lines)
+
+    recipients = [TEST_MODE_RECIPIENT] if TEST_MODE else PROD_RECIPIENTS
+    test_suffix = " [TEST]" if TEST_MODE else ""
+    subject = EMAIL_SUBJECT.format(date=metrics_date_str, test_suffix=test_suffix)
+
+    if no_email:
+        logging.info("NO_EMAIL enabled (--no-email). Skipping main and status emails.")
+    else:
+        email_error = None
+        try:
+            send_email(subject, body, recipients, attachments=attachments)
+        except Exception as e:
+            email_error = str(e)
+            logging.error(f"Main email send failed: {e}", exc_info=True)
+
+        status_subject = f"STATUS - {subject}" + (" (EMAIL FAILED)" if email_error else "")
+        status_body = body + (f"\n\nMAIN EMAIL ERROR:\n{email_error}\n" if email_error else "")
+        try:
+            send_email(status_subject, status_body, [STATUS_EMAIL_RECIPIENT], attachments=None)
+        except Exception as e:
+            logging.error(f"Status email failed: {e}", exc_info=True)
+
+    if not TEST_MODE:
+        cleanup_old_files()
+
+    logging.info("=== Daily Multi-Report Runner Completed ===")
+
+
+# =============================
+# STATUS LOGGER WRAP + ENTRYPOINT
+# =============================
+if __name__ == "__main__":
+    JOB_NAME = "Daily_MultiReport_Runner"
+    run_id = None
+    cnxn_status = None
+
+    try:
+        try:
+            from status_logger import (
+                get_cnxn,
+                get_job_id,
+                start_run,
+                finish_run,
+                STATUS_SUCCESS,
+                STATUS_FAILED,
+            )
+        except ImportError:
+            get_cnxn = get_job_id = start_run = finish_run = None
+            STATUS_SUCCESS = STATUS_FAILED = None
+
+        if get_cnxn is not None:
+            cnxn_status = get_cnxn()
+            job_id = get_job_id(cnxn_status, JOB_NAME)
+            run_id = start_run(cnxn_status, job_id)
+    except Exception as e:
+        logging.error("Status dashboard logging init failed: %s", e, exc_info=True)
+
+    try:
+        main()
+        if run_id is not None and cnxn_status is not None and finish_run is not None:
+            try:
+                finish_run(
+                    cnxn_status,
+                    run_id,
+                    STATUS_SUCCESS,
+                    row_count=None,
+                    output_file=None,
+                    error_message=None,
+                )
+            except Exception as e2:
+                logging.error("Status dashboard finish_run failed: %s", e2, exc_info=True)
+
+    except Exception as e:
+        err = str(e)
+        logging.error("Unhandled exception in Daily_MultiReport_Runner: %s", e, exc_info=True)
+        if run_id is not None and cnxn_status is not None and finish_run is not None:
+            try:
+                finish_run(
+                    cnxn_status,
+                    run_id,
+                    STATUS_FAILED,
+                    row_count=None,
+                    output_file=None,
+                    error_message=err,
+                )
+            except Exception as e2:
+                logging.error("Status dashboard finish_run failed: %s", e2, exc_info=True)
+        raise
+    finally:
+        try:
+            if cnxn_status is not None:
+                cnxn_status.close()
+        except Exception:
+            pass

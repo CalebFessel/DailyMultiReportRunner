@@ -114,14 +114,48 @@ def _write(out_dir, name, payload):
 
 
 def probe_auth(api, findings):
-    log.info("[1/6] Checking credentials against /Data/Organization ...")
+    log.info("[1/6] Detecting the HMAC scheme against /Data/Organization ...")
+
+    # The key-creation screen may issue only a key and no separate secret, so
+    # which (formula, secret) pair the tenant accepts has to be established
+    # rather than assumed.
+    detected = api.detect_auth_mode()
+    if detected is None:
+        findings["auth"] = {
+            "ok": False,
+            "error": "no HMAC scheme accepted",
+            "schemes_tried": [
+                {"mode": m, "secret": label} for m, _, label in api.candidate_auth_schemes()
+            ],
+        }
+        log.error("    Every signing scheme was rejected.")
+        log.error("    Check, in order:")
+        log.error("      - whether the key screen offers a secret you have not captured")
+        log.error("      - this machine's clock (the timestamp is valid for 300 seconds)")
+        log.error("      - that the key has read scopes enabled for Organization")
+        return None
+
+    mode, secret_label = detected
+    log.info("    Accepted: formula=%s, secret=%s", mode, secret_label)
+
     try:
         org = api.get_organization()
     except TraumasoftAPIError as exc:
-        findings["auth"] = {"ok": False, "error": str(exc), "status": exc.status_code}
-        log.error("Auth/connectivity failed: %s", exc)
+        findings["auth"] = {
+            "ok": False,
+            "error": str(exc),
+            "status": exc.status_code,
+            "auth_mode": mode,
+        }
+        log.error("    Organization fetch failed after auth succeeded: %s", exc)
         return None
-    findings["auth"] = {"ok": True, "organization_rows": len(org)}
+
+    findings["auth"] = {
+        "ok": True,
+        "auth_mode": mode,
+        "secret_source": secret_label,
+        "organization_rows": len(org),
+    }
     log.info("    OK - %s organization rows", len(org))
     return org
 
@@ -480,7 +514,8 @@ def main():
         api = TraumasoftAPI()
     except ValueError as exc:
         log.error("%s", exc)
-        log.error("Set TS_API_BASE_URL, TS_API_KEY and TS_API_SECRET before running.")
+        log.error("Set TS_API_BASE_URL and TS_API_KEY (and TS_API_SECRET if you have one)")
+        log.error("in a .env file next to this script, or in the environment.")
         return 2
 
     findings = {"probe_date": run_date, "base_url": api.base_url}

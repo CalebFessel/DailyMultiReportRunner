@@ -25,10 +25,32 @@ Four headers on every request:
 | `X-TS-AUTHORIZATION` | `hmac_sha256(body + timestamp + nonce, secret)` |
 
 GPS Geofence uses a different formula: `hmac_sha256(api_key, timestamp + secret + nonce)`.
-Both are implemented in `traumasoft_api.py` (`legacy_hmac=True` selects the second).
 
-The 300-second window means the host clock must be in sync, or every request
-returns 401.
+### When the key screen issues no secret
+
+Both formulas take a `secret` "paired with that key", but the key-creation UI
+may hand back only a single value. In that case the key doubles as its own
+secret, so there are four plausible signing combinations rather than one.
+
+Neither script guesses. `detect_auth_mode()` (and `Resolve-TsAuthMode` in the
+PowerShell probe) tries each combination against `/ThirdParty/Data/Organization`
+and keeps the first that returns a non-error status:
+
+| Order | Formula | Signing secret |
+|---|---|---|
+| 1 | default | the supplied secret, or the key when none was supplied |
+| 2 | default | the API key |
+| 3 | legacy | the supplied secret |
+| 4 | legacy | the API key |
+
+Duplicates collapse when key and secret are the same value, so a key-only setup
+tries two combinations, not four. The probe reports which one worked; pin it
+afterwards with `TS_API_AUTH_MODE` to skip the detection round-trip.
+
+If all combinations are rejected, the causes in likelihood order are: a secret
+shown once at creation time that was not captured; a host clock more than five
+minutes out (the timestamp is valid for 300 seconds — check `w32tm /query
+/status`); or the key lacking read scope for Organization.
 
 ## Rate limits and paging
 
@@ -171,13 +193,31 @@ copy .env.example .env      # Windows;  cp .env.example .env on Linux/macOS
 
 Then fill in `TS_API_BASE_URL`, `TS_API_KEY`, and `TS_API_SECRET`.
 
-### Windows (PowerShell)
+### Windows, nothing installed (no Python, no clone)
+
+`probe_traumasoft_api.ps1` is standalone — pure PowerShell, no dependencies,
+no repository. Save that one file anywhere and run it:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\probe_traumasoft_api.ps1 -Date 2026-08-17
+```
+
+It prompts for the base URL, key, and secret (press Enter at the secret prompt
+if the key screen never issued one). Everything it needs — HMAC-SHA256, HTTPS,
+JSON — is built into .NET.
+
+### Windows, with the repository checked out
 
 ```powershell
 cd C:\path\to\DailyMultiReportRunner
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass   # if the script is blocked
 .\run_probe.ps1 -Date 2026-08-17
 ```
+
+`run_probe.ps1` locates a real Python, builds `.venv`, and runs the Python
+probe. Use it when Python is available; use the standalone probe above when it
+is not.
 
 `run_probe.ps1` locates a real Python 3.10+, creates `.venv`, installs
 `requests` and `python-dotenv`, and runs the probe. It deliberately validates

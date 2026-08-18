@@ -90,6 +90,7 @@ class TraumasoftAPI:
         base_url=None,
         api_key=None,
         api_secret=None,
+        auth_mode=None,
         timeout=DEFAULT_TIMEOUT,
         min_interval=DEFAULT_MIN_INTERVAL,
         session=None,
@@ -97,49 +98,105 @@ class TraumasoftAPI:
         base_url = base_url or os.getenv("TS_API_BASE_URL", "")
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key or os.getenv("TS_API_KEY", "")
-        self.api_secret = api_secret or os.getenv("TS_API_SECRET", "")
         self.timeout = timeout
         self.min_interval = min_interval
         self.session = session or requests.Session()
         self._last_request_at = 0.0
 
+        # The spec's HMAC formulas take a secret paired with the key, but the
+        # key-creation screen may only issue a single value. When no secret is
+        # supplied the key doubles as the secret, and detect_auth_mode() settles
+        # which combination this tenant actually accepts.
+        self.api_secret = api_secret or os.getenv("TS_API_SECRET", "") or self.api_key
+        self.auth_mode = auth_mode or os.getenv("TS_API_AUTH_MODE", "") or "default"
+
         if not self.base_url:
             raise ValueError("TS_API_BASE_URL is required (e.g. https://tenant.traumasoft.com)")
-        if not self.api_key or not self.api_secret:
-            raise ValueError("TS_API_KEY and TS_API_SECRET are required")
+        if not self.api_key:
+            raise ValueError("TS_API_KEY is required")
 
     # ---------- signing ----------
-    def _auth_headers(self, body_str="", legacy_hmac=False):
+    def _sign(self, body_str, timestamp, nonce, mode, secret):
         """
-        Build the four required auth headers.
+        Compute the HMAC for one request under a given scheme.
 
-        Default scheme (all Data/Lists endpoints):
-            hmac_sha256(body + timestamp + nonce, secret)
-
-        Legacy scheme (GPS Geofence / older Postman collection):
-            hmac_sha256(api_key, timestamp + secret + nonce)
+        default: hmac_sha256(body + timestamp + nonce, secret)
+        legacy:  hmac_sha256(api_key, timestamp + secret + nonce)
+                 -- documented for GPS Geofence / the older Postman collection
         """
+        if mode == "legacy":
+            message = self.api_key
+            key = timestamp + secret + nonce
+        else:
+            message = (body_str or "") + timestamp + nonce
+            key = secret
+
+        return hmac.new(
+            key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+
+    def _auth_headers(self, body_str="", legacy_hmac=False, mode=None, secret=None):
+        """Build the four required auth headers for one request."""
         timestamp = str(int(time.time()))
         nonce = str(random.randrange(10**9, 10**10))
 
-        if legacy_hmac:
-            message = self.api_key
-            key = timestamp + self.api_secret + nonce
-        else:
-            message = (body_str or "") + timestamp + nonce
-            key = self.api_secret
-
-        digest = hmac.new(
-            key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
-        ).hexdigest()
+        if mode is None:
+            mode = "legacy" if legacy_hmac else self.auth_mode
+        if secret is None:
+            secret = self.api_secret
 
         return {
             "X-TS-APIKEY": self.api_key,
             "X-TS-TIMESTAMP": timestamp,
             "X-TS-ID": nonce,
-            "X-TS-AUTHORIZATION": digest,
+            "X-TS-AUTHORIZATION": self._sign(body_str, timestamp, nonce, mode, secret),
             "Accept": "application/json",
         }
+
+    def candidate_auth_schemes(self):
+        """
+        Every (mode, secret) pair worth trying, most likely first.
+
+        When a separate secret was supplied, the documented default is tried
+        first. When only a key exists, the key-as-secret variants are all there
+        is. Duplicates collapse when key and secret are the same value.
+        """
+        candidates = []
+        for mode in ("default", "legacy"):
+            for label, secret in (("secret", self.api_secret), ("api_key", self.api_key)):
+                if (mode, secret) in [(m, s) for m, s, _ in candidates]:
+                    continue
+                candidates.append((mode, secret, label))
+        return candidates
+
+    def detect_auth_mode(self, probe_path="ThirdParty/Data/Organization"):
+        """
+        Find the signing scheme this tenant accepts by trying each against a
+        cheap read endpoint. Sets auth_mode/api_secret on success and returns
+        (mode, secret_label); returns None if every scheme is rejected.
+        """
+        for mode, secret, label in self.candidate_auth_schemes():
+            headers = self._auth_headers("", mode=mode, secret=secret)
+            self._throttle()
+            try:
+                resp = self.session.request(
+                    "GET",
+                    f"{self.base_url}/api/{probe_path.lstrip('/')}",
+                    params=None,
+                    data=None,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                log.warning("auth probe (%s/%s) network error: %s", mode, label, exc)
+                continue
+
+            log.info("auth probe: mode=%s secret=%s -> HTTP %s", mode, label, resp.status_code)
+            if resp.status_code < 400:
+                self.auth_mode = mode
+                self.api_secret = secret
+                return mode, label
+        return None
 
     # ---------- transport ----------
     def _throttle(self):

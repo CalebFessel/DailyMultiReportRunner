@@ -30,15 +30,70 @@ from datetime import date
 
 import requests
 
-# Optional dotenv, so credentials can live in a .env file next to the script
-# instead of being exported by hand in every shell. Matches the pattern the
-# report runner already uses.
+# Optional dotenv, so credentials can live in a .env file instead of being
+# exported by hand in every shell. Both the module's own folder and the working
+# directory are tried, and what happened is remembered so a missing key can say
+# why rather than just "required".
+_DOTENV_AVAILABLE = True
+_DOTENV_LOADED_FROM = None
+_DOTENV_SEARCHED = []
+
 try:
     from dotenv import load_dotenv
-
-    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 except ImportError:
-    pass
+    _DOTENV_AVAILABLE = False
+else:
+    for _candidate in (
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+        os.path.join(os.getcwd(), ".env"),
+    ):
+        if _candidate in _DOTENV_SEARCHED:
+            continue
+        _DOTENV_SEARCHED.append(_candidate)
+        if os.path.isfile(_candidate):
+            load_dotenv(_candidate)
+            _DOTENV_LOADED_FROM = _candidate
+            break
+
+
+def _credentials_diagnostic():
+    """Explain why credentials are missing, rather than just that they are."""
+    lines = []
+    if not _DOTENV_AVAILABLE:
+        lines.append(
+            "  - python-dotenv is not installed in this interpreter, so any .env "
+            "file was ignored. Install it with: python -m pip install python-dotenv"
+        )
+    elif _DOTENV_LOADED_FROM:
+        lines.append(f"  - Loaded .env from {_DOTENV_LOADED_FROM}, but it did not set the value.")
+        lines.append("    Check for typos, and that lines look like TS_API_KEY=abc (no quotes, no spaces around =).")
+    else:
+        lines.append("  - No .env file found. Looked in:")
+        for path in _DOTENV_SEARCHED:
+            lines.append(f"      {path}")
+        stray = []
+        for path in _DOTENV_SEARCHED:
+            folder = os.path.dirname(path)
+            try:
+                # .env.example ships with the project and is not a mistake.
+                stray += [
+                    os.path.join(folder, n)
+                    for n in os.listdir(folder)
+                    if n.lower().startswith(".env")
+                    and n.lower() not in (".env", ".env.example")
+                ]
+            except OSError:
+                pass
+        if stray:
+            lines.append("    Found these instead -- Notepad appends .txt when saving:")
+            for path in sorted(set(stray)):
+                lines.append(f"      {path}")
+            lines.append("    Rename the right one to exactly .env")
+    lines.append("  - Or set them for this session:")
+    lines.append('      $env:TS_API_BASE_URL="https://your-tenant.traumasoft.com"')
+    lines.append('      $env:TS_API_KEY="..."')
+    lines.append('      $env:TS_API_SECRET="..."')
+    return "\n".join(lines)
 
 log = logging.getLogger(__name__)
 
@@ -110,10 +165,16 @@ class TraumasoftAPI:
         self.api_secret = api_secret or os.getenv("TS_API_SECRET", "") or self.api_key
         self.auth_mode = auth_mode or os.getenv("TS_API_AUTH_MODE", "") or "default"
 
-        if not self.base_url:
-            raise ValueError("TS_API_BASE_URL is required (e.g. https://tenant.traumasoft.com)")
-        if not self.api_key:
-            raise ValueError("TS_API_KEY is required")
+        missing = [
+            name for name, value in (
+                ("TS_API_BASE_URL", self.base_url),
+                ("TS_API_KEY", self.api_key),
+            ) if not value
+        ]
+        if missing:
+            raise ValueError(
+                f"{' and '.join(missing)} not set.\n{_credentials_diagnostic()}"
+            )
 
     # ---------- signing ----------
     def _sign(self, body_str, timestamp, nonce, mode, secret):

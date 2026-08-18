@@ -162,13 +162,48 @@ optional `status_logger` integration. Only the SQL constants and the eight
 
 ## Running the probe
 
-```bash
-export TS_API_BASE_URL=https://your-tenant.traumasoft.com
-export TS_API_KEY=...
-export TS_API_SECRET=...
+Credentials come from a `.env` file next to the scripts, so no shell exporting
+is needed on any platform:
 
+```
+copy .env.example .env      # Windows;  cp .env.example .env on Linux/macOS
+```
+
+Then fill in `TS_API_BASE_URL`, `TS_API_KEY`, and `TS_API_SECRET`.
+
+### Windows (PowerShell)
+
+```powershell
+cd C:\path\to\DailyMultiReportRunner
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass   # if the script is blocked
+.\run_probe.ps1 -Date 2026-08-17
+```
+
+`run_probe.ps1` locates a real Python 3.10+, creates `.venv`, installs
+`requests` and `python-dotenv`, and runs the probe. It deliberately validates
+each interpreter by asking for its version, because the Microsoft Store app
+alias answers to `python` without being Python — that alias is what produces
+"Python was not found; run without arguments to install from the Microsoft
+Store". If no usable interpreter exists, the script prints where to look for the
+one that already runs the daily report.
+
+Note that PowerShell has no `export`. To set variables for a single session
+instead of using `.env`:
+
+```powershell
+$env:TS_API_BASE_URL = "https://your-tenant.traumasoft.com"
+$env:TS_API_KEY      = "..."
+$env:TS_API_SECRET   = "..."
+```
+
+### Linux / macOS
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
 python probe_traumasoft_api.py 2026-08-17
 ```
 
-Writes `api_probe/PROBE_FINDINGS.md`, `api_probe/findings.json`, and raw JSON
-samples for each entity. It issues GETs only.
+Either way the probe writes `api_probe/PROBE_FINDINGS.md`,
+`api_probe/findings.json`, and raw JSON samples for each entity. It issues GETs
+only, and `api_probe/` and `.env` are both gitignored.

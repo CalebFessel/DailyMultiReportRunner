@@ -30,6 +30,16 @@ from datetime import date
 
 import requests
 
+# Optional dotenv, so credentials can live in a .env file next to the script
+# instead of being exported by hand in every shell. Matches the pattern the
+# report runner already uses.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
 log = logging.getLogger(__name__)
 
 # =============================

@@ -254,7 +254,10 @@ def main():
     # --- fetch + build ---
     try:
         data = R.fetch_day(api, metrics_date)
-        reports = R.build_all(data)
+        # One extra call: how recently each vehicle ran, so out-of-service
+        # records that have not moved in weeks are visible as such.
+        fleet_activity = R.fetch_fleet_activity(api, metrics_date)
+        reports = R.build_all(data, fleet_activity=fleet_activity)
     except TraumasoftAPIError as exc:
         logging.error("API failure: %s", exc, exc_info=True)
         return 1

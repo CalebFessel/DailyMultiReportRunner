@@ -68,6 +68,27 @@ IN_SERVICE_STATUSES = {"In Service"}
 OUT_OF_SERVICE_STATUSES = {"Out of Service", "Out of Service - Collision"}
 NON_FLEET_STATUSES = {"Retired", "New - Waiting for Delivery", "Waiting for Inspection"}
 
+# The SQL pruned dead records with `status_reason NOT LIKE '%duplicate%' /
+# '%retired%' / '%disposed%' / '%test%'` and a hard-coded id list. The API's
+# vehicle allowlist has no status_reason, so the equivalent is name patterns
+# plus an explicit list -- see VehicleExclusions. Vehicles left sitting at
+# "Out of Service" for years because nobody set them to Retired are
+# indistinguishable from genuinely broken ones through this API.
+FLEET_EXCLUDED_NAME_PATTERNS = tuple(
+    p.strip().lower()
+    for p in os.getenv(
+        "FLEET_EXCLUDED_NAME_PATTERNS",
+        "test,check test,do not use,dnu,duplicate,disposed,retired,spare - out",
+    ).split(",")
+    if p.strip()
+)
+
+VEHICLE_EXCLUSIONS_FILE = os.path.join(STATE_DIR, "vehicle_exclusions.json")
+
+# How far back to look for trip activity when flagging dormant vehicles.
+# Capped at the API's 31-day range limit so it costs a single call.
+FLEET_ACTIVITY_LOOKBACK_DAYS = int(os.getenv("FLEET_ACTIVITY_LOOKBACK_DAYS", "30"))
+
 # Staffing: cost centers excluded by name, and the minimum crew for a row to
 # count as a staffed unit (the SQL used HAVING COUNT(DISTINCT user_id) > 2).
 STAFFING_EXCLUDED_COST_CENTER_PATTERNS = ("dispatch", "cpr", "training", "admin")
@@ -261,6 +282,69 @@ class CostCenterMap:
             for name, counter in self.counts.items()
             if len(counter) > 1
         }
+
+
+class VehicleExclusions:
+    """
+    Vehicles to drop from the fleet reports entirely.
+
+    Replaces the SQL's `v.id NOT IN (...)` list and its status_reason LIKE
+    filters. Two mechanisms, because they catch different things:
+
+      * name patterns catch obvious rigs -- test vehicles, check trucks;
+      * an explicit list of ids or names catches units that were simply
+        abandoned at "Out of Service" instead of being set to Retired, which
+        this API gives no way to detect.
+
+    Edit state/vehicle_exclusions.json by hand, or seed it with
+    suggest_vehicle_exclusions.py.
+    """
+
+    def __init__(self, path=VEHICLE_EXCLUSIONS_FILE, patterns=None):
+        self.path = path
+        self.patterns = tuple(patterns if patterns is not None else FLEET_EXCLUDED_NAME_PATTERNS)
+        self.ids = set()
+        self.names = set()
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                stored = json.load(handle)
+        except (FileNotFoundError, ValueError):
+            return
+        self.ids = {str(i) for i in (stored.get("exclude_ids") or [])}
+        self.names = {str(n).strip().lower() for n in (stored.get("exclude_names") or [])}
+        extra = stored.get("exclude_name_patterns")
+        if extra:
+            self.patterns = tuple(list(self.patterns) + [str(p).strip().lower() for p in extra])
+
+    def save(self, note=None):
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "note": note or (
+                "Vehicles excluded from the fleet reports. exclude_ids and "
+                "exclude_names are exact matches; exclude_name_patterns are "
+                "substrings matched case-insensitively."
+            ),
+            "updated": datetime.now().isoformat(timespec="seconds"),
+            "exclude_ids": sorted(self.ids),
+            "exclude_names": sorted(self.names),
+        }
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+
+    def excludes(self, vehicle):
+        if str(vehicle.get("id")) in self.ids:
+            return "explicit id"
+        name = (vehicle.get("name") or "").strip()
+        if name.lower() in self.names:
+            return "explicit name"
+        lowered = name.lower()
+        for pattern in self.patterns:
+            if pattern and pattern in lowered:
+                return f"name matches '{pattern}'"
+        return None
 
 
 class OutOfServiceHistory:
@@ -516,11 +600,19 @@ def build_staffing_for_date(shifts, employees, target_date):
 # =============================
 # VEHICLES
 # =============================
-def _fleet_partition(vehicles):
+def _fleet_partition(vehicles, exclusions=None):
+    """
+    Split the live fleet into in-service and out-of-service.
+
+    Exclusions apply to both halves: a decommissioned truck should not inflate
+    the in-service count any more than the out-of-service list.
+    """
     in_service, out_of_service = [], []
     for vehicle in vehicles:
         status = vehicle.get("vehicle_status")
         if status in NON_FLEET_STATUSES:
+            continue
+        if exclusions and exclusions.excludes(vehicle):
             continue
         if status in IN_SERVICE_STATUSES:
             in_service.append(vehicle)
@@ -529,13 +621,33 @@ def _fleet_partition(vehicles):
     return in_service, out_of_service
 
 
+def vehicle_last_seen(legs_by_day):
+    """
+    vehicle id -> the most recent date it ran a leg.
+
+    Built from a trip lookback, which backfills fine. It is the only signal
+    this API offers for telling a truck that is genuinely down from one that
+    was abandoned in the system years ago.
+    """
+    last_seen = {}
+    for day, legs in legs_by_day.items():
+        for leg in legs:
+            vehicle_id = leg.get("vehicle_id")
+            if not vehicle_id:
+                continue
+            key = str(vehicle_id)
+            if key not in last_seen or day > last_seen[key]:
+                last_seen[key] = day
+    return last_seen
+
+
 def used_vehicle_ids(legs):
     """Vehicles that actually ran a leg on the day."""
     return {str(leg.get("vehicle_id")) for leg in legs if leg.get("vehicle_id")}
 
 
-def build_vehicle_summary(vehicles, legs, run_date):
-    in_service, out_of_service = _fleet_partition(vehicles)
+def build_vehicle_summary(vehicles, legs, run_date, exclusions=None):
+    in_service, out_of_service = _fleet_partition(vehicles, exclusions)
     used = used_vehicle_ids(legs)
     in_service_ids = {str(v.get("id")) for v in in_service}
     used_in_service = in_service_ids & used
@@ -552,7 +664,7 @@ def build_vehicle_summary(vehicles, legs, run_date):
     return pd.DataFrame(rows)
 
 
-def build_vehicles_in_use(vehicles, legs):
+def build_vehicles_in_use(vehicles, legs, exclusions=None):
     used = used_vehicle_ids(legs)
     leg_counts = Counter(str(leg.get("vehicle_id")) for leg in legs if leg.get("vehicle_id"))
     rows = [
@@ -564,14 +676,14 @@ def build_vehicles_in_use(vehicles, legs):
             "legs_run": leg_counts.get(str(v.get("id")), 0),
         }
         for v in vehicles
-        if str(v.get("id")) in used
+        if str(v.get("id")) in used and not (exclusions and exclusions.excludes(v))
     ]
     df = pd.DataFrame(rows)
     return df.sort_values("vehicle_name") if not df.empty else df
 
 
-def build_vehicles_all_in_service(vehicles):
-    in_service, _ = _fleet_partition(vehicles)
+def build_vehicles_all_in_service(vehicles, exclusions=None):
+    in_service, _ = _fleet_partition(vehicles, exclusions)
     rows = [
         {
             "vehicle_id": v.get("id"),
@@ -586,8 +698,8 @@ def build_vehicles_all_in_service(vehicles):
     return df.sort_values("vehicle_name") if not df.empty else df
 
 
-def build_vehicles_unused_in_service(vehicles, legs):
-    in_service, _ = _fleet_partition(vehicles)
+def build_vehicles_unused_in_service(vehicles, legs, exclusions=None):
+    in_service, _ = _fleet_partition(vehicles, exclusions)
     used = used_vehicle_ids(legs)
     rows = [
         {
@@ -603,7 +715,7 @@ def build_vehicles_unused_in_service(vehicles, legs):
     return df.sort_values("vehicle_name") if not df.empty else df
 
 
-def build_vehicles_out_of_service(vehicles, oos_history, run_date):
+def build_vehicles_out_of_service(vehicles, oos_history, run_date, exclusions=None, last_seen=None):
     """
     Out-of-service sheet.
 
@@ -613,10 +725,15 @@ def build_vehicles_out_of_service(vehicles, oos_history, run_date):
     they are blank for any vehicle first seen out of service before this
     history began.
     """
-    _, out_of_service = _fleet_partition(vehicles)
+    _, out_of_service = _fleet_partition(vehicles, exclusions)
+    last_seen = last_seen or {}
+    as_of = run_date if isinstance(run_date, date) else parse_ts(run_date).date()
+
     rows = []
     for vehicle in out_of_service:
         since, days = oos_history.days_out(vehicle.get("id"), run_date)
+        ran_on = last_seen.get(str(vehicle.get("id")))
+        days_since_run = (as_of - ran_on).days if ran_on else None
         rows.append(
             {
                 "vehicle_id": vehicle.get("id"),
@@ -625,6 +742,8 @@ def build_vehicles_out_of_service(vehicles, oos_history, run_date):
                 "current_odometer": vehicle.get("odometer"),
                 "oos_since": since,
                 "total_days_out_of_service": days,
+                "last_ran": ran_on.isoformat() if ran_on else None,
+                "days_since_last_run": days_since_run,
             }
         )
     df = pd.DataFrame(rows)
@@ -777,7 +896,28 @@ def fetch_day(api, metrics_date):
     }
 
 
-def build_all(data, cost_center_map=None, oos_history=None, now=None):
+def fetch_fleet_activity(api, metrics_date, lookback_days=None):
+    """
+    Last date each vehicle ran a leg, over a trailing window.
+
+    One GetTrips call: the lookback is capped at the API's 31-day range limit.
+    Used to flag out-of-service vehicles that have not moved in a long time,
+    which is how abandoned records give themselves away without status_reason.
+    """
+    lookback = min(int(lookback_days or FLEET_ACTIVITY_LOOKBACK_DAYS), 31)
+    start = metrics_date - timedelta(days=lookback - 1)
+    legs = api.get_trips(start, range_days=lookback)
+
+    by_day = defaultdict(list)
+    for leg in legs:
+        pickup = parse_ts(leg.get("pickup_time"))
+        if pickup:
+            by_day[pickup.date()].append(leg)
+    return vehicle_last_seen(by_day)
+
+
+def build_all(data, cost_center_map=None, oos_history=None, now=None,
+              exclusions=None, fleet_activity=None):
     """Build every report DataFrame from one fetch, refreshing accumulated state."""
     metrics_date = data["metrics_date"]
     legs = data["legs"]
@@ -788,10 +928,21 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None):
 
     cost_center_map = cost_center_map or CostCenterMap()
     oos_history = oos_history or OutOfServiceHistory()
+    exclusions = exclusions if exclusions is not None else VehicleExclusions()
 
     # Learn from the present before attributing the past.
     cost_center_map.update(shifts, employees)
-    oos_history.update(vehicles, metrics_date)
+    oos_history.update(
+        [v for v in vehicles if not exclusions.excludes(v)], metrics_date
+    )
+
+    dropped = [v for v in vehicles if exclusions.excludes(v)]
+    if dropped:
+        log.info(
+            "Excluded %s vehicle(s) from the fleet reports: %s",
+            len(dropped),
+            ", ".join(sorted(str(v.get("name")) for v in dropped)[:10]),
+        )
 
     scored = scored_legs(legs, cost_center_map)
     window_start = datetime.combine(metrics_date, time(0, 0))
@@ -804,12 +955,12 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None):
         "staffing_tomorrow": build_staffing_for_date(
             shifts, employees, now.date() + timedelta(days=1)
         ),
-        "vehicle_summary": build_vehicle_summary(vehicles, legs, metrics_date),
-        "vehicles_in_use": build_vehicles_in_use(vehicles, legs),
-        "vehicles_unused_in_service": build_vehicles_unused_in_service(vehicles, legs),
-        "vehicles_all_in_service": build_vehicles_all_in_service(vehicles),
+        "vehicle_summary": build_vehicle_summary(vehicles, legs, metrics_date, exclusions),
+        "vehicles_in_use": build_vehicles_in_use(vehicles, legs, exclusions),
+        "vehicles_unused_in_service": build_vehicles_unused_in_service(vehicles, legs, exclusions),
+        "vehicles_all_in_service": build_vehicles_all_in_service(vehicles, exclusions),
         "vehicles_out_of_service": build_vehicles_out_of_service(
-            vehicles, oos_history, metrics_date
+            vehicles, oos_history, metrics_date, exclusions, fleet_activity
         ),
         "uhu_by_cost_center": build_uhu_by_cost_center(
             shifts, legs, cost_center_map, window_start, window_end

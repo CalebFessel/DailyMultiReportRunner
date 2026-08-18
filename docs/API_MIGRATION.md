@@ -175,6 +175,78 @@ lags the scope list or those scopes gate fields on other endpoints. Worth asking
 Traumasoft, since dedicated certification and cost-center endpoints would remove
 most of the awkwardness above.
 
+## Confirmed against the live tenant
+
+Two probes ran against `lynxems.traumasoft.com`. Auth resolved to the
+documented default formula with a real paired secret. What they settled:
+
+| Question | Answer |
+|---|---|
+| Do trips backfill? | **Yes** — 90 days back returned 665 legs. OTP and the UHU numerator keep full history and `--date` backfill still works. |
+| Can `/Schedule/Shifts` be steered? | **No** — 751 rows, `today-1..today+2`, byte-identical for requests at −30, +0 and +30 days. |
+| Is the arrival timestamp there? | **Yes** — `at_scene`, plus a distinct `at_scene: At Patient Bedside`. |
+| Real cost-center coverage for OTP | **100%** — all 233 OTP-scorable legs carry `shift_name`. |
+| Is the vehicle allowlist closed? | **Yes** — no unlisted field returned. |
+
+### The 66.7% was a red herring
+
+The first probe's headline cost-center coverage counted every leg. Broken out
+by status, the unattributable legs are exactly the ones OTP never scores:
+
+| Trip status | Legs | With `shift_name` | With `at_scene` |
+|---|---|---|---|
+| Clear | 374 | 374 | 374 |
+| Canceled | 200 | 94 | 3 |
+| Disregard | 108 | 12 | 0 |
+| No Transport | 17 | 4 | 0 |
+| unknown | 25 | 0 | 0 |
+
+Of the 233 legs carrying both a `pickup_time` and an `at_scene` stamp — the
+population OTP actually scores — **every one** has `shift_name`. Cost-center
+attribution for OTP is complete.
+
+Note that 374 legs reach `Clear` but only 233 have a scheduled `pickup_time`,
+so a third of completed legs are unscoreable for lateness. The current SQL
+filters on `rev.pickup_time` too, so it likely excludes the same legs, but that
+has not been confirmed against a parallel run.
+
+### What being present-only forces
+
+Because shifts describe only the present, two things are accumulated to disk
+rather than queried (`TS_STATE_DIR`, default `state/`):
+
+- **`shift_cost_center_map.json`** — `shift_name` → cost center, learned from
+  each day's visible shift window. Historical legs are attributed through it.
+  Crew counts per cost center are kept rather than a single winner, so the
+  dominant cost center wins and contested profiles stay visible. 11 of 128
+  profiles map to more than one cost center, carrying 35 of 483 legs (7.2%);
+  `West Virginia Admin` spans five, which is a float pool rather than a station.
+- **`vehicle_oos_history.json`** — first date each vehicle was observed out of
+  service, which is what `oos_since` and days-out are derived from. Cleared
+  when a vehicle returns to service.
+
+Both are cold-start empty: a vehicle already out of service on changeover day
+shows a blank `oos_since` until it cycles, and a shift profile only becomes
+attributable once it has been seen staffed.
+
+### Vehicle status mapping
+
+The status strings replace the status id + `status_reason LIKE` filtering:
+
+| Status | Count | Treatment |
+|---|---|---|
+| In Service | 102 | in service |
+| Out of Service | 36 | out of service |
+| Out of Service - Collision | 4 | out of service |
+| Retired | 36 | excluded from the fleet |
+| New - Waiting for Delivery | 12 | excluded from the fleet |
+| Waiting for Inspection | 1 | excluded from the fleet |
+
+### Correction
+
+An earlier draft listed `late_reasons` as a capability gained. It came back on
+**0 legs**. Do not build on it.
+
 ## What is unaffected
 
 Everything downstream of the data pull is source-agnostic and stays as-is:

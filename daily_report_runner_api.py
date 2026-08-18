@@ -9,8 +9,13 @@ original code, lifted unchanged into report_output.
 
     python daily_report_runner_api.py                 # yesterday
     python daily_report_runner_api.py 2026-08-17      # backfill that day
-    python daily_report_runner_api.py --no-email      # write files only
+    python daily_report_runner_api.py --zip           # also bundle the day into one .zip
+    python daily_report_runner_api.py --no-email      # never attempt delivery
     python daily_report_runner_api.py --dry-run       # write nothing, report what would happen
+
+Email is optional. With no SMTP server and no recipients configured the run
+writes its workbooks and stops there, which is the right behaviour when the
+files are being sent by hand.
 
 What backfill can and cannot do, per the live probes:
 
@@ -24,6 +29,7 @@ What backfill can and cannot do, per the live probes:
 
 import os
 import sys
+import zipfile
 import logging
 import traceback
 from pathlib import Path
@@ -77,6 +83,31 @@ def parse_cli_end_date(argv):
 def has_flag(argv, flag):
     flag = flag.lower()
     return any(a.lower() == flag for a in argv[1:])
+
+
+def email_is_configured():
+    """
+    Whether delivery is even possible.
+
+    With no SMTP credentials or no recipients there is nothing to attempt, and
+    a run that produces its workbooks and stops is a success rather than a
+    failure -- that is the normal state when the files are sent by hand.
+    """
+    has_smtp = bool(os.getenv("SMTP_USER")) and bool(
+        os.getenv("SMTP_PASS") or os.getenv("SMTP_PASSWORD")
+    )
+    has_recipients = bool(PROD_RECIPIENTS) or (TEST_MODE and bool(TEST_MODE_RECIPIENT))
+    return has_smtp and has_recipients
+
+
+def bundle_zip(paths, output_dir, run_date_str):
+    """Bundle the day's workbooks into one archive that is easy to attach."""
+    zip_path = os.path.join(output_dir, f"Daily_Reports_{run_date_str}.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in paths:
+            if os.path.exists(path):
+                archive.write(path, arcname=os.path.basename(path))
+    return zip_path
 
 
 # =============================
@@ -195,6 +226,7 @@ def main():
     metrics_date = parse_cli_end_date(sys.argv) or (date.today() - timedelta(days=1))
     no_email = has_flag(sys.argv, "--no-email")
     dry_run = has_flag(sys.argv, "--dry-run")
+    make_zip = has_flag(sys.argv, "--zip")
     run_date_str = metrics_date.isoformat()
 
     output_dir = OUT.OUTPUT_DIR
@@ -279,21 +311,37 @@ def main():
         logging.info("Dry run complete; nothing written or sent.")
         return 0
 
+    if make_zip and attachments:
+        try:
+            zip_path = bundle_zip(attachments, output_dir, run_date_str)
+            logging.info("Bundled %s files into %s", len(attachments), zip_path)
+        except Exception as exc:
+            logging.warning("Could not build the zip bundle: %s", exc)
+
     try:
         OUT.cleanup_old_files()
     except Exception as exc:
         logging.warning("Cleanup failed: %s", exc)
 
-    # --- email ---
+    # --- where the files are ---
+    logging.info("")
+    logging.info("Files for %s are in %s:", run_date_str, os.path.abspath(output_dir))
+    for path in attachments:
+        logging.info("  %s", os.path.basename(path))
+
+    # --- email (optional) ---
     if no_email:
-        logging.info("--no-email set; skipping delivery.")
+        logging.info("--no-email set; delivery skipped.")
+        return 0
+
+    if not email_is_configured():
+        logging.info(
+            "Email not configured (needs SMTP_USER, SMTP_PASS and PROD_RECIPIENTS); "
+            "the workbooks above are ready to send by hand."
+        )
         return 0
 
     recipients = [TEST_MODE_RECIPIENT] if TEST_MODE else PROD_RECIPIENTS
-    if not recipients:
-        logging.warning("No recipients configured (set PROD_RECIPIENTS or TEST_MODE); skipping email.")
-        return 0
-
     subject = EMAIL_SUBJECT.format(date=run_date_str, test_suffix=" [TEST]" if TEST_MODE else "")
     send_error = None
     try:

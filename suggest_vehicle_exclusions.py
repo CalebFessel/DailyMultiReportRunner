@@ -91,6 +91,29 @@ def main():
     vehicles = api.list_vehicles()
     log.info("Fetched %s vehicles", len(vehicles))
 
+    # The list call asks the server to omit deleted and disabled records. If any
+    # come back anyway, the server-side filter is not doing what it claims and
+    # the flags on the rows are the more reliable signal.
+    leaked = [
+        v for v in vehicles
+        if R._is_truthy_flag(v.get("deleted")) or R._is_truthy_flag(v.get("disabled"))
+    ]
+    if leaked:
+        log.warning(
+            "%s vehicle(s) came back flagged deleted/disabled despite "
+            "include_deleted=false and include_disabled=false:",
+            len(leaked),
+        )
+        for v in leaked[:20]:
+            log.warning(
+                "    %-32s id=%-6s deleted=%s disabled=%s",
+                v.get("name"), v.get("id"), v.get("deleted"), v.get("disabled"),
+            )
+        log.warning(
+            "  These are filtered out locally, so they will drop off the reports "
+            "without needing an exclusion entry."
+        )
+
     last_seen, start, end = fetch_last_seen(api, args.days)
     log.info("Trip activity covers %s .. %s (%s vehicles ran at least once)",
              start, end, len(last_seen))
@@ -100,6 +123,8 @@ def main():
     candidates = [
         v for v in vehicles
         if v.get("vehicle_status") in R.OUT_OF_SERVICE_STATUSES
+        and not R._is_truthy_flag(v.get("deleted"))
+        and not R._is_truthy_flag(v.get("disabled"))
     ]
     log.info("%s vehicles are currently out of service", len(candidates))
 
@@ -115,6 +140,8 @@ def main():
             "id": vehicle.get("id"),
             "name": name,
             "status": vehicle.get("vehicle_status"),
+            "deleted": vehicle.get("deleted"),
+            "disabled": vehicle.get("disabled"),
             "last_ran": ran_on.isoformat() if ran_on else None,
         }
         if matched:

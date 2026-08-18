@@ -600,6 +600,21 @@ def build_staffing_for_date(shifts, employees, target_date):
 # =============================
 # VEHICLES
 # =============================
+def _is_truthy_flag(value):
+    """
+    Whether an API boolean is set.
+
+    These come back as real booleans on some endpoints and as "0"/"1" or
+    "true"/"false" strings on others, so a bare truth test would treat the
+    string "0" as set.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "y")
+
+
 def _fleet_partition(vehicles, exclusions=None):
     """
     Split the live fleet into in-service and out-of-service.
@@ -609,6 +624,11 @@ def _fleet_partition(vehicles, exclusions=None):
     """
     in_service, out_of_service = [], []
     for vehicle in vehicles:
+        # Belt and braces: the list call already asks the server to omit
+        # deleted and disabled records, but the fields are returned so there is
+        # no reason to trust that over the data in hand.
+        if _is_truthy_flag(vehicle.get("deleted")) or _is_truthy_flag(vehicle.get("disabled")):
+            continue
         status = vehicle.get("vehicle_status")
         if status in NON_FLEET_STATUSES:
             continue

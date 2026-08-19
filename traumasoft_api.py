@@ -30,10 +30,16 @@ from datetime import date
 
 import requests
 
-# Optional dotenv, so credentials can live in a .env file instead of being
-# exported by hand in every shell. Both the module's own folder and the working
-# directory are tried, and what happened is remembered so a missing key can say
-# why rather than just "required".
+log = logging.getLogger(__name__)
+
+# Credentials live in a .env file rather than being exported by hand in every
+# shell. python-dotenv reads it when installed, but a missing dependency used to
+# mean the file was silently ignored -- indistinguishable, from the error, from
+# having no file at all. The fallback parser below removes that failure mode:
+# .env is read either way, and only the diagnostic changes.
+#
+# Notepad appends .txt to a file saved as ".env", which is common enough to be
+# worth loading rather than rejecting. It is loaded loudly, not silently.
 _DOTENV_AVAILABLE = True
 _DOTENV_LOADED_FROM = None
 _DOTENV_SEARCHED = []
@@ -42,31 +48,71 @@ try:
     from dotenv import load_dotenv
 except ImportError:
     _DOTENV_AVAILABLE = False
-else:
-    for _candidate in (
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
-        os.path.join(os.getcwd(), ".env"),
-    ):
+    load_dotenv = None
+
+
+def _load_env_file(path):
+    """
+    Minimal KEY=VALUE reader, used when python-dotenv is not installed.
+
+    Deliberately narrow: no interpolation, no multi-line values, no export
+    keyword. It only has to read the handful of lines .env.example documents.
+    Existing environment variables win, matching load_dotenv's default.
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as handle:
+            lines = handle.readlines()
+    except OSError as exc:
+        log.warning("Could not read %s: %s", path, exc)
+        return
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        name = name.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if name and name not in os.environ:
+            os.environ[name] = value
+
+
+for _folder in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
+    for _name in (".env", ".env.txt"):
+        _candidate = os.path.join(_folder, _name)
         if _candidate in _DOTENV_SEARCHED:
             continue
         _DOTENV_SEARCHED.append(_candidate)
-        if os.path.isfile(_candidate):
+        if not os.path.isfile(_candidate):
+            continue
+        if _DOTENV_AVAILABLE:
             load_dotenv(_candidate)
-            _DOTENV_LOADED_FROM = _candidate
-            break
+        else:
+            _load_env_file(_candidate)
+        _DOTENV_LOADED_FROM = _candidate
+        if _name == ".env.txt":
+            log.warning(
+                "Loaded credentials from %s. Rename it to exactly .env -- "
+                "Notepad added the .txt.", _candidate,
+            )
+        break
+    if _DOTENV_LOADED_FROM:
+        break
 
 
 def _credentials_diagnostic():
     """Explain why credentials are missing, rather than just that they are."""
     lines = []
-    if not _DOTENV_AVAILABLE:
-        lines.append(
-            "  - python-dotenv is not installed in this interpreter, so any .env "
-            "file was ignored. Install it with: python -m pip install python-dotenv"
-        )
-    elif _DOTENV_LOADED_FROM:
-        lines.append(f"  - Loaded .env from {_DOTENV_LOADED_FROM}, but it did not set the value.")
+    if _DOTENV_LOADED_FROM:
+        lines.append(f"  - Loaded {_DOTENV_LOADED_FROM}, but it did not set the value.")
         lines.append("    Check for typos, and that lines look like TS_API_KEY=abc (no quotes, no spaces around =).")
+        lines.append("    A value the shell already exported wins over the file, so check for a stale $env: too.")
     else:
         lines.append("  - No .env file found. Looked in:")
         for path in _DOTENV_SEARCHED:
@@ -80,12 +126,12 @@ def _credentials_diagnostic():
                     os.path.join(folder, n)
                     for n in os.listdir(folder)
                     if n.lower().startswith(".env")
-                    and n.lower() not in (".env", ".env.example")
+                    and n.lower() not in (".env", ".env.txt", ".env.example")
                 ]
             except OSError:
                 pass
         if stray:
-            lines.append("    Found these instead -- Notepad appends .txt when saving:")
+            lines.append("    Found these instead:")
             for path in sorted(set(stray)):
                 lines.append(f"      {path}")
             lines.append("    Rename the right one to exactly .env")
@@ -94,8 +140,6 @@ def _credentials_diagnostic():
     lines.append('      $env:TS_API_KEY="..."')
     lines.append('      $env:TS_API_SECRET="..."')
     return "\n".join(lines)
-
-log = logging.getLogger(__name__)
 
 # =============================
 # CONFIG

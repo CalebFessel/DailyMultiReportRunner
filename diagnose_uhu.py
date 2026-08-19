@@ -218,6 +218,89 @@ def main():
             ],
         }
 
+    # ---- which stamp pair to trust ----
+    #
+    # enroute -> clear is the natural definition of a committed unit, but it is
+    # only as good as the crew's habit of pressing Clear. When Clear is really
+    # being set as the next call is assigned, consecutive legs butt up against
+    # each other and the span tiles the whole shift. That is measurable, so
+    # measure it rather than arguing about it.
+    print()
+    print("=" * 78)
+    print("CANDIDATE SPANS")
+    print("=" * 78)
+
+    todays_all = {
+        name: [s for s in spans if s[0].date() == target]
+        for name, spans in R.shift_instances(shifts, shift_offset).items()
+    }
+    todays_all = {n: s for n, s in todays_all.items() if s}
+    scheduled_total = sum(
+        (e - s).total_seconds() for spans in todays_all.values() for s, e in spans
+    ) / 3600.0
+
+    print(f"\n  Scheduled unit-hours on {target}: {scheduled_total:.1f}")
+    print(f"  {'span':<12} {'keys':<34} {'legs':>6} {'missing':>8} {'hours':>9} {'UHU':>7}")
+    for label, (s_key, e_key) in R.UHU_SPANS.items():
+        hours = 0.0
+        counted = missing = 0
+        for name, spans in todays_all.items():
+            for leg in legs_by_profile.get(name, []):
+                status = (leg.get("trip_status") or "").strip().lower()
+                if status in R.UHU_EXCLUDED_TRIP_STATUSES:
+                    continue
+                instance = R.assign_leg(leg, spans, s_key, e_key)
+                if instance is None:
+                    continue
+                stamps = R.timestamp_map(leg)
+                a = R.parse_ts(stamps.get(s_key))
+                b = R.parse_ts(stamps.get(e_key))
+                if not a or not b or b <= a:
+                    missing += 1
+                    continue
+                counted += 1
+                hours += R.overlap_minutes(a, b, instance[0], instance[1]) / 60.0
+        ratio = hours / scheduled_total if scheduled_total else 0.0
+        print(f"  {label:<12} {s_key + ' -> ' + e_key:<34} {counted:>6} {missing:>8} "
+              f"{hours:>9.1f} {ratio:>7.1%}")
+
+    # ---- is `clear` really the end of the call? ----
+    print()
+    print("  Gap between one leg clearing and the same unit going enroute again:")
+    gaps = []
+    for name, spans in todays_all.items():
+        ordered = []
+        for leg in legs_by_profile.get(name, []):
+            status = (leg.get("trip_status") or "").strip().lower()
+            if status in R.UHU_EXCLUDED_TRIP_STATUSES:
+                continue
+            stamps = R.timestamp_map(leg)
+            a = R.parse_ts(stamps.get("enroute"))
+            b = R.parse_ts(stamps.get("clear"))
+            if a and b:
+                ordered.append((a, b))
+        ordered.sort()
+        for (_, prev_clear), (next_enroute, _) in zip(ordered, ordered[1:]):
+            gaps.append((next_enroute - prev_clear).total_seconds())
+
+    if gaps:
+        gaps.sort()
+        within = lambda s: sum(1 for g in gaps if g <= s)
+        print(f"    {len(gaps)} consecutive pairs")
+        print(f"    within 10s : {within(10):>4}  ({within(10) / len(gaps):.0%})")
+        print(f"    within 60s : {within(60):>4}  ({within(60) / len(gaps):.0%})")
+        print(f"    within 5m  : {within(300):>4}  ({within(300) / len(gaps):.0%})")
+        print(f"    median     : {gaps[len(gaps) // 2] / 60.0:.1f} min")
+        if within(60) > len(gaps) * 0.5:
+            print()
+            print("    More than half the time this unit goes enroute on the next call")
+            print("    within a minute of clearing the last one. Clear is being set as")
+            print("    the next call is assigned, not when the call ended, so")
+            print("    enroute -> clear tiles the shift and overstates utilization.")
+    else:
+        print("    (no consecutive pairs to compare)")
+    print()
+
     out = Path("uhu_diagnosis.json")
     out.write_text(json.dumps(dump, indent=2, default=str), encoding="utf-8")
     print()

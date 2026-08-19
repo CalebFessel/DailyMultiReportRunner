@@ -109,8 +109,22 @@ STAFFING_EXCLUDED_LICENSE_LEVELS = {
 # like-for-like match -- see docs/API_MIGRATION.md.
 UHU_SPAN = os.getenv("UHU_SPAN", "task")
 UHU_SPANS = {
+    # enroute -> clear. The whole committed period in principle, but only as
+    # good as the crew's discipline about pressing Clear. On this tenant the
+    # next leg's enroute lands seconds after the previous leg's clear, which
+    # means clear is being set when the next call is assigned rather than when
+    # the last one ended -- so this tiles the shift and pushes UHU toward 100%.
     "task": ("enroute", "clear"),
+    # enroute -> at_destination. Dispatch to drop-off, stopping at a stamp the
+    # crew hits on arrival rather than one they get around to later. Drops the
+    # post-drop-off tail, which is where the sloppiness lives.
+    "transport": ("enroute", "at_destination"),
+    # transporting -> at_destination. Patient on board only; excludes response
+    # and on-scene time, so it understates a unit's real commitment.
     "loaded": ("transporting", "at_destination"),
+    # enroute -> at_scene. Response only. Not a utilization measure; useful as
+    # a floor when comparing candidates.
+    "response": ("enroute", "at_scene"),
 }
 
 # The UHU SQL excluded schedules named like Dispatch / Comm / Call, which are

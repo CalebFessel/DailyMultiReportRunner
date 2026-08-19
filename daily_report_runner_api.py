@@ -251,6 +251,38 @@ def write_uhu(reports, run_date_str, output_dir, append_dir):
 
 
 # =============================
+# MODULE COMPATIBILITY
+# =============================
+# The runner and the data layer are separate files, and on a machine where they
+# are copied in by hand it is easy to update one and not the other. Left
+# unchecked that surfaces as a KeyError partway through a run, minutes and a few
+# hundred API calls in, naming a report rather than the stale file. Check up
+# front instead, and say which file to replace.
+REQUIRED_BUILDERS = (
+    "build_runs_by_cost_center",
+    "build_runs_by_vehicle",
+    "shift_instances",
+    "resolve_shift_offset",
+    "parse_shift_ts",
+)
+
+
+def check_modules():
+    """Fail immediately, and legibly, when the data layer is out of date."""
+    missing = [name for name in REQUIRED_BUILDERS if not hasattr(R, name)]
+    if not missing:
+        return True
+    logging.error("%s is out of date and does not provide: %s",
+                  getattr(R, "__file__", "traumasoft_reports.py"), ", ".join(missing))
+    logging.error(
+        "Replace that file with the current version. If you saved it from a "
+        "browser it may have landed alongside it as 'traumasoft_reports (1).py' "
+        "rather than overwriting it."
+    )
+    return False
+
+
+# =============================
 # MAIN
 # =============================
 def main():
@@ -269,6 +301,9 @@ def main():
     logging.info("=== %s ===", JOB_NAME)
     logging.info("Metrics date: %s   test_mode=%s   dry_run=%s", run_date_str, TEST_MODE, dry_run)
     logging.info("Log: %s", log_path)
+
+    if not check_modules():
+        return 2
 
     backfilling = metrics_date < (date.today() - timedelta(days=1))
 

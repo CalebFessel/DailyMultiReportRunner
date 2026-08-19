@@ -1086,7 +1086,7 @@ def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN, shift_
 
     utilized = defaultdict(float)
     runs = Counter()
-    unattributed = 0
+    adjacent = orphaned = 0
     for leg in legs:
         name = leg.get("shift_name")
         if not name or _excluded_uhu_profile(name):
@@ -1099,9 +1099,14 @@ def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN, shift_
         spans = todays.get(name)
         instance = assign_leg(leg, spans, start_key, end_key)
         if spans and instance is None:
-            # The profile ran today, but this leg belongs to an adjacent
-            # instance -- the previous night's unit, or tomorrow's.
-            unattributed += 1
+            # Legs are fetched for the next day as well, to catch an overnight
+            # unit's tail, so most of these belong to an adjacent day's instance
+            # and are meant to be skipped. One belonging to no instance at all
+            # is the interesting case.
+            if assign_leg(leg, all_instances.get(name), start_key, end_key):
+                adjacent += 1
+            else:
+                orphaned += 1
             continue
 
         runs[name] += 1
@@ -1118,18 +1123,24 @@ def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN, shift_
         utilized[name] += minutes / 60.0
 
     attributed = sum(runs.values())
-    if unattributed:
+    total = attributed + adjacent + orphaned
+    if adjacent or orphaned:
         log.info(
-            "UHU: %s of %s leg(s) fell outside their profile's %s shift "
-            "instances (the adjacent night's unit, most likely).",
-            unattributed, unattributed + attributed, metrics_date,
+            "UHU %s: %s leg(s) counted, %s belong to an adjacent day's unit "
+            "(expected -- the next day is fetched for the overnight tail), "
+            "%s match no shift instance at all.",
+            metrics_date, attributed, adjacent, orphaned,
         )
-    if unattributed > attributed and unattributed > 20:
+    # Only an orphan is a real signal. A leg landing outside every instance of
+    # its own profile, on any date, is what a shift/trip clock mismatch looks
+    # like from the inside.
+    if orphaned > 20 and orphaned > total * 0.25:
         log.warning(
-            "UHU: most legs missed their shift instance entirely. That is the "
-            "signature of a shift/trip clock mismatch rather than real "
+            "UHU: %s of %s legs match no shift instance on any date. That is "
+            "the signature of a shift/trip clock mismatch rather than real "
             "scheduling -- check the offset applied to shift times "
-            "(TS_SHIFT_UTC_OFFSET_HOURS)."
+            "(TS_SHIFT_UTC_OFFSET_HOURS).",
+            orphaned, total,
         )
 
     rows = []
@@ -1160,8 +1171,13 @@ def build_uhu_by_shift_profile(shifts, legs, cost_center_map, metrics_date, span
 
 
 def build_uhu_by_cost_center(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN,
-                             shift_offset=None):
-    df = build_uhu(shifts, legs, cost_center_map, metrics_date, span, shift_offset)
+                             shift_offset=None, by_profile=None):
+    # by_profile lets a caller that already built the per-profile frame roll it
+    # up rather than rebuilding it, which also stops the diagnostics being
+    # logged twice for one run.
+    df = by_profile if by_profile is not None else build_uhu(
+        shifts, legs, cost_center_map, metrics_date, span, shift_offset
+    )
     if df.empty:
         return pd.DataFrame(
             columns=[
@@ -1299,6 +1315,9 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
         )
 
     scored = scored_legs(legs, cost_center_map)
+    uhu_by_profile = build_uhu_by_shift_profile(
+        shifts, uhu_legs, cost_center_map, metrics_date, shift_offset=shift_offset
+    )
 
     reports = {
         "otp_by_call_type": build_otp_by_call_type(scored),
@@ -1317,11 +1336,10 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
         "runs_by_cost_center": build_runs_by_cost_center(legs, cost_center_map),
         "runs_by_vehicle": build_runs_by_vehicle(legs, vehicles, cost_center_map),
         "uhu_by_cost_center": build_uhu_by_cost_center(
-            shifts, uhu_legs, cost_center_map, metrics_date, shift_offset=shift_offset
+            shifts, uhu_legs, cost_center_map, metrics_date,
+            shift_offset=shift_offset, by_profile=uhu_by_profile,
         ),
-        "uhu_by_shift_profile": build_uhu_by_shift_profile(
-            shifts, uhu_legs, cost_center_map, metrics_date, shift_offset=shift_offset
-        ),
+        "uhu_by_shift_profile": uhu_by_profile,
     }
 
     cost_center_map.save()

@@ -71,6 +71,8 @@ def main():
 
     log.info("Fetching trips for %s ...", target)
     legs = api.get_trips(target, range_days=1)
+    log.info("Fetching trips for %s (overnight tail) ...", target + timedelta(days=1))
+    legs += api.get_trips(target + timedelta(days=1), range_days=1)
     log.info("Fetching shifts (rolling window) ...")
     shifts = api.list_shifts()
     log.info("%s legs, %s shift rows", len(legs), len(shifts))
@@ -94,7 +96,7 @@ def main():
     if args.profile:
         chosen = list(dict.fromkeys(args.profile))
     else:
-        df = R.build_uhu(shifts, legs, R.CostCenterMap(), window_start, window_end)
+        df = R.build_uhu(shifts, legs, R.CostCenterMap(), target)
         chosen = []
         if not df.empty:
             worst_ratio = df[df["scheduled_hours"] > 0].nlargest(args.top, "uhu_ratio")
@@ -107,6 +109,7 @@ def main():
     dump = {
         "metrics_date": target.isoformat(),
         "window": [window_start.isoformat(), window_end.isoformat()],
+        "attribution": "shift-instance",
         "uhu_span": R.UHU_SPAN,
         "span_keys": [start_key, end_key],
         "generated": datetime.now().isoformat(timespec="seconds"),
@@ -122,7 +125,12 @@ def main():
         print(f"PROFILE: {name}")
         print("=" * 78)
 
+        instances = R.shift_instances(shifts).get(name, [])
+        todays = [s for s in instances if s[0].date() == target]
         print(f"\n  Shift records ({len(rows)}) -- window {window_start} .. {window_end}")
+        print(f"  Unit-shift instances starting {target}: {len(todays)}")
+        for s, e in todays:
+            print(f"    {s} -> {e}   ({(e - s).total_seconds() / 3600.0:.2f}h)")
         if not rows:
             print("    NONE. The rolling shift feed has nothing for this profile, so")
             print("    scheduled_hours is 0 and the ratio is meaningless.")
@@ -157,7 +165,14 @@ def main():
         for leg in profile_legs:
             stamps = R.timestamp_map(leg)
             span = R.span_minutes(leg, start_key, end_key)
-            hours = (span or 0.0) / 60.0
+            raw_hours = (span or 0.0) / 60.0
+            instance = R.assign_leg(leg, todays, start_key, end_key)
+            s_start_c = R.parse_ts(stamps.get(start_key))
+            s_end_c = R.parse_ts(stamps.get(end_key))
+            if instance and s_start_c and s_end_c:
+                hours = R.overlap_minutes(s_start_c, s_end_c, instance[0], instance[1]) / 60.0
+            else:
+                hours = raw_hours
             status = (leg.get("trip_status") or "").strip()
             counted = status.lower() not in R.UHU_EXCLUDED_TRIP_STATUSES
             if counted:
@@ -165,10 +180,14 @@ def main():
             flags = []
             if not counted:
                 flags.append(f"excluded({status})")
+            if todays and instance is None:
+                flags.append("NOT IN ANY INSTANCE -- adjacent night's unit")
+            elif instance and abs(raw_hours - hours) > 0.01:
+                flags.append(f"clipped from {raw_hours:.2f}h to the instance")
             if span is None:
                 flags.append(f"NO SPAN ({start_key}/{end_key} missing)")
-            elif hours > IMPLAUSIBLE_SPAN_HOURS:
-                flags.append(f"SPAN {hours:.1f}h -- likely never cleared")
+            elif raw_hours > IMPLAUSIBLE_SPAN_HOURS:
+                flags.append(f"RAW SPAN {raw_hours:.1f}h -- likely never cleared")
             s_start = R.parse_ts(stamps.get(start_key))
             s_end = R.parse_ts(stamps.get(end_key))
             if s_start and s_end and s_end.date() != s_start.date():

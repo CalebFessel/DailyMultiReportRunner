@@ -31,7 +31,7 @@ import json
 import logging
 from pathlib import Path
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, date, time
+from datetime import datetime, timedelta, date
 
 import pandas as pd
 
@@ -773,22 +773,16 @@ def build_vehicles_out_of_service(vehicles, oos_history, run_date, exclusions=No
 # =============================
 # UNIT-HOUR UTILIZATION
 # =============================
-def build_uhu(shifts, legs, cost_center_map, window_start, window_end, span=UHU_SPAN):
+def shift_instances(shifts):
     """
-    Scheduled vs utilized hours per shift profile.
+    shift_name -> the distinct unit-shifts the feed describes.
 
-    Scheduled hours are the portion of each shift overlapping the window,
-    counted once per unit rather than once per crew member. Utilized hours come
-    from real trip timestamps -- a better basis than the estimated durations the
-    SQL summed, but not the same number.
-
-    Only meaningful for a window inside the rolling shift feed. For an older
-    date the scheduled side is empty and the ratio is meaningless.
+    The feed returns one row per crew member, so the same unit-shift arrives two
+    or three times; identical (start, end) pairs collapse to one instance. This
+    is the unit-hour denominator: two medics on one truck for twelve hours is
+    twelve unit hours, not twenty-four.
     """
-    start_key, end_key = UHU_SPANS.get(span, UHU_SPANS["task"])
-
-    scheduled = defaultdict(float)
-    seen_units = defaultdict(set)
+    instances = defaultdict(set)
     for shift in shifts:
         if shift.get("deleted"):
             continue
@@ -797,15 +791,86 @@ def build_uhu(shifts, legs, cost_center_map, window_start, window_end, span=UHU_
             continue
         start = parse_ts(shift.get("start_time"))
         end = parse_ts(shift.get("end_time"))
-        # One unit's scheduled hours, not one per crew member on it.
-        unit_key = (name, start, end)
-        if unit_key in seen_units[name]:
+        if not start or not end or end <= start:
             continue
-        seen_units[name].add(unit_key)
-        scheduled[name] += overlap_minutes(start, end, window_start, window_end) / 60.0
+        instances[name].add((start, end))
+    return {name: sorted(spans) for name, spans in instances.items()}
+
+
+def leg_anchor(leg, start_key):
+    """When a leg committed its unit -- the span's own start, or the pickup."""
+    stamps = timestamp_map(leg)
+    return parse_ts(stamps.get(start_key)) or parse_ts(leg.get("pickup_time"))
+
+
+def assign_leg(leg, spans, start_key, end_key):
+    """
+    Which unit-shift a leg belongs to, or None.
+
+    A leg belongs to the instance running when it committed the unit. Falling
+    back to any instance the leg's span overlaps catches a call taken moments
+    before the shift's recorded start.
+    """
+    if not spans:
+        return None
+    anchor = leg_anchor(leg, start_key)
+    if anchor:
+        for span in spans:
+            if span[0] <= anchor < span[1]:
+                return span
+
+    stamps = timestamp_map(leg)
+    leg_start = parse_ts(stamps.get(start_key)) or anchor
+    leg_end = parse_ts(stamps.get(end_key))
+    if leg_start and leg_end:
+        overlapping = [
+            span for span in spans
+            if overlap_minutes(leg_start, leg_end, span[0], span[1]) > 0
+        ]
+        if overlapping:
+            return max(
+                overlapping,
+                key=lambda s: overlap_minutes(leg_start, leg_end, s[0], s[1]),
+            )
+    return None
+
+
+def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN):
+    """
+    Scheduled vs utilized hours per shift profile, attributed by shift instance.
+
+    A unit-shift is the unit of account, not the calendar day. A truck working
+    19:00 to 07:00 is one twelve-hour instance belonging to the day it started,
+    and the calls it runs after midnight belong to it too -- so `legs` must
+    cover the metrics date and the day after, or an overnight unit's tail is
+    lost. Utilized time is clipped to the instance for the same reason the
+    scheduled side is bounded by it: a leg whose clear stamp never fired would
+    otherwise contribute its full wall-clock span, and a unit cannot be utilized
+    after its crew went home.
+
+    Legs whose profile has no instance on this date still appear, with zero
+    scheduled hours and a meaningless ratio, rather than vanishing. That is the
+    normal state for a backfilled date -- the shift feed describes only a
+    rolling window around today and cannot be steered to an older one.
+    """
+    start_key, end_key = UHU_SPANS.get(span, UHU_SPANS["task"])
+    all_instances = shift_instances(shifts)
+
+    # A unit-shift belongs to the day it starts on.
+    todays = {
+        name: [s for s in spans if s[0].date() == metrics_date]
+        for name, spans in all_instances.items()
+    }
+    todays = {name: spans for name, spans in todays.items() if spans}
+
+    scheduled = {
+        name: sum((e - s).total_seconds() for s, e in spans) / 3600.0
+        for name, spans in todays.items()
+    }
 
     utilized = defaultdict(float)
     runs = Counter()
+    unattributed = 0
     for leg in legs:
         name = leg.get("shift_name")
         if not name or _excluded_uhu_profile(name):
@@ -815,13 +880,37 @@ def build_uhu(shifts, legs, cost_center_map, window_start, window_end, span=UHU_
         status = (leg.get("trip_status") or "").strip().lower()
         if status in UHU_EXCLUDED_TRIP_STATUSES:
             continue
+
+        spans = todays.get(name)
+        instance = assign_leg(leg, spans, start_key, end_key)
+        if spans and instance is None:
+            # The profile ran today, but this leg belongs to an adjacent
+            # instance -- the previous night's unit, or tomorrow's.
+            unattributed += 1
+            continue
+
         runs[name] += 1
-        minutes = span_minutes(leg, start_key, end_key)
-        if minutes:
-            utilized[name] += minutes / 60.0
+        stamps = timestamp_map(leg)
+        leg_start = parse_ts(stamps.get(start_key))
+        leg_end = parse_ts(stamps.get(end_key))
+        if not leg_start or not leg_end or leg_end <= leg_start:
+            continue
+        if instance:
+            minutes = overlap_minutes(leg_start, leg_end, instance[0], instance[1])
+        else:
+            # No schedule to bound it; the row carries no ratio either way.
+            minutes = (leg_end - leg_start).total_seconds() / 60.0
+        utilized[name] += minutes / 60.0
+
+    if unattributed:
+        log.info(
+            "UHU: %s leg(s) fell outside their profile's %s shift instances "
+            "(the adjacent night's unit, most likely).",
+            unattributed, metrics_date,
+        )
 
     rows = []
-    for name in sorted(set(scheduled) | set(utilized)):
+    for name in sorted(set(scheduled) | set(utilized) | set(runs)):
         scheduled_hours = round(scheduled.get(name, 0.0), 2)
         utilized_hours = round(utilized.get(name, 0.0), 2)
         total_runs = runs.get(name, 0)
@@ -839,15 +928,15 @@ def build_uhu(shifts, legs, cost_center_map, window_start, window_end, span=UHU_
     return pd.DataFrame(rows)
 
 
-def build_uhu_by_shift_profile(shifts, legs, cost_center_map, window_start, window_end, span=UHU_SPAN):
-    df = build_uhu(shifts, legs, cost_center_map, window_start, window_end, span)
+def build_uhu_by_shift_profile(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN):
+    df = build_uhu(shifts, legs, cost_center_map, metrics_date, span)
     if df.empty:
         return df
     return df.sort_values("uhu_ratio", ascending=False)
 
 
-def build_uhu_by_cost_center(shifts, legs, cost_center_map, window_start, window_end, span=UHU_SPAN):
-    df = build_uhu(shifts, legs, cost_center_map, window_start, window_end, span)
+def build_uhu_by_cost_center(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN):
+    df = build_uhu(shifts, legs, cost_center_map, metrics_date, span)
     if df.empty:
         return pd.DataFrame(
             columns=[
@@ -894,6 +983,15 @@ def fetch_day(api, metrics_date):
     log.info("Fetching trips for %s ...", metrics_date)
     legs = api.get_trips(metrics_date, range_days=1)
 
+    # UHU attributes a leg to the unit-shift that was running when it started,
+    # and an overnight shift's calls land on the following date. Those legs
+    # belong to this date's report but not to any other sheet, so they are
+    # fetched separately rather than widening `legs` under OTP and the fleet
+    # reports, which are strictly one-day.
+    log.info("Fetching trips for %s (overnight tail, UHU only) ...",
+             metrics_date + timedelta(days=1))
+    uhu_legs = legs + api.get_trips(metrics_date + timedelta(days=1), range_days=1)
+
     log.info("Fetching shifts (rolling window, not %s) ...", metrics_date)
     shifts = api.list_shifts()
 
@@ -904,12 +1002,14 @@ def fetch_day(api, metrics_date):
     vehicles = api.list_vehicles()
 
     log.info(
-        "Fetched %s legs, %s shift rows, %s employees, %s vehicles",
-        len(legs), len(shifts), len(employees), len(vehicles),
+        "Fetched %s legs (%s including the overnight tail), %s shift rows, "
+        "%s employees, %s vehicles",
+        len(legs), len(uhu_legs), len(shifts), len(employees), len(vehicles),
     )
     return {
         "metrics_date": metrics_date,
         "legs": legs,
+        "uhu_legs": uhu_legs,
         "shifts": shifts,
         "employees": employees,
         "vehicles": vehicles,
@@ -941,6 +1041,9 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
     """Build every report DataFrame from one fetch, refreshing accumulated state."""
     metrics_date = data["metrics_date"]
     legs = data["legs"]
+    # Absent when a caller built the fetch dict itself; UHU then loses only the
+    # overnight tail rather than failing.
+    uhu_legs = data.get("uhu_legs") or legs
     shifts = data["shifts"]
     employees = data["employees"]
     vehicles = data["vehicles"]
@@ -965,8 +1068,6 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
         )
 
     scored = scored_legs(legs, cost_center_map)
-    window_start = datetime.combine(metrics_date, time(0, 0))
-    window_end = window_start + timedelta(days=1)
 
     reports = {
         "otp_by_call_type": build_otp_by_call_type(scored),
@@ -983,10 +1084,10 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
             vehicles, oos_history, metrics_date, exclusions, fleet_activity
         ),
         "uhu_by_cost_center": build_uhu_by_cost_center(
-            shifts, legs, cost_center_map, window_start, window_end
+            shifts, uhu_legs, cost_center_map, metrics_date
         ),
         "uhu_by_shift_profile": build_uhu_by_shift_profile(
-            shifts, legs, cost_center_map, window_start, window_end
+            shifts, uhu_legs, cost_center_map, metrics_date
         ),
     }
 

@@ -43,6 +43,7 @@ log = logging.getLogger(__name__)
 # State that has to survive between runs because the API cannot reproduce it.
 STATE_DIR = os.getenv("TS_STATE_DIR", "state")
 COST_CENTER_MAP_FILE = os.path.join(STATE_DIR, "shift_cost_center_map.json")
+COST_CENTER_OVERRIDES_FILE = os.path.join(STATE_DIR, "shift_cost_center_overrides.json")
 OOS_HISTORY_FILE = os.path.join(STATE_DIR, "vehicle_oos_history.json")
 
 # Trip timestamp names this tenant emits, in preference order, for the moment a
@@ -151,6 +152,12 @@ SHIFT_UTC_OFFSET_HOURS = float(_offset_override) if _offset_override else None
 
 UNASSIGNED_COST_CENTER = "No Cost Center Assigned"
 UNASSIGNED_VEHICLE = "No Vehicle Assigned"
+
+# A trip row with a blank trip_status. Excluded from run counts by default --
+# see is_run.
+COUNT_STATUSLESS_LEGS = os.getenv("TS_COUNT_STATUSLESS_LEGS", "0").strip().lower() in (
+    "1", "true", "yes",
+)
 
 
 # =============================
@@ -317,10 +324,14 @@ class CostCenterMap:
     contested ones stay visible via `ambiguous()`.
     """
 
-    def __init__(self, path=COST_CENTER_MAP_FILE):
+    def __init__(self, path=COST_CENTER_MAP_FILE, overrides_path=COST_CENTER_OVERRIDES_FILE):
         self.path = path
+        self.overrides_path = overrides_path
         self.counts = defaultdict(Counter)
+        self.override_names = {}
+        self.override_prefixes = []
         self._load()
+        self._load_overrides()
 
     def _load(self):
         try:
@@ -361,11 +372,53 @@ class CostCenterMap:
         )
         return learned
 
+    def _load_overrides(self):
+        """
+        Hand-written mappings, for profiles the crew route can never reach.
+
+        Some profiles carry real runs but no scheduled crew -- outsourced work
+        is the obvious case -- so no amount of accumulating will attribute them.
+        A deliberate mapping is the only answer, and it wins over what was
+        learned, being a decision rather than an observation.
+        """
+        try:
+            with open(self.overrides_path, "r", encoding="utf-8") as handle:
+                stored = json.load(handle)
+        except (FileNotFoundError, ValueError):
+            return
+        self.override_names = {
+            str(k).strip().lower(): v
+            for k, v in (stored.get("by_name") or {}).items() if v
+        }
+        # Longest prefix first, so a specific rule beats a general one.
+        self.override_prefixes = sorted(
+            ((str(k).strip().lower(), v) for k, v in (stored.get("by_prefix") or {}).items() if v),
+            key=lambda kv: -len(kv[0]),
+        )
+        if self.override_names or self.override_prefixes:
+            log.info(
+                "Cost-center overrides: %s exact, %s prefix rule(s) from %s",
+                len(self.override_names), len(self.override_prefixes), self.overrides_path,
+            )
+
     def resolve(self, shift_name):
         """Dominant cost center for a shift profile, or None if unknown."""
         if not shift_name:
             return None
+        lowered = str(shift_name).strip().lower()
+        if lowered in self.override_names:
+            return self.override_names[lowered]
+        for prefix, centre in self.override_prefixes:
+            if lowered.startswith(prefix):
+                return centre
         counter = self.counts.get(shift_name)
+        if not counter:
+            # Trailing spaces and casing drift between the trip and shift feeds;
+            # fall back to a normalized match before giving up.
+            for name, stored in self.counts.items():
+                if str(name).strip().lower() == lowered:
+                    counter = stored
+                    break
         if not counter:
             return None
         # most_common breaks ties by insertion order; sort for determinism.
@@ -952,9 +1005,24 @@ def assign_leg(leg, spans, start_key, end_key):
 # =============================
 # RUN VOLUME
 # =============================
+def has_status(leg):
+    """Whether a leg says anything at all about how it ended."""
+    return bool((leg.get("trip_status") or "").strip())
+
+
 def is_run(leg):
-    """Whether a leg actually ran, by the same rule UHU counts by."""
+    """
+    Whether a leg actually ran, by the same rule UHU counts by.
+
+    A leg carrying no status at all is missing data, not evidence of a
+    completed transport, and on this tenant those legs carry no shift either --
+    the same signature as a call cancelled before it was ever assigned. Counting
+    them would quietly inflate run volume, so they are excluded by default.
+    Set TS_COUNT_STATUSLESS_LEGS=1 to count them instead.
+    """
     status = (leg.get("trip_status") or "").strip().lower()
+    if not status:
+        return COUNT_STATUSLESS_LEGS
     return status not in UHU_EXCLUDED_TRIP_STATUSES
 
 
@@ -967,16 +1035,27 @@ def build_runs_by_cost_center(legs, cost_center_map):
     settles on. Cancellations are counted separately rather than dropped, so a
     quiet day and a day full of cancelled calls do not look the same.
     """
-    runs, cancelled = Counter(), Counter()
+    runs, cancelled, no_status = Counter(), Counter(), Counter()
     vehicles_seen = defaultdict(set)
+    statusless = sum(1 for leg in legs if not has_status(leg))
+    if statusless:
+        log.info(
+            "Run volume: %s leg(s) carry no trip_status and are %s. "
+            "Set TS_COUNT_STATUSLESS_LEGS=1 to change that.",
+            statusless, "counted" if COUNT_STATUSLESS_LEGS else "not counted as runs",
+        )
     for leg in legs:
         centre = cost_center_map.resolve(leg.get("shift_name")) or UNASSIGNED_COST_CENTER
         if is_run(leg):
             runs[centre] += 1
             if leg.get("vehicle_id"):
                 vehicles_seen[centre].add(str(leg.get("vehicle_id")))
-        else:
+        elif has_status(leg):
             cancelled[centre] += 1
+        else:
+            # Neither a run nor a cancellation -- the row says nothing. Calling
+            # it cancelled would invent a fact.
+            no_status[centre] += 1
 
     rows = [
         {
@@ -986,8 +1065,9 @@ def build_runs_by_cost_center(legs, cost_center_map):
             "runs_per_vehicle": round(runs.get(centre, 0) / len(vehicles_seen[centre]), 2)
             if vehicles_seen.get(centre) else 0,
             "cancelled_legs": cancelled.get(centre, 0),
+            "no_status_legs": no_status.get(centre, 0),
         }
-        for centre in sorted(set(runs) | set(cancelled))
+        for centre in sorted(set(runs) | set(cancelled) | set(no_status))
     ]
     df = pd.DataFrame(rows)
     return df.sort_values("total_runs", ascending=False) if not df.empty else df
@@ -1007,7 +1087,7 @@ def build_runs_by_vehicle(legs, vehicles, cost_center_map):
     """
     by_id = {str(v.get("id")): v for v in vehicles if v.get("id")}
 
-    runs, cancelled = Counter(), Counter()
+    runs, cancelled, no_status = Counter(), Counter(), Counter()
     centres = defaultdict(Counter)
     names = {}
     for leg in legs:
@@ -1022,11 +1102,13 @@ def build_runs_by_vehicle(legs, vehicles, cost_center_map):
         if is_run(leg):
             runs[key] += 1
             centres[key][cost_center_map.resolve(leg.get("shift_name")) or UNASSIGNED_COST_CENTER] += 1
-        else:
+        elif has_status(leg):
             cancelled[key] += 1
+        else:
+            no_status[key] += 1
 
     rows = []
-    for key in sorted(set(runs) | set(cancelled)):
+    for key in sorted(set(runs) | set(cancelled) | set(no_status)):
         vehicle = by_id.get(key, {})
         if key == UNASSIGNED_VEHICLE:
             # Not a missing vehicle record -- a leg that named no vehicle.
@@ -1045,6 +1127,7 @@ def build_runs_by_vehicle(legs, vehicles, cost_center_map):
                 "cost_centers_served": len(served),
                 "total_runs": runs.get(key, 0),
                 "cancelled_legs": cancelled.get(key, 0),
+                "no_status_legs": no_status.get(key, 0),
             }
         )
     df = pd.DataFrame(rows)

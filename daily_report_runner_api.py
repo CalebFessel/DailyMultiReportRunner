@@ -187,9 +187,40 @@ def write_vehicles(reports, run_date_str, output_dir, append_dir):
     )
     OUT._append_to_workbook_xlsx(
         append_path, "Out Of Service", reports["vehicles_out_of_service"],
-        dedupe_keys=["snapshot_date", "vehicle_id"], snapshot_date_value=run_date_str,
+        # Keyed on the name, not the id: Excel reads a column of digit strings
+        # back as integers, so "7" never matches the 7 that comes out of the
+        # append file and a same-day re-run appends instead of replacing.
+        dedupe_keys=["snapshot_date", "vehicle_name"], snapshot_date_value=run_date_str,
     )
     return f"Summary={len(reports['vehicle_summary'])}, OOS={len(reports['vehicles_out_of_service'])}", path
+
+
+def write_runs(reports, run_date_str, output_dir, append_dir):
+    path = os.path.join(output_dir, f"Daily_Run_Volume_{run_date_str}.xlsx")
+    _write_workbook(path, {
+        "Runs by Cost Center": reports["runs_by_cost_center"],
+        "Runs by Vehicle": reports["runs_by_vehicle"],
+    })
+
+    OUT._append_to_workbook_xlsx(
+        os.path.join(append_dir, "Daily_Run_Volume_By_Cost_Center_APPEND.xlsx"),
+        "Runs by Cost Center", reports["runs_by_cost_center"],
+        dedupe_keys=["snapshot_date", "cost_center_name"], snapshot_date_value=run_date_str,
+    )
+    OUT._append_to_workbook_xlsx(
+        os.path.join(append_dir, "Daily_Run_Volume_By_Vehicle_APPEND.xlsx"),
+        "Runs by Vehicle", reports["runs_by_vehicle"],
+        # Keyed on the name for the same reason as the vehicle overview above.
+        dedupe_keys=["snapshot_date", "vehicle_name"], snapshot_date_value=run_date_str,
+    )
+
+    cc = reports["runs_by_cost_center"]
+    veh = reports["runs_by_vehicle"]
+    total = int(cc["total_runs"].sum()) if not cc.empty else 0
+    return (
+        f"{total} runs across {len(cc)} cost center(s) and {len(veh)} vehicle(s)",
+        [path],
+    )
 
 
 def write_uhu(reports, run_date_str, output_dir, append_dir):
@@ -270,6 +301,7 @@ def main():
         ("Staffing", write_staffing),
         ("Daily Vehicle Overview", write_vehicles),
         ("Unit-Hour Utilization", write_uhu),
+        ("Run Volume", write_runs),
     ]
     for name, writer in writers:
         logging.info("--- Running: %s ---", name)

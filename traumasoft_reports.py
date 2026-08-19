@@ -150,6 +150,7 @@ _offset_override = os.getenv("TS_SHIFT_UTC_OFFSET_HOURS", "").strip()
 SHIFT_UTC_OFFSET_HOURS = float(_offset_override) if _offset_override else None
 
 UNASSIGNED_COST_CENTER = "No Cost Center Assigned"
+UNASSIGNED_VEHICLE = "No Vehicle Assigned"
 
 
 # =============================
@@ -948,6 +949,108 @@ def assign_leg(leg, spans, start_key, end_key):
     return None
 
 
+# =============================
+# RUN VOLUME
+# =============================
+def is_run(leg):
+    """Whether a leg actually ran, by the same rule UHU counts by."""
+    status = (leg.get("trip_status") or "").strip().lower()
+    return status not in UHU_EXCLUDED_TRIP_STATUSES
+
+
+def build_runs_by_cost_center(legs, cost_center_map):
+    """
+    Transport volume per cost center for the day.
+
+    A count, not a duration, so unlike UHU it does not depend on crews clearing
+    a call promptly -- it is unaffected by whatever the utilized-time span
+    settles on. Cancellations are counted separately rather than dropped, so a
+    quiet day and a day full of cancelled calls do not look the same.
+    """
+    runs, cancelled = Counter(), Counter()
+    vehicles_seen = defaultdict(set)
+    for leg in legs:
+        centre = cost_center_map.resolve(leg.get("shift_name")) or UNASSIGNED_COST_CENTER
+        if is_run(leg):
+            runs[centre] += 1
+            if leg.get("vehicle_id"):
+                vehicles_seen[centre].add(str(leg.get("vehicle_id")))
+        else:
+            cancelled[centre] += 1
+
+    rows = [
+        {
+            "cost_center_name": centre,
+            "total_runs": runs.get(centre, 0),
+            "vehicles_used": len(vehicles_seen.get(centre, ())),
+            "runs_per_vehicle": round(runs.get(centre, 0) / len(vehicles_seen[centre]), 2)
+            if vehicles_seen.get(centre) else 0,
+            "cancelled_legs": cancelled.get(centre, 0),
+        }
+        for centre in sorted(set(runs) | set(cancelled))
+    ]
+    df = pd.DataFrame(rows)
+    return df.sort_values("total_runs", ascending=False) if not df.empty else df
+
+
+def build_runs_by_vehicle(legs, vehicles, cost_center_map):
+    """
+    Transport volume per vehicle for the day.
+
+    Every vehicle that ran appears, including ones the fleet reports exclude: an
+    exclusion means a truck is decommissioned, and one that ran legs today
+    plainly is not. Dropping it here would also stop the vehicle rows summing to
+    the cost-center rows, which is the first thing anyone checks.
+
+    A vehicle can work for more than one cost center in a day, so the dominant
+    one is named and `cost_centers_served` says whether to trust it.
+    """
+    by_id = {str(v.get("id")): v for v in vehicles if v.get("id")}
+
+    runs, cancelled = Counter(), Counter()
+    centres = defaultdict(Counter)
+    names = {}
+    for leg in legs:
+        # A leg with no vehicle still happened. Bucketing it rather than
+        # skipping it keeps the vehicle rows summing to the cost-center rows,
+        # and puts the gap on the sheet where someone can see it.
+        key = str(leg.get("vehicle_id") or UNASSIGNED_VEHICLE)
+        # Trip rows carry a name too, which is the only one left for a vehicle
+        # deleted since the leg ran.
+        if leg.get("vehicle_name"):
+            names.setdefault(key, leg.get("vehicle_name"))
+        if is_run(leg):
+            runs[key] += 1
+            centres[key][cost_center_map.resolve(leg.get("shift_name")) or UNASSIGNED_COST_CENTER] += 1
+        else:
+            cancelled[key] += 1
+
+    rows = []
+    for key in sorted(set(runs) | set(cancelled)):
+        vehicle = by_id.get(key, {})
+        if key == UNASSIGNED_VEHICLE:
+            # Not a missing vehicle record -- a leg that named no vehicle.
+            vehicle = {"id": "", "name": UNASSIGNED_VEHICLE, "vehicle_status": "n/a"}
+        served = centres.get(key) or Counter()
+        rows.append(
+            {
+                "vehicle_id": vehicle.get("id", key),
+                "vehicle_name": vehicle.get("name") or names.get(key) or key,
+                "vehicle_status": vehicle.get("vehicle_status") or "Not in vehicle list",
+                "cost_center_name": (
+                    # Ties break on name so a re-run cannot reorder the sheet.
+                    sorted(served.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+                    if served else UNASSIGNED_COST_CENTER
+                ),
+                "cost_centers_served": len(served),
+                "total_runs": runs.get(key, 0),
+                "cancelled_legs": cancelled.get(key, 0),
+            }
+        )
+    df = pd.DataFrame(rows)
+    return df.sort_values("total_runs", ascending=False) if not df.empty else df
+
+
 def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN, shift_offset=None):
     """
     Scheduled vs utilized hours per shift profile, attributed by shift instance.
@@ -990,8 +1093,7 @@ def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN, shift_
             continue
         # A cancelled or disregarded leg was never a run and must not dilute
         # hours-per-run, even though it still carries a shift assignment.
-        status = (leg.get("trip_status") or "").strip().lower()
-        if status in UHU_EXCLUDED_TRIP_STATUSES:
+        if not is_run(leg):
             continue
 
         spans = todays.get(name)
@@ -1212,6 +1314,8 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
         "vehicles_out_of_service": build_vehicles_out_of_service(
             vehicles, oos_history, metrics_date, exclusions, fleet_activity
         ),
+        "runs_by_cost_center": build_runs_by_cost_center(legs, cost_center_map),
+        "runs_by_vehicle": build_runs_by_vehicle(legs, vehicles, cost_center_map),
         "uhu_by_cost_center": build_uhu_by_cost_center(
             shifts, uhu_legs, cost_center_map, metrics_date, shift_offset=shift_offset
         ),

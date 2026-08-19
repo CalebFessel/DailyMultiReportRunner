@@ -123,6 +123,18 @@ UHU_EXCLUDED_PROFILE_PATTERNS = ("dispatch", "comm", "call")
 # this tenant for legs that never ran.
 UHU_EXCLUDED_TRIP_STATUSES = {"canceled", "cancelled", "disregard", "no transport"}
 
+# /Schedule/Shifts returns start_time and end_time as bare UTC wall time, while
+# trips return local time with an explicit offset. Left unreconciled, every
+# comparison between a shift and a trip -- or between a shift and "now" -- is
+# wrong by the tenant's offset. Set TS_SHIFT_TIMES_ARE_UTC=0 if Traumasoft ever
+# starts returning these as local, and TS_SHIFT_UTC_OFFSET_HOURS to pin the
+# offset when a day's trips carry none to read it from.
+SHIFT_TIMES_ARE_UTC = os.getenv("TS_SHIFT_TIMES_ARE_UTC", "1").strip().lower() not in (
+    "0", "false", "no",
+)
+_offset_override = os.getenv("TS_SHIFT_UTC_OFFSET_HOURS", "").strip()
+SHIFT_UTC_OFFSET_HOURS = float(_offset_override) if _offset_override else None
+
 UNASSIGNED_COST_CENTER = "No Cost Center Assigned"
 
 
@@ -190,6 +202,75 @@ def span_minutes(leg, start_key, end_key):
     if not start or not end or end <= start:
         return None
     return (end - start).total_seconds() / 60.0
+
+
+def parse_ts_aware(value):
+    """Like parse_ts, but keeps the offset when the value carries one."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def tenant_utc_offset(legs):
+    """
+    The tenant's current UTC offset, read from the trip timestamps themselves.
+
+    Trip stamps arrive as local time with an explicit offset ('-04:00'); shift
+    start/end arrive as bare UTC wall time with none. Comparing the two without
+    reconciling them is wrong by the offset -- four hours on Eastern daylight
+    time -- which silently misplaces every shift.
+
+    Taking the offset from the response rather than a config value means it
+    follows the tenant across daylight saving without anyone remembering to
+    change it, and needs no timezone database on the machine.
+    """
+    counts = Counter()
+    for leg in legs:
+        for value in timestamp_map(leg).values():
+            parsed = parse_ts_aware(value)
+            if parsed is not None and parsed.tzinfo is not None:
+                counts[parsed.utcoffset()] += 1
+    if not counts:
+        return None
+    return counts.most_common(1)[0][0]
+
+
+def resolve_shift_offset(legs):
+    """The offset to add to a shift's UTC time to reach tenant-local time."""
+    if not SHIFT_TIMES_ARE_UTC:
+        return timedelta(0)
+    if SHIFT_UTC_OFFSET_HOURS is not None:
+        return timedelta(hours=SHIFT_UTC_OFFSET_HOURS)
+    offset = tenant_utc_offset(legs)
+    if offset is None:
+        log.warning(
+            "No trip timestamp carried a UTC offset, so shift times cannot be "
+            "converted to local. Scheduled hours and staffing will be wrong by "
+            "the tenant's offset. Set TS_SHIFT_UTC_OFFSET_HOURS to fix it."
+        )
+        return timedelta(0)
+    return offset
+
+
+def parse_shift_ts(value, offset=None):
+    """
+    Parse a shift start/end into tenant-local naive time.
+
+    The feed returns these as bare UTC; every other timestamp in the reports is
+    local, so they are shifted into line here rather than at each comparison.
+    """
+    parsed = parse_ts(value)
+    if parsed is None or not offset:
+        return parsed
+    return parsed + offset
 
 
 def overlap_minutes(start, end, window_start, window_end):
@@ -512,7 +593,7 @@ def _excluded_uhu_profile(name):
     return any(pattern in lowered for pattern in UHU_EXCLUDED_PROFILE_PATTERNS)
 
 
-def _staffing_rows(shifts, employees, predicate):
+def _staffing_rows(shifts, employees, predicate, shift_offset=None):
     """
     Collapse crew-level shift rows into one row per staffed unit.
 
@@ -526,8 +607,8 @@ def _staffing_rows(shifts, employees, predicate):
     )
 
     for shift in shifts:
-        start = parse_ts(shift.get("start_time"))
-        end = parse_ts(shift.get("end_time"))
+        start = parse_shift_ts(shift.get("start_time"), shift_offset)
+        end = parse_shift_ts(shift.get("end_time"), shift_offset)
         if not start or not end or not predicate(start, end):
             continue
         if shift.get("deleted"):
@@ -587,14 +668,14 @@ def _staffing_rows(shifts, employees, predicate):
     return df.sort_values(["cost_center", "shift_profile", "start_time"])
 
 
-def build_staffing_active_now(shifts, employees, as_of):
+def build_staffing_active_now(shifts, employees, as_of, shift_offset=None):
     """Units staffed at a moment in time."""
-    return _staffing_rows(shifts, employees, lambda s, e: s <= as_of <= e)
+    return _staffing_rows(shifts, employees, lambda s, e: s <= as_of <= e, shift_offset)
 
 
-def build_staffing_for_date(shifts, employees, target_date):
+def build_staffing_for_date(shifts, employees, target_date, shift_offset=None):
     """Units whose shift starts on a given calendar day."""
-    return _staffing_rows(shifts, employees, lambda s, e: s.date() == target_date)
+    return _staffing_rows(shifts, employees, lambda s, e: s.date() == target_date, shift_offset)
 
 
 # =============================
@@ -773,7 +854,7 @@ def build_vehicles_out_of_service(vehicles, oos_history, run_date, exclusions=No
 # =============================
 # UNIT-HOUR UTILIZATION
 # =============================
-def shift_instances(shifts):
+def shift_instances(shifts, shift_offset=None):
     """
     shift_name -> the distinct unit-shifts the feed describes.
 
@@ -789,12 +870,30 @@ def shift_instances(shifts):
         name = shift.get("shift_name")
         if not name or _excluded_uhu_profile(name):
             continue
-        start = parse_ts(shift.get("start_time"))
-        end = parse_ts(shift.get("end_time"))
+        start = parse_shift_ts(shift.get("start_time"), shift_offset)
+        end = parse_shift_ts(shift.get("end_time"), shift_offset)
         if not start or not end or end <= start:
             continue
         instances[name].add((start, end))
-    return {name: sorted(spans) for name, spans in instances.items()}
+    return {name: _merge_spans(spans) for name, spans in instances.items()}
+
+
+def _merge_spans(spans):
+    """
+    Collapse overlapping unit-shifts into the period the unit was covered.
+
+    Crew on one truck rarely start and finish together -- a partner leaving
+    early is two rows with the same start and different ends, which is one
+    truck, not two. Summing them would bill the unit twice for the same hour.
+    Shifts that merely meet end-to-end are left alone; those are a handover.
+    """
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start < merged[-1][1]:
+            merged[-1] = [merged[-1][0], max(merged[-1][1], end)]
+        else:
+            merged.append([start, end])
+    return [tuple(span) for span in merged]
 
 
 def leg_anchor(leg, start_key):
@@ -835,7 +934,7 @@ def assign_leg(leg, spans, start_key, end_key):
     return None
 
 
-def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN):
+def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN, shift_offset=None):
     """
     Scheduled vs utilized hours per shift profile, attributed by shift instance.
 
@@ -854,7 +953,7 @@ def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN):
     rolling window around today and cannot be steered to an older one.
     """
     start_key, end_key = UHU_SPANS.get(span, UHU_SPANS["task"])
-    all_instances = shift_instances(shifts)
+    all_instances = shift_instances(shifts, shift_offset)
 
     # A unit-shift belongs to the day it starts on.
     todays = {
@@ -902,11 +1001,19 @@ def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN):
             minutes = (leg_end - leg_start).total_seconds() / 60.0
         utilized[name] += minutes / 60.0
 
+    attributed = sum(runs.values())
     if unattributed:
         log.info(
-            "UHU: %s leg(s) fell outside their profile's %s shift instances "
-            "(the adjacent night's unit, most likely).",
-            unattributed, metrics_date,
+            "UHU: %s of %s leg(s) fell outside their profile's %s shift "
+            "instances (the adjacent night's unit, most likely).",
+            unattributed, unattributed + attributed, metrics_date,
+        )
+    if unattributed > attributed and unattributed > 20:
+        log.warning(
+            "UHU: most legs missed their shift instance entirely. That is the "
+            "signature of a shift/trip clock mismatch rather than real "
+            "scheduling -- check the offset applied to shift times "
+            "(TS_SHIFT_UTC_OFFSET_HOURS)."
         )
 
     rows = []
@@ -928,15 +1035,17 @@ def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN):
     return pd.DataFrame(rows)
 
 
-def build_uhu_by_shift_profile(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN):
-    df = build_uhu(shifts, legs, cost_center_map, metrics_date, span)
+def build_uhu_by_shift_profile(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN,
+                               shift_offset=None):
+    df = build_uhu(shifts, legs, cost_center_map, metrics_date, span, shift_offset)
     if df.empty:
         return df
     return df.sort_values("uhu_ratio", ascending=False)
 
 
-def build_uhu_by_cost_center(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN):
-    df = build_uhu(shifts, legs, cost_center_map, metrics_date, span)
+def build_uhu_by_cost_center(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN,
+                             shift_offset=None):
+    df = build_uhu(shifts, legs, cost_center_map, metrics_date, span, shift_offset)
     if df.empty:
         return pd.DataFrame(
             columns=[
@@ -1049,6 +1158,12 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
     vehicles = data["vehicles"]
     now = now or datetime.now()
 
+    # Shift times are UTC while everything else is local; resolve the gap once
+    # from the trips themselves and hand it to everything that reads a shift.
+    shift_offset = resolve_shift_offset(uhu_legs)
+    if shift_offset:
+        log.info("Shift times shifted by %s to reach tenant-local time.", shift_offset)
+
     cost_center_map = cost_center_map or CostCenterMap()
     oos_history = oos_history or OutOfServiceHistory()
     exclusions = exclusions if exclusions is not None else VehicleExclusions()
@@ -1072,9 +1187,9 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
     reports = {
         "otp_by_call_type": build_otp_by_call_type(scored),
         "otp_by_cost_center": build_otp_by_cost_center(scored),
-        "staffing_active_now": build_staffing_active_now(shifts, employees, now),
+        "staffing_active_now": build_staffing_active_now(shifts, employees, now, shift_offset),
         "staffing_tomorrow": build_staffing_for_date(
-            shifts, employees, now.date() + timedelta(days=1)
+            shifts, employees, now.date() + timedelta(days=1), shift_offset
         ),
         "vehicle_summary": build_vehicle_summary(vehicles, legs, metrics_date, exclusions),
         "vehicles_in_use": build_vehicles_in_use(vehicles, legs, exclusions),
@@ -1084,10 +1199,10 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
             vehicles, oos_history, metrics_date, exclusions, fleet_activity
         ),
         "uhu_by_cost_center": build_uhu_by_cost_center(
-            shifts, uhu_legs, cost_center_map, metrics_date
+            shifts, uhu_legs, cost_center_map, metrics_date, shift_offset=shift_offset
         ),
         "uhu_by_shift_profile": build_uhu_by_shift_profile(
-            shifts, uhu_legs, cost_center_map, metrics_date
+            shifts, uhu_legs, cost_center_map, metrics_date, shift_offset=shift_offset
         ),
     }
 

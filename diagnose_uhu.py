@@ -77,6 +77,11 @@ def main():
     shifts = api.list_shifts()
     log.info("%s legs, %s shift rows", len(legs), len(shifts))
 
+    # Shift times arrive as UTC while trips are local; the trips carry the
+    # tenant's offset, so it is read from them rather than configured.
+    shift_offset = R.resolve_shift_offset(legs)
+    log.info("Tenant UTC offset from trip timestamps: %s", shift_offset)
+
     start_key, end_key = R.UHU_SPANS.get(R.UHU_SPAN, R.UHU_SPANS["task"])
 
     # --- group the raw records by profile ---
@@ -96,7 +101,7 @@ def main():
     if args.profile:
         chosen = list(dict.fromkeys(args.profile))
     else:
-        df = R.build_uhu(shifts, legs, R.CostCenterMap(), target)
+        df = R.build_uhu(shifts, legs, R.CostCenterMap(), target, shift_offset=shift_offset)
         chosen = []
         if not df.empty:
             worst_ratio = df[df["scheduled_hours"] > 0].nlargest(args.top, "uhu_ratio")
@@ -110,6 +115,7 @@ def main():
         "metrics_date": target.isoformat(),
         "window": [window_start.isoformat(), window_end.isoformat()],
         "attribution": "shift-instance",
+        "shift_offset_hours": shift_offset.total_seconds() / 3600.0,
         "uhu_span": R.UHU_SPAN,
         "span_keys": [start_key, end_key],
         "generated": datetime.now().isoformat(timespec="seconds"),
@@ -125,25 +131,23 @@ def main():
         print(f"PROFILE: {name}")
         print("=" * 78)
 
-        instances = R.shift_instances(shifts).get(name, [])
+        instances = R.shift_instances(shifts, shift_offset).get(name, [])
         todays = [s for s in instances if s[0].date() == target]
-        print(f"\n  Shift records ({len(rows)}) -- window {window_start} .. {window_end}")
+        print(f"\n  Shift records ({len(rows)}), shown as raw then local "
+              f"(offset {shift_offset})")
         print(f"  Unit-shift instances starting {target}: {len(todays)}")
         for s, e in todays:
             print(f"    {s} -> {e}   ({(e - s).total_seconds() / 3600.0:.2f}h)")
         if not rows:
             print("    NONE. The rolling shift feed has nothing for this profile, so")
             print("    scheduled_hours is 0 and the ratio is meaningless.")
-        seen, scheduled_total = set(), 0.0
+        seen = set()
         for row in rows:
-            start = R.parse_ts(row.get("start_time"))
-            end = R.parse_ts(row.get("end_time"))
-            overlap = R.overlap_minutes(start, end, window_start, window_end) / 60.0
+            start = R.parse_shift_ts(row.get("start_time"), shift_offset)
+            end = R.parse_shift_ts(row.get("end_time"), shift_offset)
             key = (name, start, end)
             duplicate = key in seen
             seen.add(key)
-            if not duplicate and not row.get("deleted"):
-                scheduled_total += overlap
             flags = []
             if row.get("deleted"):
                 flags.append("deleted")
@@ -154,10 +158,12 @@ def main():
             if start and end and end.date() != start.date():
                 flags.append("crosses-midnight")
             print(
-                f"    start={_fmt(row.get('start_time')):<20} "
-                f"end={_fmt(row.get('end_time')):<20} "
-                f"overlap={overlap:5.2f}h  {' '.join(flags)}"
+                f"    raw={_fmt(row.get('start_time')):<18}->{_fmt(row.get('end_time')):<18} "
+                f"local={start} -> {end}  {' '.join(flags)}"
             )
+        # The instances above are what the report bills; overlapping crew rows
+        # have already been merged into one covered period.
+        scheduled_total = sum((e - s).total_seconds() for s, e in todays) / 3600.0
         print(f"    -> scheduled_hours = {scheduled_total:.2f}")
 
         print(f"\n  Legs ({len(profile_legs)})")

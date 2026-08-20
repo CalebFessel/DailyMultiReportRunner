@@ -102,8 +102,10 @@ def main():
         print(f"  Detected offset to local: {offset}")
 
     # Scheduled versus punched, per unit-shift starting on the target date.
+    rules = R.UnitStaffingRules()
     print(f"\n  Scheduled vs punched hours for unit-shifts starting {target}")
-    print(f"    {'shift_profile':<34} {'sched':>7} {'punched':>8} {'crew':>5}  note")
+    print(f"    {'shift_profile':<34} {'need':>4} {'sched':>7} {'worked':>7} "
+          f"{'crew':>5}  note")
     rows = []
     by_profile = defaultdict(list)
     for shift in shifts:
@@ -138,27 +140,60 @@ def main():
                     punched += h
                     punch_rows += 1
         scheduled = sum(hours(s, e) for s, e in R._merge_spans(spans))
+        needed = rules.min_crew(name)
+        # The figure the report will actually bill: hours with enough crew on
+        # the clock together, not the sum of what everyone punched.
+        grouped, _ = R.unit_punches_by_instance(crew_rows, offset, target)
+        worked = sum(
+            R.staffed_hours(punches, needed)
+            for punches in grouped.get(name, {}).values()
+        )
         note = []
         if not punch_rows:
             note.append("no completed punches")
         if open_punches:
             note.append(f"{open_punches} still open")
-        rows.append({"shift_profile": name, "scheduled_hours": round(scheduled, 2),
+        if scheduled and not worked:
+            note.append(f"NEVER REACHED {needed} CREW -- contributes no unit hours")
+        rows.append({"shift_profile": name, "min_crew": needed,
+                     "scheduled_hours": round(scheduled, 2),
+                     "worked_hours": round(worked, 2),
                      "punched_hours": round(punched, 2), "crew": len(crew_rows),
                      "punch_rows": punch_rows, "open_punches": open_punches})
-        print(f"    {name:<34} {scheduled:>7.2f} {punched:>8.2f} {len(crew_rows):>5}  "
-              f"{' '.join(note)}")
+        print(f"    {name:<34} {needed:>4} {scheduled:>7.2f} {worked:>7.2f} "
+              f"{len(crew_rows):>5}  {' '.join(note)}")
 
     total_sched = sum(r["scheduled_hours"] for r in rows)
-    total_punched = sum(r["punched_hours"] for r in rows)
-    unpunched = [r for r in rows if not r["punch_rows"]]
-    print(f"\n    {'TOTAL':<34} {total_sched:>7.2f} {total_punched:>8.2f}")
-    print(f"    {len(unpunched)} profile(s) scheduled with no completed punch")
-    print("\n    Note: punched hours are per crew member, scheduled hours are per")
-    print("    unit. Two medics on one truck punch twice for one unit-shift, so")
-    print("    these columns are not directly comparable -- the useful signal is")
-    print("    which profiles show zero.")
+    total_worked = sum(r["worked_hours"] for r in rows)
+    unstaffed = [r for r in rows if r["scheduled_hours"] and not r["worked_hours"]]
+    print(f"\n    {'TOTAL':<34} {'':>4} {total_sched:>7.2f} {total_worked:>7.2f}")
+    print(f"    {len(unstaffed)} profile(s) rostered but never crewed to minimum")
+    print("\n    'need' is the crew this profile must have on the clock together.")
+    print("    'worked' is what the report bills -- hours at or above that number,")
+    print("    not the sum of individual punches. Any profile that should need one")
+    print("    rather than two belongs in the rules file below.")
     dump["profiles"] = rows
+
+    # ---------- a rules file to edit rather than write from scratch ----------
+    proposal = {
+        "note": [
+            "Crew each shift profile must have on the clock at once for its",
+            "unit-shift to count. Generated from the profiles seen on "
+            f"{target}; every one starts at the default.",
+            "",
+            "Change to 1 for wheelchair and secure car profiles -- those are the",
+            "ones that run single-crewed. Leave BLS and ALS at 2. Delete any",
+            "entry to fall back to default_min_crew.",
+            "",
+            "Rename to unit_staffing_rules.json to put it in effect.",
+        ],
+        "default_min_crew": rules.default,
+        "by_pattern": {r["shift_profile"]: r["min_crew"] for r in rows},
+    }
+    proposed_path = Path(R.UNIT_STAFFING_RULES_FILE).with_suffix(".proposed.json")
+    proposed_path.parent.mkdir(parents=True, exist_ok=True)
+    proposed_path.write_text(json.dumps(proposal, indent=2), encoding="utf-8")
+    print(f"\n    Wrote {proposed_path} with {len(rows)} profile(s) to review.")
 
     # ---------- which timestamps actually get recorded ----------
     print()

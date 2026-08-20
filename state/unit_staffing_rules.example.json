@@ -12,8 +12,11 @@
     "knows which of its names mean wheelchair or secure car work, so list them",
     "here rather than relying on a naming convention that could change.",
     "",
-    "Rename to unit_staffing_rules.json to put it in effect. Run",
-    "probe_uhu_sources.py to see every profile and what it was scored as."
+    "Rename to unit_staffing_rules.json to put it in effect.",
+    "",
+    "Easier: run probe_uhu_sources.py. It writes",
+    "unit_staffing_rules.proposed.json listing every profile it saw with the",
+    "crew it was scored as, ready to edit and rename."
   ],
   "default_min_crew": 2,
   "by_pattern": {

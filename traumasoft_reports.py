@@ -1238,18 +1238,19 @@ def staffed_hours(intervals, min_crew):
     return total / 3600.0
 
 
-def unit_worked_hours(shifts, metrics_date, shift_offset=None, staffing_rules=None):
+def unit_punches_by_instance(shifts, shift_offset=None, metrics_date=None):
     """
-    shift_name -> unit hours actually crewed on `metrics_date`.
+    shift_name -> {unit-shift instance: [(punch start, punch end), ...]}.
 
     Punches belong to a crew member; a unit-shift is the several crew rows that
     share an instance. Each punch is clipped to its instance, because a punch
     left open would otherwise run until whenever someone noticed, and time
     outside the shift is not that shift's unit hours.
-    """
-    rules = staffing_rules if staffing_rules is not None else UnitStaffingRules()
-    all_instances = shift_instances(shifts, shift_offset)
 
+    Returns the grouping and a count of open punches per profile, so a caller
+    can report them rather than have them silently bounded.
+    """
+    all_instances = shift_instances(shifts, shift_offset)
     by_instance = defaultdict(lambda: defaultdict(list))
     open_punches = Counter()
     for shift in shifts:
@@ -1266,7 +1267,9 @@ def unit_worked_hours(shifts, metrics_date, shift_offset=None, staffing_rules=No
              if span[0] <= start < span[1]),
             None,
         )
-        if instance is None or instance[0].date() != metrics_date:
+        if instance is None:
+            continue
+        if metrics_date is not None and instance[0].date() != metrics_date:
             continue
 
         for punch in shift.get("punches") or []:
@@ -1285,6 +1288,16 @@ def unit_worked_hours(shifts, metrics_date, shift_offset=None, staffing_rules=No
             punch_end = min(punch_end, instance[1])
             if punch_end > punch_start:
                 by_instance[name][instance].append((punch_start, punch_end))
+
+    return by_instance, open_punches
+
+
+def unit_worked_hours(shifts, metrics_date, shift_offset=None, staffing_rules=None):
+    """shift_name -> unit hours actually crewed to minimum staffing."""
+    rules = staffing_rules if staffing_rules is not None else UnitStaffingRules()
+    by_instance, open_punches = unit_punches_by_instance(
+        shifts, shift_offset, metrics_date
+    )
 
     worked = {}
     for name, instances in by_instance.items():

@@ -150,6 +150,20 @@ SHIFT_TIMES_ARE_UTC = os.getenv("TS_SHIFT_TIMES_ARE_UTC", "1").strip().lower() n
 _offset_override = os.getenv("TS_SHIFT_UTC_OFFSET_HOURS", "").strip()
 SHIFT_UTC_OFFSET_HOURS = float(_offset_override) if _offset_override else None
 
+# What the UHU denominator measures. "worked" is unit hours the truck was
+# actually crewed to minimum staffing, read from shift punches; "scheduled" is
+# hours rostered. A profile rostered with one person is not a unit that ran --
+# anything but a wheelchair or secure car needs two -- so rostered hours count
+# trucks that never turned a wheel and understate every ratio they appear in.
+UHU_DENOMINATOR = os.getenv("UHU_DENOMINATOR", "worked").strip().lower()
+
+# Crew needed simultaneously on the clock for a unit to be in service. Two for
+# BLS and ALS alike (an EMT or medic plus a driver); one for wheelchair and
+# secure car. Profiles that need one are named in the rules file, since only
+# the operation knows which its names refer to.
+UHU_DEFAULT_MIN_CREW = int(os.getenv("UHU_DEFAULT_MIN_CREW", "2"))
+UNIT_STAFFING_RULES_FILE = os.path.join(STATE_DIR, "unit_staffing_rules.json")
+
 UNASSIGNED_COST_CENTER = "No Cost Center Assigned"
 UNASSIGNED_VEHICLE = "No Vehicle Assigned"
 
@@ -452,6 +466,47 @@ class CostCenterMap:
             for name, counter in self.counts.items()
             if len(counter) > 1
         }
+
+
+class UnitStaffingRules:
+    """
+    Shift profile -> the crew it needs on the clock at once to be a unit.
+
+    Two people for BLS and ALS -- a licensed clinician plus someone to drive --
+    and one for wheelchair and secure car work. Which profile names mean which
+    is knowledge the API does not carry and only the operation has, so the
+    exceptions are listed rather than inferred from a naming convention that
+    could change.
+    """
+
+    def __init__(self, path=UNIT_STAFFING_RULES_FILE, default=None):
+        self.path = path
+        self.default = default if default is not None else UHU_DEFAULT_MIN_CREW
+        self.patterns = []
+        self._load()
+
+    def _load(self):
+        stored = load_state_file(self.path, "unit staffing rules")
+        if not stored:
+            return
+        if stored.get("default_min_crew") is not None:
+            self.default = int(stored["default_min_crew"])
+        # Longest pattern first, so a specific name beats a general one.
+        self.patterns = sorted(
+            ((str(k).strip().lower(), int(v))
+             for k, v in (stored.get("by_pattern") or {}).items()),
+            key=lambda kv: -len(kv[0]),
+        )
+        if self.patterns:
+            log.info("Unit staffing rules: %s pattern(s), default %s crew, from %s",
+                     len(self.patterns), self.default, self.path)
+
+    def min_crew(self, shift_name):
+        lowered = str(shift_name or "").strip().lower()
+        for pattern, needed in self.patterns:
+            if pattern and pattern in lowered:
+                return needed
+        return self.default
 
 
 class VehicleExclusions:
@@ -1151,7 +1206,103 @@ def build_runs_by_vehicle(legs, vehicles, cost_center_map):
     return df.sort_values("total_runs", ascending=False) if not df.empty else df
 
 
-def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN, shift_offset=None):
+def staffed_hours(intervals, min_crew):
+    """
+    Hours during which at least `min_crew` of the given intervals overlap.
+
+    A unit is in service when enough of its crew are on the clock together, so
+    this is a coverage question rather than a sum. Summing punches would make
+    one person working twelve hours look identical to two working six, and only
+    the second is a staffed truck.
+    """
+    if min_crew <= 0:
+        return 0.0
+    events = []
+    for start, end in intervals:
+        if start and end and end > start:
+            events.append((start, 1))
+            events.append((end, -1))
+    if not events:
+        return 0.0
+    # Starts before ends at the same instant, so a clean handover stays covered.
+    events.sort(key=lambda e: (e[0], -e[1]))
+
+    total = 0.0
+    live = 0
+    previous = None
+    for moment, delta in events:
+        if previous is not None and live >= min_crew:
+            total += (moment - previous).total_seconds()
+        live += delta
+        previous = moment
+    return total / 3600.0
+
+
+def unit_worked_hours(shifts, metrics_date, shift_offset=None, staffing_rules=None):
+    """
+    shift_name -> unit hours actually crewed on `metrics_date`.
+
+    Punches belong to a crew member; a unit-shift is the several crew rows that
+    share an instance. Each punch is clipped to its instance, because a punch
+    left open would otherwise run until whenever someone noticed, and time
+    outside the shift is not that shift's unit hours.
+    """
+    rules = staffing_rules if staffing_rules is not None else UnitStaffingRules()
+    all_instances = shift_instances(shifts, shift_offset)
+
+    by_instance = defaultdict(lambda: defaultdict(list))
+    open_punches = Counter()
+    for shift in shifts:
+        if shift.get("deleted"):
+            continue
+        name = shift.get("shift_name")
+        if not name or _excluded_uhu_profile(name):
+            continue
+        start = parse_shift_ts(shift.get("start_time"), shift_offset)
+        if not start:
+            continue
+        instance = next(
+            (span for span in all_instances.get(name, ())
+             if span[0] <= start < span[1]),
+            None,
+        )
+        if instance is None or instance[0].date() != metrics_date:
+            continue
+
+        for punch in shift.get("punches") or []:
+            if punch.get("deleted"):
+                continue
+            punch_start = parse_shift_ts(punch.get("start_time"), shift_offset)
+            punch_end = parse_shift_ts(punch.get("end_time"), shift_offset)
+            if not punch_start:
+                continue
+            if not punch_end:
+                # Still on the clock as far as the record goes. Bound it at the
+                # end of the shift rather than letting it run away.
+                open_punches[name] += 1
+                punch_end = instance[1]
+            punch_start = max(punch_start, instance[0])
+            punch_end = min(punch_end, instance[1])
+            if punch_end > punch_start:
+                by_instance[name][instance].append((punch_start, punch_end))
+
+    worked = {}
+    for name, instances in by_instance.items():
+        needed = rules.min_crew(name)
+        worked[name] = sum(
+            staffed_hours(punches, needed) for punches in instances.values()
+        )
+    if open_punches:
+        log.info(
+            "UHU: %s punch(es) across %s profile(s) were still open and were "
+            "bounded at the end of their shift.",
+            sum(open_punches.values()), len(open_punches),
+        )
+    return worked
+
+
+def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN,
+              shift_offset=None, staffing_rules=None):
     """
     Scheduled vs utilized hours per shift profile, attributed by shift instance.
 
@@ -1171,6 +1322,22 @@ def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN, shift_
     """
     start_key, end_key = UHU_SPANS.get(span, UHU_SPANS["task"])
     all_instances = shift_instances(shifts, shift_offset)
+    worked = unit_worked_hours(shifts, metrics_date, shift_offset, staffing_rules)
+
+    # Worked hours are the honest denominator, but only where punches exist. A
+    # feed carrying none at all -- a tenant that does not use them, or a date
+    # outside whatever window they are kept for -- would otherwise make every
+    # ratio zero and look like a fleet that never turned a wheel. Fall back
+    # rather than publish that, and say so.
+    denominator_is_worked = UHU_DENOMINATOR == "worked"
+    if denominator_is_worked and not any(shift.get("punches") for shift in shifts):
+        denominator_is_worked = False
+        log.warning(
+            "UHU: no shift row carries punches, so unit hours cannot be measured "
+            "from them. Falling back to scheduled hours for %s -- ratios will "
+            "count units that were rostered but may not have run.",
+            metrics_date,
+        )
 
     # A unit-shift belongs to the day it starts on.
     todays = {
@@ -1244,51 +1411,67 @@ def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN, shift_
         )
 
     rows = []
-    for name in sorted(set(scheduled) | set(utilized) | set(runs)):
+    unstaffed = []
+    for name in sorted(set(scheduled) | set(utilized) | set(runs) | set(worked)):
         scheduled_hours = round(scheduled.get(name, 0.0), 2)
+        worked_hours = round(worked.get(name, 0.0), 2)
         utilized_hours = round(utilized.get(name, 0.0), 2)
         total_runs = runs.get(name, 0)
+        # A profile rostered but never crewed to minimum staffing did not run.
+        denominator = worked_hours if denominator_is_worked else scheduled_hours
+        if scheduled_hours and not worked_hours:
+            unstaffed.append(name)
         rows.append(
             {
                 "cost_center_name": cost_center_map.resolve(name) or UNASSIGNED_COST_CENTER,
                 "shift_profile_name": name,
                 "scheduled_hours": scheduled_hours,
+                "worked_hours": worked_hours,
                 "utilized_hours": utilized_hours,
                 "total_runs": total_runs,
                 "hours_per_run": round(utilized_hours / total_runs, 3) if total_runs else 0,
-                "uhu_ratio": round(utilized_hours / scheduled_hours, 3) if scheduled_hours else 0,
+                "uhu_ratio": round(utilized_hours / denominator, 3) if denominator else 0,
             }
+        )
+
+    if denominator_is_worked and unstaffed:
+        log.info(
+            "UHU: %s profile(s) were rostered on %s but never reached minimum "
+            "crew, so they contribute no unit hours: %s",
+            len(unstaffed), metrics_date, ", ".join(sorted(unstaffed)[:8]),
         )
     return pd.DataFrame(rows)
 
 
-def build_uhu_by_shift_profile(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN,
+def build_uhu_by_shift_profile(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN, staffing_rules=None,
                                shift_offset=None):
-    df = build_uhu(shifts, legs, cost_center_map, metrics_date, span, shift_offset)
+    df = build_uhu(shifts, legs, cost_center_map, metrics_date, span, shift_offset,
+                   staffing_rules)
     if df.empty:
         return df
     return df.sort_values("uhu_ratio", ascending=False)
 
 
-def build_uhu_by_cost_center(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN,
+def build_uhu_by_cost_center(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN, staffing_rules=None,
                              shift_offset=None, by_profile=None):
     # by_profile lets a caller that already built the per-profile frame roll it
     # up rather than rebuilding it, which also stops the diagnostics being
     # logged twice for one run.
     df = by_profile if by_profile is not None else build_uhu(
-        shifts, legs, cost_center_map, metrics_date, span, shift_offset
+        shifts, legs, cost_center_map, metrics_date, span, shift_offset, staffing_rules
     )
     if df.empty:
         return pd.DataFrame(
             columns=[
-                "cost_center_name", "scheduled_hours", "utilized_hours",
-                "total_runs", "hours_per_run", "uhu_ratio",
+                "cost_center_name", "scheduled_hours", "worked_hours",
+                "utilized_hours", "total_runs", "hours_per_run", "uhu_ratio",
             ]
         )
     grouped = (
         df.groupby("cost_center_name", dropna=False)
         .agg(
             scheduled_hours=("scheduled_hours", "sum"),
+            worked_hours=("worked_hours", "sum"),
             utilized_hours=("utilized_hours", "sum"),
             total_runs=("total_runs", "sum"),
         )
@@ -1298,10 +1481,12 @@ def build_uhu_by_cost_center(shifts, legs, cost_center_map, metrics_date, span=U
         lambda r: round(r["utilized_hours"] / r["total_runs"], 3) if r["total_runs"] else 0,
         axis=1,
     )
+    denominator_col = "worked_hours" if UHU_DENOMINATOR == "worked" else "scheduled_hours"
     grouped["uhu_ratio"] = grouped.apply(
-        lambda r: round(r["utilized_hours"] / r["scheduled_hours"], 3) if r["scheduled_hours"] else 0,
+        lambda r: round(r["utilized_hours"] / r[denominator_col], 3) if r[denominator_col] else 0,
         axis=1,
     )
+    grouped["worked_hours"] = grouped["worked_hours"].round(2)
     grouped["scheduled_hours"] = grouped["scheduled_hours"].round(2)
     grouped["utilized_hours"] = grouped["utilized_hours"].round(2)
     return grouped.sort_values("uhu_ratio", ascending=False)
@@ -1378,7 +1563,7 @@ def fetch_fleet_activity(api, metrics_date, lookback_days=None):
 
 
 def build_all(data, cost_center_map=None, oos_history=None, now=None,
-              exclusions=None, fleet_activity=None):
+              exclusions=None, fleet_activity=None, staffing_rules=None):
     """Build every report DataFrame from one fetch, refreshing accumulated state."""
     metrics_date = data["metrics_date"]
     legs = data["legs"]
@@ -1399,6 +1584,7 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
     cost_center_map = cost_center_map or CostCenterMap()
     oos_history = oos_history or OutOfServiceHistory()
     exclusions = exclusions if exclusions is not None else VehicleExclusions()
+    staffing_rules = staffing_rules if staffing_rules is not None else UnitStaffingRules()
 
     # Learn from the present before attributing the past.
     cost_center_map.update(shifts, employees)
@@ -1416,7 +1602,8 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
 
     scored = scored_legs(legs, cost_center_map)
     uhu_by_profile = build_uhu_by_shift_profile(
-        shifts, uhu_legs, cost_center_map, metrics_date, shift_offset=shift_offset
+        shifts, uhu_legs, cost_center_map, metrics_date,
+        shift_offset=shift_offset, staffing_rules=staffing_rules,
     )
 
     reports = {

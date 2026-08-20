@@ -1,0 +1,24 @@
+{
+  "note": [
+    "How many crew must be on the clock at once for a unit-shift to count as a",
+    "unit that ran. UHU's denominator is unit hours actually crewed, so a",
+    "profile rostered with one person contributes nothing -- which is the point:",
+    "anything but a wheelchair or secure car needs two, a licensed clinician",
+    "plus someone to drive.",
+    "",
+    "default_min_crew applies to every profile with no matching pattern.",
+    "by_pattern maps a case-insensitive substring of the shift profile name to",
+    "the crew that profile needs, longest pattern first. Only the operation",
+    "knows which of its names mean wheelchair or secure car work, so list them",
+    "here rather than relying on a naming convention that could change.",
+    "",
+    "Rename to unit_staffing_rules.json to put it in effect. Run",
+    "probe_uhu_sources.py to see every profile and what it was scored as."
+  ],
+  "default_min_crew": 2,
+  "by_pattern": {
+    "w/c": 1,
+    "wheelchair": 1,
+    "secure car": 1
+  }
+}

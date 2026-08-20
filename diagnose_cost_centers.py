@@ -65,15 +65,16 @@ def main():
     cc_map = R.CostCenterMap()
     cc_map.update(shifts, employees)
 
-    feed_names = {s.get("shift_name") for s in shifts if s.get("shift_name")}
+    feed_names = {R.profile_name(s) for s in shifts if R.profile_name(s)}
     emp_cc = {
         str(e.get("user_id")): e.get("cost_center_name")
         for e in employees if e.get("user_id")
     }
     crew_by_shift = defaultdict(list)
     for s in shifts:
-        if s.get("shift_name"):
-            crew_by_shift[s["shift_name"]].append(str(s.get("user_id")))
+        name = R.profile_name(s)
+        if name:
+            crew_by_shift[name].append(str(s.get("user_id")))
 
     resolved = 0
     no_shift_name = Counter()
@@ -84,8 +85,8 @@ def main():
     vehicle_cc = defaultdict(Counter)
 
     for leg in legs:
-        name = (leg.get("shift_name") or "").strip()
-        centre = cc_map.resolve(leg.get("shift_name"))
+        name = R.profile_name(leg) or ""
+        centre = cc_map.resolve(name)
         status = (leg.get("trip_status") or "(none)").strip()
         if centre:
             resolved += 1

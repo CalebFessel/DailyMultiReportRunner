@@ -24,6 +24,7 @@ Usage:
     python probe_uhu_sources.py [YYYY-MM-DD]
 """
 
+import os
 import sys
 import json
 import logging
@@ -41,6 +42,51 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("probe-uhu-sources")
+
+
+# Vehicle name prefixes whose units run single-crewed. On this tenant the fleet
+# numbers say it plainly: WC- is wheelchair and M- is secure car, while A- is an
+# ambulance needing two. Overridable, since a fleet can renumber.
+SINGLE_CREW_VEHICLE_PREFIXES = tuple(
+    p.strip().lower()
+    for p in os.getenv("SINGLE_CREW_VEHICLE_PREFIXES", "wc-,m-").split(",")
+    if p.strip()
+)
+
+# Markers in a profile name that say the same thing, for rows naming no vehicle.
+SINGLE_CREW_NAME_MARKERS = ("w/c", "wheelchair", "secure car")
+
+
+def vehicle_class(name):
+    """'wheelchair'/'secure car' style classes, read off the fleet number."""
+    lowered = str(name or "").strip().lower()
+    # Names like '(SC)WC-101' carry the prefix after a parenthetical.
+    for prefix in SINGLE_CREW_VEHICLE_PREFIXES:
+        if lowered.startswith(prefix) or f")({prefix}" in lowered or f"){prefix}" in lowered:
+            return prefix
+    return None
+
+
+def suggest_min_crew(profile, vehicles, default):
+    """
+    What this profile probably needs, and why.
+
+    Returns (min_crew, reason). A profile whose trucks are all wheelchair or
+    secure car runs single-crewed; one mixing classes is left at the default and
+    flagged, since only the operation knows which way it should fall.
+    """
+    lowered = str(profile or "").lower()
+    marker = next((m for m in SINGLE_CREW_NAME_MARKERS if m in lowered), None)
+    classes = {vehicle_class(v) for v in vehicles} if vehicles else set()
+
+    if vehicles and None not in classes and classes:
+        return 1, f"all vehicles are {'/'.join(sorted(c.rstrip('-') for c in classes))}"
+    if vehicles and classes - {None}:
+        mixed = ", ".join(sorted(vehicles))
+        return default, f"MIXED vehicle classes ({mixed}) -- confirm"
+    if marker:
+        return 1, f"name says '{marker}' but its vehicles are not -- confirm"
+    return default, ""
 
 
 def hours(start, end):
@@ -126,7 +172,7 @@ def main():
     for shift in shifts:
         if shift.get("deleted"):
             continue
-        name = shift.get("shift_name")
+        name = R.profile_name(shift)
         start = R.parse_shift_ts(shift.get("start_time"), offset)
         if not name or not start or start.date() != target:
             continue
@@ -190,20 +236,47 @@ def main():
     dump["profiles"] = rows
 
     # ---------- a rules file to edit rather than write from scratch ----------
+    vehicles_by_profile = defaultdict(set)
+    for shift in shifts:
+        name = R.profile_name(shift)
+        if name and shift.get("vehicle_name"):
+            vehicles_by_profile[name].add(str(shift["vehicle_name"]).strip())
+
+    suggested = {}
+    evidence = {}
+    for r in rows:
+        name = r["shift_profile"]
+        vehicles = sorted(vehicles_by_profile.get(name, ()))
+        crew, reason = suggest_min_crew(name, vehicles, rules.default)
+        suggested[name] = crew
+        if reason or vehicles:
+            evidence[name] = {"vehicles": vehicles, "suggested": crew, "why": reason}
+
+    single = [n for n, c in suggested.items() if c == 1]
+    confirm = [n for n, e in evidence.items() if "confirm" in e["why"]]
+    print(f"\n    Suggested {len(single)} profile(s) as single-crew from their fleet "
+          f"numbers; {len(confirm)} need a look.")
+    for name in sorted(confirm):
+        print(f"      {name:<34} {evidence[name]['why']}")
+
     proposal = {
         "note": [
             "Crew each shift profile must have on the clock at once for its",
             "unit-shift to count. Generated from the profiles seen on "
             f"{target}; every one starts at the default.",
             "",
-            "Change to 1 for wheelchair and secure car profiles -- those are the",
-            "ones that run single-crewed. Leave BLS and ALS at 2. Delete any",
-            "entry to fall back to default_min_crew.",
+            "Values are suggested from the fleet numbers of the vehicles each",
+            "profile actually ran -- wheelchair and secure car units run",
+            "single-crewed, ambulances do not. Check them: _evidence records the",
+            "vehicles behind each, and anything marked 'confirm' mixed classes or",
+            "disagreed with its own name. Delete an entry to fall back to",
+            "default_min_crew. _evidence is ignored when the file is read.",
             "",
             "Rename to unit_staffing_rules.json to put it in effect.",
         ],
         "default_min_crew": rules.default,
-        "by_pattern": {r["shift_profile"]: r["min_crew"] for r in rows},
+        "by_pattern": suggested,
+        "_evidence": dict(sorted(evidence.items())),
     }
     proposed_path = Path(R.UNIT_STAFFING_RULES_FILE).with_suffix(".proposed.json")
     proposed_path.parent.mkdir(parents=True, exist_ok=True)
@@ -262,12 +335,12 @@ def main():
     print(f"\n  {len(named)} of {len(shifts)} shift rows name a vehicle "
           f"({len(named) / len(shifts):.0%})" if shifts else "")
     if named:
-        pairs = {(s.get("shift_name"), s.get("vehicle_name")) for s in named}
+        pairs = {(R.profile_name(s), s.get("vehicle_name")) for s in named}
         print(f"  {len(pairs)} distinct (shift_profile, vehicle) pairs")
         for shift_name, vehicle in sorted(pairs)[:10]:
             print(f"    {str(shift_name):<34} -> {vehicle}")
     dump["shift_vehicle_pairs"] = sorted(
-        {(str(s.get("shift_name")), str(s.get("vehicle_name"))) for s in named}
+        {(str(R.profile_name(s)), str(s.get("vehicle_name"))) for s in named}
     )
 
     out = Path("uhu_sources.json")

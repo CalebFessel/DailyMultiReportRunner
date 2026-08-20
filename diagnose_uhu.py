@@ -87,13 +87,13 @@ def main():
     # --- group the raw records by profile ---
     shifts_by_profile = defaultdict(list)
     for shift in shifts:
-        name = shift.get("shift_name")
+        name = R.profile_name(shift)
         if name:
             shifts_by_profile[name].append(shift)
 
     legs_by_profile = defaultdict(list)
     for leg in legs:
-        name = leg.get("shift_name")
+        name = R.profile_name(leg)
         if name:
             legs_by_profile[name].append(leg)
 

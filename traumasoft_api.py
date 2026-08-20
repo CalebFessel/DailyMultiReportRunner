@@ -565,3 +565,22 @@ class TraumasoftAPI:
 def build_query_string(params):
     """Render params the way the API expects (used for logging/debugging)."""
     return urllib.parse.urlencode(params or {}, doseq=True)
+
+
+# =============================
+# NOT A SCRIPT
+# =============================
+if __name__ == "__main__":
+    # Running a library file does nothing and says nothing, which reads exactly
+    # like a report that ran and produced no output. Say which file to run.
+    import sys as _sys
+    _sys.stderr.write(
+        "\n{me} is a library, not a script -- it defines how the reports are\n"
+        "built and does nothing on its own.\n\n"
+        "To produce the reports, from the folder holding these files:\n"
+        "    .venv\\Scripts\\python.exe daily_report_runner_api.py --zip\n\n"
+        "With no date that reports yesterday, which is what the daily run wants.\n"
+        "Add a date to redo one: daily_report_runner_api.py 2026-08-19 --zip\n\n"
+        .format(me=__file__)
+    )
+    raise SystemExit(2)

@@ -240,6 +240,22 @@ def span_minutes(leg, start_key, end_key):
     return (end - start).total_seconds() / 60.0
 
 
+def profile_name(record):
+    """
+    A shift profile name usable as a join key.
+
+    Some rows carry leading or trailing spaces -- '  WV-A-MCD-08-20' and
+    'WV-A-MCD-08-20' are one unit typed twice -- and left alone they split into
+    two profiles that each look half-staffed. Stripped on the way in, on both
+    the shift and the trip side, so the two always agree.
+    """
+    name = record.get("shift_name")
+    if name is None:
+        return None
+    name = str(name).strip()
+    return name or None
+
+
 def parse_ts_aware(value):
     """Like parse_ts, but keeps the offset when the value carries one."""
     if not value:
@@ -397,7 +413,7 @@ class CostCenterMap:
         }
         learned = 0
         for shift in shifts:
-            name = shift.get("shift_name")
+            name = profile_name(shift)
             cost_center = employee_cc.get(str(shift.get("user_id")))
             if name and cost_center:
                 self.counts[name][cost_center] += 1
@@ -660,7 +676,7 @@ def scored_legs(legs, cost_center_map, arrival_keys=None):
         status, delta = score_leg(leg, arrival_keys)
         if status == "Missing Data":
             continue
-        shift_name = leg.get("shift_name")
+        shift_name = profile_name(leg)
         rows.append(
             {
                 "leg_id": leg.get("leg_id"),
@@ -762,7 +778,7 @@ def _staffing_rows(shifts, employees, predicate, shift_offset=None):
         if not user_id:
             continue
 
-        key = (shift.get("shift_name"), start, end)
+        key = (profile_name(shift), start, end)
         unit = units[key]
         unit["start"] = start
         unit["end"] = end
@@ -1007,7 +1023,7 @@ def shift_instances(shifts, shift_offset=None):
     for shift in shifts:
         if shift.get("deleted"):
             continue
-        name = shift.get("shift_name")
+        name = profile_name(shift)
         if not name or _excluded_uhu_profile(name):
             continue
         start = parse_shift_ts(shift.get("start_time"), shift_offset)
@@ -1117,7 +1133,7 @@ def build_runs_by_cost_center(legs, cost_center_map):
             statusless, "counted" if COUNT_STATUSLESS_LEGS else "not counted as runs",
         )
     for leg in legs:
-        centre = cost_center_map.resolve(leg.get("shift_name")) or UNASSIGNED_COST_CENTER
+        centre = cost_center_map.resolve(profile_name(leg)) or UNASSIGNED_COST_CENTER
         if is_run(leg):
             runs[centre] += 1
             if leg.get("vehicle_id"):
@@ -1173,7 +1189,7 @@ def build_runs_by_vehicle(legs, vehicles, cost_center_map):
             names.setdefault(key, leg.get("vehicle_name"))
         if is_run(leg):
             runs[key] += 1
-            centres[key][cost_center_map.resolve(leg.get("shift_name")) or UNASSIGNED_COST_CENTER] += 1
+            centres[key][cost_center_map.resolve(profile_name(leg)) or UNASSIGNED_COST_CENTER] += 1
         elif has_status(leg):
             cancelled[key] += 1
         else:
@@ -1256,7 +1272,7 @@ def unit_punches_by_instance(shifts, shift_offset=None, metrics_date=None):
     for shift in shifts:
         if shift.get("deleted"):
             continue
-        name = shift.get("shift_name")
+        name = profile_name(shift)
         if not name or _excluded_uhu_profile(name):
             continue
         start = parse_shift_ts(shift.get("start_time"), shift_offset)
@@ -1368,7 +1384,7 @@ def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN,
     runs = Counter()
     adjacent = orphaned = 0
     for leg in legs:
-        name = leg.get("shift_name")
+        name = profile_name(leg)
         if not name or _excluded_uhu_profile(name):
             continue
         # A cancelled or disregarded leg was never a run and must not dilute

@@ -92,6 +92,21 @@ def main():
     print(f"\n  {len(with_punches)} of {len(shifts)} shift rows carry punches "
           f"({len(with_punches) / len(shifts):.0%})" if shifts else "\n  no shifts")
 
+    in_window = sorted({
+        s.date() for s in (R.parse_shift_ts(x.get("start_time"), offset) for x in shifts)
+        if s
+    })
+    if target not in in_window:
+        print()
+        print("  !! No shift starts on this date. The shift feed only covers")
+        print(f"     {in_window[0]} .. {in_window[-1]} and cannot be asked for an older one,"
+              if in_window else "     nothing at all,")
+        print("     so punches and worked hours are unavailable for it. Re-run with")
+        if in_window:
+            # The window opens at yesterday, which is the most recent complete day.
+            print(f"     a date in that range -- {in_window[0]} is the most recent")
+            print("     complete one.")
+
     if with_punches:
         sample = with_punches[0]
         print(f"\n  Structure of one punch array ({sample.get('shift_name')}):")
@@ -213,19 +228,26 @@ def main():
             seen_on_runs[name] += 1
     total_runs = len(ran) or 1
 
-    configured = {str(t.get("name")): t for t in catalogue}
+    # The catalogue's `name` is a display label ("At Scene"); the key a leg
+    # actually carries is its `type` ("at_scene"). Joining on name matches
+    # nothing and makes every stamp look unconfigured.
+    configured = {}
+    for t in catalogue:
+        key = str(t.get("type") or t.get("name") or "").strip()
+        if key:
+            configured[key] = t
     print(f"\n  {len(configured)} configured, {len(seen)} seen on legs for {target}")
-    print(f"\n    {'timestamp':<38} {'type':<12} {'all legs':>10} {'runs only':>11}")
+    print(f"\n    {'timestamp':<38} {'catalogue':<22} {'all legs':>10} {'runs only':>11}")
     for name in sorted(set(configured) | set(seen)):
         t = configured.get(name) or {}
-        kind = str(t.get("type") or ("-" if name in configured else "NOT CONFIGURED"))
+        kind = str(t.get("name") or ("-" if name in configured else "not in catalogue"))
         a = seen.get(name, 0)
         r = seen_on_runs.get(name, 0)
-        print(f"    {name:<38} {kind:<12} {a:>6} {a / total_legs:>5.0%} "
+        print(f"    {name:<38} {kind:<22} {a:>6} {a / total_legs:>5.0%} "
               f"{r:>6} {r / total_runs:>5.0%}")
 
     dump["timestamp_fill"] = {
-        name: {"type": (configured.get(name) or {}).get("type"),
+        name: {"catalogue_name": (configured.get(name) or {}).get("name"),
                "on_all_legs": seen.get(name, 0), "on_runs": seen_on_runs.get(name, 0)}
         for name in sorted(set(configured) | set(seen))
     }

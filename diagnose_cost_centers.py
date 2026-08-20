@@ -139,8 +139,17 @@ def main():
 
     print("\n  Unresolved by trip status")
     for status, n in by_status_unresolved.most_common(12):
-        runs = "cancelled/disregarded" if status.lower() in R.UHU_EXCLUDED_TRIP_STATUSES else "counts as a run"
-        print(f"    {status:<28} {n:>5}   ({runs})")
+        # Ask the report's own predicate rather than restating its rule, so
+        # this cannot drift from what the workbooks actually count.
+        probe = {"trip_status": "" if status == "(none)" else status}
+        if not R.has_status(probe):
+            note = ("no status -- counted" if R.COUNT_STATUSLESS_LEGS
+                    else "no status -- not counted as a run")
+        elif R.is_run(probe):
+            note = "counts as a run"
+        else:
+            note = "cancelled/disregarded"
+        print(f"    {status:<28} {n:>5}   ({note})")
 
     # How much would falling back to the vehicle's own cost center recover?
     recoverable = sum(1 for vid in vehicle_of_unresolved if vehicle_cc.get(vid))

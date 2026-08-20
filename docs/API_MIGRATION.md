@@ -75,16 +75,33 @@ minutes out (the timestamp is valid for 300 seconds — check `w32tm /query
 
 `range_days` is inclusive and capped at 31, so backfill works up to a month per call.
 
-**ePCR is explicitly out of scope for this API** (the spec excludes
-`ThirdParty/Data/Epcr/Huly` and directs partners to dedicated credentials). The
-current OTP "actual" time comes from ePCR field 549, so it has to be replaced by
-a CAD status time from the `timestamps` array on each leg. That array is a list
-of `status name -> ISO time` maps; run `probe_traumasoft_api.py` to see which
-names this tenant actually emits before picking one.
+**ePCR is out of scope of this spec, which is not the same as absent.** The spec
+names `ThirdParty/Data/Epcr/Huly` (and `Trip?rtype=HulyUpdateTrip`) under "Not
+included in this spec — private or non-partner integrations", directing partners
+to dedicated credentials and internal docs. So the surface exists; this API key
+cannot reach it and no schema for it is published here.
 
-Expect OTP percentages to shift after the switch — the new series will not tie
-to the historical one. `TripLegSummary` also exposes `late_reasons`, which the
-current report has no equivalent for.
+That makes the ask a specific one rather than a feature request: **credentials
+and documentation for the `Epcr/Huly` surface**, and confirmation of whether it
+reads or only writes. `Data/Attachments` accepts `epcr_run_id` and
+`epcr_run_number` alongside `cad_leg_id`, so ePCR runs and CAD legs are
+correlatable internally — a join would be possible if a read path were opened.
+Whether Huly exposes per-run timestamps is unknown until those docs exist.
+
+Two things now depend on that answer, not one:
+
+  * **OTP.** The current "actual" time comes from ePCR field 549, replaced here
+    by a CAD status time from the `timestamps` array on each leg — a list of
+    `status name -> ISO time` maps. Expect OTP percentages to shift; the new
+    series will not tie to the historical one.
+  * **UHU.** Crews are not clearing calls when they end — the next leg's
+    `enroute` lands seconds after the previous leg's `clear` — so `enroute ->
+    clear` tiles the shift and pushes utilization toward 100%. This is the same
+    status-discipline problem the ePCR sidestepped. No CAD stamp fully fixes it.
+
+Correction to an earlier draft of this document: `TripLegSummary` declares
+`late_reasons`, but the probe returned it on **0** legs on this tenant, so it is
+not a capability gained.
 
 ### Staffing
 

@@ -309,6 +309,31 @@ def overlap_minutes(start, end, window_start, window_end):
 # =============================
 # ACCUMULATED STATE
 # =============================
+def load_state_file(path, what):
+    """
+    Read one of the state/ JSON files, or None if it is not usable.
+
+    A file that exists but does not parse is a typo someone just made, not an
+    absence. Swallowing that silently means an edit appears to have no effect,
+    which is the hardest kind of change to debug -- so say so.
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return None
+    except ValueError as exc:
+        log.warning(
+            "%s is not valid JSON and is being ignored: %s. "
+            "The %s it defines will not take effect until it parses.",
+            path, exc, what,
+        )
+        return None
+    except OSError as exc:
+        log.warning("Could not read %s: %s", path, exc)
+        return None
+
+
 class CostCenterMap:
     """
     shift_name -> cost center, accumulated across runs.
@@ -334,10 +359,8 @@ class CostCenterMap:
         self._load_overrides()
 
     def _load(self):
-        try:
-            with open(self.path, "r", encoding="utf-8") as handle:
-                stored = json.load(handle)
-        except (FileNotFoundError, ValueError):
+        stored = load_state_file(self.path, "learned cost centers")
+        if not stored:
             return
         for shift_name, centers in (stored.get("counts") or {}).items():
             self.counts[shift_name] = Counter(centers)
@@ -381,10 +404,8 @@ class CostCenterMap:
         A deliberate mapping is the only answer, and it wins over what was
         learned, being a decision rather than an observation.
         """
-        try:
-            with open(self.overrides_path, "r", encoding="utf-8") as handle:
-                stored = json.load(handle)
-        except (FileNotFoundError, ValueError):
+        stored = load_state_file(self.overrides_path, "cost center overrides")
+        if not stored:
             return
         self.override_names = {
             str(k).strip().lower(): v
@@ -457,10 +478,8 @@ class VehicleExclusions:
         self._load()
 
     def _load(self):
-        try:
-            with open(self.path, "r", encoding="utf-8") as handle:
-                stored = json.load(handle)
-        except (FileNotFoundError, ValueError):
+        stored = load_state_file(self.path, "vehicle exclusions")
+        if not stored:
             return
         self.ids = {str(i) for i in (stored.get("exclude_ids") or [])}
         self.names = {str(n).strip().lower() for n in (stored.get("exclude_names") or [])}
@@ -512,10 +531,8 @@ class OutOfServiceHistory:
         self._load()
 
     def _load(self):
-        try:
-            with open(self.path, "r", encoding="utf-8") as handle:
-                stored = json.load(handle)
-        except (FileNotFoundError, ValueError):
+        stored = load_state_file(self.path, "out-of-service history")
+        if not stored:
             return
         self.since = dict(stored.get("since") or {})
 

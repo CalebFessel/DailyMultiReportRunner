@@ -339,6 +339,43 @@ def overlap_minutes(start, end, window_start, window_end):
 # =============================
 # ACCUMULATED STATE
 # =============================
+def _describe_unparsable(path):
+    """Say what is actually in a state file that would not parse."""
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return
+
+    if not raw.strip():
+        log.warning("  It is %s. Nothing was ever written to it -- check "
+                    "whether an editor saved alongside it as '%s.txt' instead.",
+                    "empty" if not raw else "blank (%s bytes of whitespace)" % len(raw),
+                    os.path.basename(path))
+        return
+
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        log.warning("  It is UTF-16. A PowerShell '>' redirect writes UTF-16; "
+                    "use Set-Content -Encoding UTF8, or copy the file in "
+                    "rather than retyping it.")
+        return
+
+    first = ""
+    for line in raw.decode("utf-8", "replace").splitlines():
+        if line.strip():
+            first = line.strip()
+            break
+    log.warning("  It is %s bytes and starts with: %s",
+                len(raw), first[:70] + ("..." if len(first) > 70 else ""))
+    if first.startswith(("@'", '@"', "'@", '"@')) or "Set-Content" in first:
+        log.warning("  That is the PowerShell command that was meant to write "
+                    "the file, not the file's contents. Only the JSON between "
+                    "the quotes belongs here -- it must start with '{'.")
+    elif not first.startswith(("{", "[")):
+        log.warning("  JSON has to start with '{'. Anything before it -- a "
+                    "shell prompt, a heading, a stray character -- has to go.")
+
+
 def load_state_file(path, what):
     """
     Read one of the state/ JSON files, or None if it is not usable.
@@ -353,11 +390,16 @@ def load_state_file(path, what):
     except FileNotFoundError:
         return None
     except ValueError as exc:
+        # "Expecting value: line 1 column 1" is the same message whether the
+        # file is empty or starts with something that is not JSON at all, and
+        # the two are fixed differently. Say which, and show it, rather than
+        # leaving the reader to guess from a parser's column number.
         log.warning(
             "%s is not valid JSON and is being ignored: %s. "
             "The %s it defines will not take effect until it parses.",
-            path, exc, what,
+            os.path.abspath(path), exc, what,
         )
+        _describe_unparsable(path)
         return None
     except OSError as exc:
         log.warning("Could not read %s: %s", path, exc)

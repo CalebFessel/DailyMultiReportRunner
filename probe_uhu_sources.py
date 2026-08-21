@@ -204,7 +204,9 @@ def main():
         needed = rules.min_crew(name)
         # The figure the report will actually bill: hours with enough crew on
         # the clock together, not the sum of what everyone punched.
-        grouped, _ = R.unit_punches_by_instance(crew_rows, offset, target)
+        grouped, _, _ = R.unit_punches_by_instance(
+            crew_rows, offset, target, R.tenant_now(offset)
+        )
         worked = sum(
             R.staffed_hours(punches, needed)
             for punches in grouped.get(name, {}).values()

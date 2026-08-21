@@ -31,7 +31,7 @@ import json
 import logging
 from pathlib import Path
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 
 import pandas as pd
 
@@ -323,6 +323,20 @@ def parse_shift_ts(value, offset=None):
     if parsed is None or not offset:
         return parsed
     return parsed + offset
+
+
+def tenant_now(shift_offset=None):
+    """
+    Now, on the same clock the shifts and punches are on.
+
+    Derived from UTC plus the offset the trips reported rather than from the
+    machine's own clock, so a reporting box in the wrong timezone -- or one
+    that follows daylight saving differently from the tenant -- does not shift
+    the answer. Falls back to local time when no offset could be resolved.
+    """
+    if shift_offset is None:
+        return datetime.now()
+    return datetime.now(timezone.utc).replace(tzinfo=None) + shift_offset
 
 
 def overlap_minutes(start, end, window_start, window_end):
@@ -1296,7 +1310,7 @@ def staffed_hours(intervals, min_crew):
     return total / 3600.0
 
 
-def unit_punches_by_instance(shifts, shift_offset=None, metrics_date=None):
+def unit_punches_by_instance(shifts, shift_offset=None, metrics_date=None, now=None):
     """
     shift_name -> {unit-shift instance: [(punch start, punch end), ...]}.
 
@@ -1305,12 +1319,20 @@ def unit_punches_by_instance(shifts, shift_offset=None, metrics_date=None):
     left open would otherwise run until whenever someone noticed, and time
     outside the shift is not that shift's unit hours.
 
-    Returns the grouping and a count of open punches per profile, so a caller
-    can report them rather than have them silently bounded.
+    A punch with no end is bounded at the end of its shift or at `now`,
+    whichever comes first. Pass `now` for any run that can overlap a shift
+    still in progress, which every morning run does; leave it None to bound
+    only at the shift end.
+
+    Returns the grouping, a count of open punches per profile, and how many of
+    those are open because the shift has not finished yet -- a crew still on
+    the road and a crew who forgot to punch out look identical in the feed but
+    mean different things.
     """
     all_instances = shift_instances(shifts, shift_offset)
     by_instance = defaultdict(lambda: defaultdict(list))
     open_punches = Counter()
+    still_running = Counter()
     for shift in shifts:
         if shift.get("deleted"):
             continue
@@ -1339,22 +1361,29 @@ def unit_punches_by_instance(shifts, shift_offset=None, metrics_date=None):
                 continue
             if not punch_end:
                 # Still on the clock as far as the record goes. Bound it at the
-                # end of the shift rather than letting it run away.
+                # end of the shift rather than letting it run away -- but never
+                # past now, or a shift still running bills hours nobody has
+                # worked yet. An overnight unit probed at 06:00 would otherwise
+                # be credited to its 08:00 end.
                 open_punches[name] += 1
                 punch_end = instance[1]
+                if now is not None and now < punch_end:
+                    punch_end = now
+                    still_running[name] += 1
             punch_start = max(punch_start, instance[0])
             punch_end = min(punch_end, instance[1])
             if punch_end > punch_start:
                 by_instance[name][instance].append((punch_start, punch_end))
 
-    return by_instance, open_punches
+    return by_instance, open_punches, still_running
 
 
-def unit_worked_hours(shifts, metrics_date, shift_offset=None, staffing_rules=None):
+def unit_worked_hours(shifts, metrics_date, shift_offset=None, staffing_rules=None,
+                      now=None):
     """shift_name -> unit hours actually crewed to minimum staffing."""
     rules = staffing_rules if staffing_rules is not None else UnitStaffingRules()
-    by_instance, open_punches = unit_punches_by_instance(
-        shifts, shift_offset, metrics_date
+    by_instance, open_punches, still_running = unit_punches_by_instance(
+        shifts, shift_offset, metrics_date, now
     )
 
     worked = {}
@@ -1364,16 +1393,20 @@ def unit_worked_hours(shifts, metrics_date, shift_offset=None, staffing_rules=No
             staffed_hours(punches, needed) for punches in instances.values()
         )
     if open_punches:
+        running = sum(still_running.values())
         log.info(
-            "UHU: %s punch(es) across %s profile(s) were still open and were "
-            "bounded at the end of their shift.",
+            "UHU: %s punch(es) across %s profile(s) were still open. %s were "
+            "bounded at now because the shift is still running; %s at the end "
+            "of a shift that has already finished, which means a missed "
+            "punch-out rather than a crew on the road.",
             sum(open_punches.values()), len(open_punches),
+            running, sum(open_punches.values()) - running,
         )
     return worked
 
 
 def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN,
-              shift_offset=None, staffing_rules=None):
+              shift_offset=None, staffing_rules=None, now=None):
     """
     Scheduled vs utilized hours per shift profile, attributed by shift instance.
 
@@ -1393,7 +1426,8 @@ def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN,
     """
     start_key, end_key = UHU_SPANS.get(span, UHU_SPANS["task"])
     all_instances = shift_instances(shifts, shift_offset)
-    worked = unit_worked_hours(shifts, metrics_date, shift_offset, staffing_rules)
+    worked = unit_worked_hours(shifts, metrics_date, shift_offset, staffing_rules,
+                               now if now is not None else tenant_now(shift_offset))
 
     # Worked hours are the honest denominator, but only where punches exist. A
     # feed carrying none at all -- a tenant that does not use them, or a date
@@ -1515,21 +1549,22 @@ def build_uhu(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN,
 
 
 def build_uhu_by_shift_profile(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN, staffing_rules=None,
-                               shift_offset=None):
+                               shift_offset=None, now=None):
     df = build_uhu(shifts, legs, cost_center_map, metrics_date, span, shift_offset,
-                   staffing_rules)
+                   staffing_rules, now)
     if df.empty:
         return df
     return df.sort_values("uhu_ratio", ascending=False)
 
 
 def build_uhu_by_cost_center(shifts, legs, cost_center_map, metrics_date, span=UHU_SPAN, staffing_rules=None,
-                             shift_offset=None, by_profile=None):
+                             shift_offset=None, by_profile=None, now=None):
     # by_profile lets a caller that already built the per-profile frame roll it
     # up rather than rebuilding it, which also stops the diagnostics being
     # logged twice for one run.
     df = by_profile if by_profile is not None else build_uhu(
-        shifts, legs, cost_center_map, metrics_date, span, shift_offset, staffing_rules
+        shifts, legs, cost_center_map, metrics_date, span, shift_offset,
+        staffing_rules, now
     )
     if df.empty:
         return pd.DataFrame(
@@ -1644,13 +1679,17 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
     shifts = data["shifts"]
     employees = data["employees"]
     vehicles = data["vehicles"]
-    now = now or datetime.now()
-
     # Shift times are UTC while everything else is local; resolve the gap once
     # from the trips themselves and hand it to everything that reads a shift.
     shift_offset = resolve_shift_offset(uhu_legs)
     if shift_offset:
         log.info("Shift times shifted by %s to reach tenant-local time.", shift_offset)
+
+    # "Now" has to be on the tenant's clock, not the reporting machine's, since
+    # everything it is compared against -- shift instances, punches -- has been
+    # moved onto that clock above.
+    if now is None:
+        now = tenant_now(shift_offset)
 
     cost_center_map = cost_center_map or CostCenterMap()
     oos_history = oos_history or OutOfServiceHistory()
@@ -1674,7 +1713,7 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
     scored = scored_legs(legs, cost_center_map)
     uhu_by_profile = build_uhu_by_shift_profile(
         shifts, uhu_legs, cost_center_map, metrics_date,
-        shift_offset=shift_offset, staffing_rules=staffing_rules,
+        shift_offset=shift_offset, staffing_rules=staffing_rules, now=now,
     )
 
     reports = {

@@ -164,9 +164,18 @@ def write_staffing(reports, run_date_str, output_dir, append_dir):
             dedupe_keys=["snapshot_date", "cost_center", "shift_profile", "start_time", "end_time"],
             snapshot_date_value=run_date_str,
         )
+    # Rows are now every unit on shift, not only the crewed ones, so the count
+    # alone would read as a jump in coverage. Say how many are short.
+    def tally(key):
+        df = reports[key]
+        if df.empty or "staffing_status" not in df:
+            return f"{len(df)}"
+        short = int((df["staffing_status"] != "OK").sum())
+        return f"{len(df)}" + (f" ({short} short)" if short else "")
+
     return (
-        f"ActiveNow={len(reports['staffing_active_now'])}, "
-        f"Tomorrow={len(reports['staffing_tomorrow'])}",
+        f"ActiveNow={tally('staffing_active_now')}, "
+        f"Tomorrow={tally('staffing_tomorrow')}",
         path,
     )
 

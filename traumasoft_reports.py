@@ -90,10 +90,12 @@ VEHICLE_EXCLUSIONS_FILE = os.path.join(STATE_DIR, "vehicle_exclusions.json")
 # Capped at the API's 31-day range limit so it costs a single call.
 FLEET_ACTIVITY_LOOKBACK_DAYS = int(os.getenv("FLEET_ACTIVITY_LOOKBACK_DAYS", "30"))
 
-# Staffing: cost centers excluded by name, and the minimum crew for a row to
-# count as a staffed unit (the SQL used HAVING COUNT(DISTINCT user_id) > 2).
+# Staffing: cost centers excluded by name. What a unit needs on the clock is
+# no longer a flat number here -- it comes from state/unit_staffing_rules.json,
+# the same rules the UHU denominator uses, so a wheelchair or secure car needs
+# one where an ambulance needs two.
 STAFFING_EXCLUDED_COST_CENTER_PATTERNS = ("dispatch", "cpr", "training", "admin")
-STAFFING_MIN_CREW = int(os.getenv("STAFFING_MIN_CREW", "3"))
+
 
 # The SQL excluded certification templates 101-104. The API exposes a
 # license_level string instead of those ids, so the exclusion is by name and
@@ -163,6 +165,20 @@ UHU_DENOMINATOR = os.getenv("UHU_DENOMINATOR", "worked").strip().lower()
 # the operation knows which its names refer to.
 UHU_DEFAULT_MIN_CREW = int(os.getenv("UHU_DEFAULT_MIN_CREW", "2"))
 UNIT_STAFFING_RULES_FILE = os.path.join(STATE_DIR, "unit_staffing_rules.json")
+
+# The SQL used HAVING COUNT(DISTINCT user_id) > 2, which this inherited as
+# STAFFING_MIN_CREW=3. A flat floor cannot express "one for a wheelchair, two
+# for an ambulance", and at 3 it dropped nearly every properly crewed truck.
+# Anyone who set it deserves to be told it stopped applying rather than to
+# find the number quietly doing nothing.
+if os.getenv("STAFFING_MIN_CREW"):
+    log.warning(
+        "STAFFING_MIN_CREW=%s is set but no longer used. Crew minimums now come "
+        "from %s, per shift profile. Units below their own minimum are listed "
+        "and marked SHORT rather than dropped.",
+        os.getenv("STAFFING_MIN_CREW"), UNIT_STAFFING_RULES_FILE,
+    )
+
 
 UNASSIGNED_COST_CENTER = "No Cost Center Assigned"
 UNASSIGNED_VEHICLE = "No Vehicle Assigned"
@@ -805,14 +821,22 @@ def _excluded_uhu_profile(name):
     return any(pattern in lowered for pattern in UHU_EXCLUDED_PROFILE_PATTERNS)
 
 
-def _staffing_rows(shifts, employees, predicate, shift_offset=None):
+def _staffing_rows(shifts, employees, predicate, shift_offset=None,
+                   staffing_rules=None):
     """
-    Collapse crew-level shift rows into one row per staffed unit.
+    Collapse crew-level shift rows into one row per unit, staffed or not.
 
     The API returns one row per crew member per shift, which is the shape the
     SQL grouped over. Rows are keyed on the shift profile and its start/end so
     two crews on the same profile at different times stay separate.
+
+    What a unit needs comes from the same rules the UHU denominator uses, so an
+    ambulance needs two and a wheelchair or secure car needs one. A unit short
+    of its own minimum stays in the sheet and is marked, because that is the
+    staffing problem the report exists to surface -- dropping it is what let it
+    go unnoticed.
     """
+    rules = staffing_rules if staffing_rules is not None else UnitStaffingRules()
     by_user = {str(emp.get("user_id")): emp for emp in employees if emp.get("user_id")}
     units = defaultdict(
         lambda: {"crew": {}, "cost_centers": Counter(), "start": None, "end": None}
@@ -849,8 +873,6 @@ def _staffing_rows(shifts, employees, predicate, shift_offset=None):
 
     rows = []
     for (shift_name, start, end), unit in units.items():
-        if len(unit["crew"]) < STAFFING_MIN_CREW:
-            continue
         cost_center = None
         if unit["cost_centers"]:
             cost_center = sorted(
@@ -858,36 +880,52 @@ def _staffing_rows(shifts, employees, predicate, shift_offset=None):
             )[0][0]
         if _excluded_cost_center(cost_center):
             continue
+        crew_count = len(unit["crew"])
+        needed = rules.min_crew(shift_name)
+        short_by = max(0, needed - crew_count)
         rows.append(
             {
                 "shift_profile": shift_name,
                 "cost_center": cost_center or UNASSIGNED_COST_CENTER,
                 "start_time": start,
                 "end_time": end,
-                "crew_count": len(unit["crew"]),
+                "crew_count": crew_count,
+                "crew_needed": needed,
+                "staffing_status": "OK" if not short_by else f"SHORT {short_by}",
                 "crew_members": "\n".join(sorted(unit["crew"].values())),
             }
         )
 
+    columns = [
+        "shift_profile", "cost_center", "start_time", "end_time",
+        "crew_count", "crew_needed", "staffing_status", "crew_members",
+    ]
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "shift_profile", "cost_center", "start_time",
-                "end_time", "crew_count", "crew_members",
-            ]
-        )
-    return df.sort_values(["cost_center", "shift_profile", "start_time"])
+        return pd.DataFrame(columns=columns)
+    # Short units first inside each cost center, so the problems are at the top
+    # of the block rather than scattered through it.
+    df = df.reindex(columns=columns)
+    df["_short"] = df["staffing_status"] != "OK"
+    df = df.sort_values(
+        ["cost_center", "_short", "shift_profile", "start_time"],
+        ascending=[True, False, True, True],
+    )
+    return df.drop(columns="_short")
 
 
-def build_staffing_active_now(shifts, employees, as_of, shift_offset=None):
-    """Units staffed at a moment in time."""
-    return _staffing_rows(shifts, employees, lambda s, e: s <= as_of <= e, shift_offset)
+def build_staffing_active_now(shifts, employees, as_of, shift_offset=None,
+                              staffing_rules=None):
+    """Units on shift at a moment in time, whether or not they are crewed."""
+    return _staffing_rows(shifts, employees, lambda s, e: s <= as_of <= e,
+                          shift_offset, staffing_rules)
 
 
-def build_staffing_for_date(shifts, employees, target_date, shift_offset=None):
+def build_staffing_for_date(shifts, employees, target_date, shift_offset=None,
+                            staffing_rules=None):
     """Units whose shift starts on a given calendar day."""
-    return _staffing_rows(shifts, employees, lambda s, e: s.date() == target_date, shift_offset)
+    return _staffing_rows(shifts, employees, lambda s, e: s.date() == target_date,
+                          shift_offset, staffing_rules)
 
 
 # =============================
@@ -1719,9 +1757,12 @@ def build_all(data, cost_center_map=None, oos_history=None, now=None,
     reports = {
         "otp_by_call_type": build_otp_by_call_type(scored),
         "otp_by_cost_center": build_otp_by_cost_center(scored),
-        "staffing_active_now": build_staffing_active_now(shifts, employees, now, shift_offset),
+        "staffing_active_now": build_staffing_active_now(
+            shifts, employees, now, shift_offset, staffing_rules
+        ),
         "staffing_tomorrow": build_staffing_for_date(
-            shifts, employees, now.date() + timedelta(days=1), shift_offset
+            shifts, employees, now.date() + timedelta(days=1), shift_offset,
+            staffing_rules
         ),
         "vehicle_summary": build_vehicle_summary(vehicles, legs, metrics_date, exclusions),
         "vehicles_in_use": build_vehicles_in_use(vehicles, legs, exclusions),

@@ -1,11 +1,19 @@
 """
-Checks for the regional filter and the month-to-date rollups.
+Checks for the regional filter, the month-to-date rollups and the dependency
+sheet.
 
-    python test_region_monthly.py
+    python -m pytest test_region_monthly.py     # preferred
+    python test_region_monthly.py               # same checks, no pytest needed
 
-Plain asserts and no pytest, because the reporting machine has neither and
-these have to be runnable there -- the whole point is to confirm a file copied
-onto that machine by hand behaves.
+It runs both ways on purpose. pytest gives selection and proper failure
+reporting; the standalone runner means a machine that has only Python can still
+confirm that a file copied onto it by hand behaves, which is how these files
+reach the reporting box.
+
+check() raises as well as printing, so a failure reaches whichever runner is
+in charge. It used to only print and record -- which the standalone runner read
+afterwards, and which made the suite silently decorative under pytest: a broken
+assertion printed FAIL and the test passed anyway.
 
 Nothing here touches the network. The append workbooks are written to a
 temporary directory with the real writer, then read back with the real reader,
@@ -30,11 +38,22 @@ FAILURES = []
 
 
 def check(name, condition, detail=""):
+    """
+    Assert, print, and record.
+
+    It raises. An earlier version only printed and recorded, which was fine
+    under the standalone runner that read the record afterwards -- and silently
+    useless under pytest, where a failing check printed FAIL and the test still
+    passed. A suite that reports green whatever it finds is worse than no suite,
+    so the failure has to reach the runner the way every runner understands.
+    """
     if condition:
         print(f"  ok    {name}")
-    else:
-        print(f"  FAIL  {name}{(' -- ' + detail) if detail else ''}")
-        FAILURES.append(name)
+        return
+    message = f"{name}{(' -- ' + detail) if detail else ''}"
+    print(f"  FAIL  {message}")
+    FAILURES.append(name)
+    raise AssertionError(message)
 
 
 def regions_from(payload, tmpdir):
@@ -465,20 +484,39 @@ def test_daily_runner_region_flag():
 
 
 def main():
+    """
+    The standalone runner, for a machine with no pytest.
+
+    Each test is run in its own try, so one failure does not hide the tests
+    after it -- the same granularity pytest gives. Within a test, the first
+    failing check stops that test, which is also what pytest does.
+    """
     tmpdir = tempfile.mkdtemp(prefix="region_tests_")
+    tests = [
+        (test_region_matching, (tmpdir,)),
+        (test_missing_and_broken_files, (tmpdir,)),
+        (test_frame_filtering, (tmpdir,)),
+        (test_vehicle_working_two_regions, (tmpdir,)),
+        (test_window, ()),
+        (test_uhu_is_summed_not_averaged, ()),
+        (test_staffing_rollup, ()),
+        (test_window_filtering_and_gaps, ()),
+        (test_dependency_notes, ()),
+        (test_append_round_trip, (tmpdir,)),
+        (test_cli_parsing, ()),
+        (test_daily_runner_region_flag, ()),
+    ]
     try:
-        test_region_matching(tmpdir)
-        test_missing_and_broken_files(tmpdir)
-        test_frame_filtering(tmpdir)
-        test_vehicle_working_two_regions(tmpdir)
-        test_window()
-        test_uhu_is_summed_not_averaged()
-        test_staffing_rollup()
-        test_window_filtering_and_gaps()
-        test_dependency_notes()
-        test_append_round_trip(tmpdir)
-        test_cli_parsing()
-        test_daily_runner_region_flag()
+        for test, args in tests:
+            try:
+                test(*args)
+            except AssertionError:
+                # check() has already printed and recorded it; keep going so
+                # one broken thing does not mask the rest of the suite.
+                pass
+            except Exception as exc:  # a test that broke rather than failed
+                print(f"  ERROR {test.__name__}: {exc.__class__.__name__}: {exc}")
+                FAILURES.append(f"{test.__name__} (crashed)")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -488,7 +526,7 @@ def main():
         for name in FAILURES:
             print(f"  - {name}")
         return 1
-    print("All checks passed.")
+    print(f"All checks passed ({len(tests)} tests).")
     return 0
 
 

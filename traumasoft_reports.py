@@ -773,6 +773,197 @@ def legs_in_region(legs, cost_center_map, regions, region):
     return kept, unattributed
 
 
+DEPENDENCY_COLUMNS = ["report", "metric", "status", "built_from", "covers", "known_issue"]
+
+
+def build_dependency_notes(region=None, window=None, uhu_days=None, staffing_days=None,
+                           metrics_date=None, unattributed=None):
+    """
+    What each number on these sheets depends on, and what is wrong with it.
+
+    A regional director reading a UHU of 0.52 has no way to know it was built
+    from six days of hours because the shifts endpoint will not answer for the
+    3rd, or that utilized time reads high because crews press Clear when the
+    next call is assigned. Those are not footnotes to the number; on this data
+    they are most of what the number means.
+
+    Written from the constants actually in effect rather than from prose, so a
+    changed UHU_SPAN or denominator shows up here instead of quietly making the
+    sheet wrong. `window` is (start, end) for a month-to-date bundle and None
+    for a single day.
+    """
+    span_start, span_end = UHU_SPANS.get(UHU_SPAN, UHU_SPANS["task"])
+    denominator = "worked_hours" if UHU_DENOMINATOR == "worked" else "scheduled_hours"
+    asked = ((window[1] - window[0]).days + 1) if window else 1
+    covers = f"{window[0]} to {window[1]}" if window else str(metrics_date or "the run date")
+
+    def accrued(days):
+        if days is None:
+            return "the run date"
+        return f"{len(days)} of {asked} day(s) in the window"
+
+    rows = []
+
+    def add(report, metric, status, built_from, covering, issue):
+        rows.append({
+            "report": report, "metric": metric, "status": status,
+            "built_from": built_from, "covers": covering, "known_issue": issue,
+        })
+
+    # ---- OTP
+    add("OTP", "on-time percentage", "Complete, but not comparable to history",
+        f"the CAD '{ARRIVAL_TIMESTAMP_KEYS[0]}' stamp against the scheduled "
+        f"pickup_time, +/-{OTP_ON_TIME_WINDOW_MINUTES} minutes counting as on time",
+        covers,
+        "The old report took arrival from ePCR field 549, which this API cannot "
+        "reach -- Data/Epcr/Huly answers 501 to a read. This is the nearest CAD "
+        "equivalent, so the series is sound going forward but will not tie to "
+        "OTP numbers produced before the changeover.")
+    add("OTP", "which legs are scored", "Known exclusion",
+        "legs carrying both a scheduled pickup and an arrival stamp",
+        covers,
+        "On a sampled day only 233 of 374 completed legs had a scheduled "
+        "pickup_time, so roughly a third of finished runs cannot be scored for "
+        "lateness at all. The old SQL filtered the same way, so this is not new, "
+        "but the denominator is smaller than 'runs completed'.")
+
+    # ---- Run volume
+    add("Run Volume", "transport counts", "Complete",
+        "one row per leg, counted rather than timed",
+        covers,
+        "None material. Counts do not depend on crews clearing calls promptly, "
+        "which is why this is the most trustworthy sheet in the bundle.")
+    add("Run Volume", "legs with no trip_status", "Known exclusion",
+        "legs whose status field is blank",
+        covers,
+        "Counted in their own column, not as transports. A row that says nothing "
+        "about how it ended is missing data rather than a completed run. On a "
+        "sampled day this was 28 legs. TS_COUNT_STATUSLESS_LEGS=1 counts them.")
+
+    # ---- UHU numerator
+    add("UHU", "utilized hours (numerator)", "Reads high",
+        f"the '{UHU_SPAN}' span: {span_start} -> {span_end} on each leg, clipped "
+        "to the unit-shift it belongs to",
+        covers,
+        ("Crews are not pressing Clear when a call ends -- the next leg's enroute "
+         "lands seconds after the previous leg's clear -- so this span tiles the "
+         "shift and drives utilization toward 100% by construction. Set "
+         "UHU_SPAN=transport (enroute -> at_destination) to end at a stamp crews "
+         "hit on arrival; coverage is identical at 99.5%, so it costs no data. "
+         "This is a status-discipline problem in the field, not a reporting one."
+         ) if span_end == "clear" else
+        ("Ends at a stamp crews hit on arrival rather than one they get to later. "
+         "Coverage is 99.5%, the same as every other candidate stamp."))
+
+    # ---- UHU denominator: the date problem
+    add("UHU", "worked hours (denominator)", "Accruing -- cannot be backfilled",
+        "crew punch intervals from the shift rows, swept so only time at or "
+        f"above each profile's minimum crew counts, divided into {denominator}",
+        accrued(uhu_days),
+        "THE DATE LIMITATION. /Schedule/Shifts returns today-1..today+2 and "
+        "ignores every filter -- verified byte-identical for requests at -30, "
+        "+0 and +30 days. The hours a unit was crewed on the 3rd exist only "
+        "because the daily run recorded them on the 3rd. Nothing can recover a "
+        "day that was missed, and no backfill run can produce them. A full "
+        "month becomes available roughly 30 daily runs after changeover.")
+    add("UHU", "how the window is totalled", "By design",
+        f"sum(utilized_hours) / sum({denominator}) across the days present",
+        accrued(uhu_days),
+        "Not the average of the daily ratios, which would weight a Sunday with "
+        "two trucks out the same as a Monday with twenty. Compare this figure "
+        "only against other periods of similar length.")
+    add("UHU", "open punches", "Known handling",
+        "a punch with no end time, bounded at the shift's end or at now, "
+        "whichever comes first",
+        covers,
+        "Bounding only at the shift end bills hours nobody has worked yet: an "
+        "overnight unit read at 06:37 was credited to its 09:00 finish. Still-"
+        "running shifts and missed punch-outs are counted apart in the run log; "
+        "on a sampled morning 23 were running and 11 were genuinely missed "
+        "punch-outs, which is a timekeeping finding this report can surface but "
+        "not fix.")
+    add("UHU", "which units count at all", "Depends on a hand-maintained file",
+        "state/unit_staffing_rules.json -- crew each profile needs on the clock "
+        f"together, defaulting to {UHU_DEFAULT_MIN_CREW}",
+        covers,
+        "Matched on substrings of the profile name, which is what the operation "
+        "encodes but is not a guarantee. A profile renamed outside the "
+        "convention silently gets the default and a solo-crewed truck would "
+        "start counting as a staffed unit. probe_uhu_sources.py lists every "
+        "profile with the crew it was scored as.")
+
+    # ---- Staffing
+    add("Staffing", "shortfalls", "Accruing -- observations, not hours",
+        "the Active Now sheet, one look at the board per daily run",
+        accrued(staffing_days),
+        "A truck short at 07:45 and crewed by 09:00 reads as one short day. This "
+        "measures how often a shortfall was caught, not time spent short. Same "
+        "date limitation as worked hours: a day with no run has no record.")
+    add("Staffing", "crew composition", "Not implemented",
+        "a count of bodies on the clock",
+        covers,
+        "Minimum crew counts people, not 'one EMT plus one driver' or 'one "
+        "Paramedic plus one driver'. license_level is on each shift row and "
+        "Lists/User/LicenseLevels is reachable, so this is buildable once the "
+        "license vocabulary is confirmed.")
+
+    # ---- Attribution
+    add("All sheets", "cost center on a leg", "Derived, not supplied",
+        "shift_name -> the crew on that shift -> employee.cost_center_name, "
+        "accumulated in state/shift_cost_center_map.json",
+        covers,
+        "Trips carry no cost center, so attribution is indirect. A profile only "
+        "becomes attributable once it has been seen staffed; 11 of 128 profiles "
+        "map to more than one cost center and the dominant one wins. "
+        "state/shift_cost_center_overrides.json forces the exceptions.")
+    if unattributed:
+        add("All sheets", "legs belonging to no cost center", "Expected gap",
+            "legs whose profile no cost center claims",
+            covers,
+            f"{unattributed} leg(s) in this window, mostly calls cancelled before "
+            "they reached a unit -- there is no unit to attribute them to and "
+            "nothing in the API can supply one. This is why a regional total does "
+            "not sum to the company-wide sheet.")
+    if region:
+        add("All sheets", f"what counts as {region}", "Hand-maintained",
+            "state/regions.json",
+            covers,
+            "The API cannot answer which cost centers make up a region -- a "
+            "district in the Data/Organization tree can span several. A cost "
+            "center added after that file was written belongs to no region and "
+            "appears in no regional bundle; every regional run names the ones "
+            "that are unclaimed, and --list-cost-centers prints them all.")
+
+    # ---- Clock
+    add("All sheets", "shift clock", "Corrected",
+        "shift start/end times are bare UTC while every other timestamp is "
+        "tenant-local; the offset is read from the trips themselves",
+        covers,
+        "Left uncorrected this put every shift out by the tenant's UTC offset -- "
+        "a profile named 19-08 billed one scheduled hour instead of thirteen. "
+        "Reading the offset from the response means it follows daylight saving "
+        "on its own. TS_SHIFT_UTC_OFFSET_HOURS pins it if a day's trips carry none.")
+
+    # ---- Fleet
+    add("Fleet sheets", "regional scoping", "Not possible",
+        "the vehicle list",
+        covers,
+        "The API puts no cost center on a vehicle, so in-service and out-of-"
+        "service rosters cannot be narrowed to a region and are fleet-wide "
+        "wherever they appear. Run Volume by Vehicle IS regional, because a leg "
+        "is attributable through its shift profile.")
+    add("Fleet sheets", "out-of-service detail", "Columns lost",
+        "vehicle_status, plus a first-seen-out date accumulated locally",
+        covers,
+        "No status_reason, no status history and no work-order endpoint, so "
+        "odometer_started, odometer_completed and work_order_station are gone. "
+        "days_since_last_run from a "
+        f"{FLEET_ACTIVITY_LOOKBACK_DAYS}-day lookback stands in for spotting "
+        "abandoned records.")
+
+    return pd.DataFrame(rows, columns=DEPENDENCY_COLUMNS)
+
+
 def build_region_leg_reports(legs, vehicles, cost_center_map, regions, region):
     """
     The leg-derived sheets, rebuilt from one region's legs.

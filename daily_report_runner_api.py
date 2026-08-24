@@ -254,6 +254,19 @@ def write_vehicles(reports, run_date_str, output_dir, append_dir, tag=""):
     return f"Summary={len(reports['vehicle_summary'])}, OOS={len(reports['vehicles_out_of_service'])}", path
 
 
+def write_dependencies(reports, run_date_str, output_dir, append_dir, tag=""):
+    """
+    What each number in a regional bundle depends on, and what is wrong with it.
+
+    Its own workbook rather than a sheet repeated in all five, so it rides along
+    in the zip and the email without being five copies of the same page.
+    """
+    notes = reports["dependency_notes"]
+    path = os.path.join(output_dir, _out_name("Report_Dependencies", tag, run_date_str))
+    _write_workbook(path, {"Dependencies": notes})
+    return f"{len(notes)} notes", path
+
+
 def write_runs(reports, run_date_str, output_dir, append_dir, tag=""):
     path = os.path.join(output_dir, _out_name("Daily_Run_Volume", tag, run_date_str))
     _write_workbook(path, {
@@ -427,6 +440,9 @@ def main():
             data["legs"], data["vehicles"], R.CostCenterMap(), regions, region
         )
         reports.update(rebuilt)
+        reports["dependency_notes"] = R.build_dependency_notes(
+            region=region, metrics_date=metrics_date, unattributed=region_unattributed
+        )
 
     results = []
     attachments = []
@@ -438,6 +454,8 @@ def main():
         ("Unit-Hour Utilization", write_uhu),
         ("Run Volume", write_runs),
     ]
+    if region:
+        writers.append(("Report Dependencies", write_dependencies))
     for name, writer in writers:
         logging.info("--- Running: %s ---", name)
         if dry_run:

@@ -294,14 +294,23 @@ def build_region_bundle(region, regions, start, end, legs, cost_center_map, appe
         "UHU by Shift Profile": rollup_uhu(uhu_sp_raw, "shift_profile_name"),
         "Staffing Shortfalls": rollup_staffing(staffing_raw),
     }
+    uhu_days = days_present(uhu_cc_raw)
+    staffing_days = days_present(staffing_raw)
     summary = build_summary(
         region, regions, start, end, region_legs,
-        uhu_days=days_present(uhu_cc_raw),
-        staffing_days=days_present(staffing_raw),
-        sheets=sheets,
+        uhu_days=uhu_days, staffing_days=staffing_days,
+        sheets=sheets, unattributed=unattributed,
+    )
+    # Second in the book: the Summary says what this run covers, Dependencies
+    # says what each number is built from and what is wrong with it. A director
+    # reading a UHU of 0.52 has no other way to learn it came from six days of
+    # hours, or that utilized time reads high because Clear is pressed late.
+    dependencies = R.build_dependency_notes(
+        region=region, window=(start, end),
+        uhu_days=uhu_days, staffing_days=staffing_days,
         unattributed=unattributed,
     )
-    return {"Summary": summary, **sheets}
+    return {"Summary": summary, "Dependencies": dependencies, **sheets}
 
 
 def build_summary(region, regions, start, end, legs, uhu_days, staffing_days, sheets,
@@ -319,6 +328,9 @@ def build_summary(region, regions, start, end, legs, uhu_days, staffing_days, sh
         ("Window", f"{start} to {end}"),
         ("Days in window", asked),
         ("Cost centers configured", ", ".join(sorted(regions.configured.get(region, []))) or "(patterns only)"),
+        ("Before reading the numbers",
+         "See the Dependencies sheet: what each figure is built from, and what is "
+         "known to be wrong with it."),
         ("", ""),
         ("OTP and run volume", f"complete -- rebuilt from the API across all {asked} day(s)"),
         ("Legs attributed to this region", len(legs)),

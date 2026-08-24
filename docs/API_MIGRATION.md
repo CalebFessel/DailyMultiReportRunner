@@ -334,6 +334,36 @@ rosters cannot be scoped to a region. Under `--region` they pass through whole
 and are named as fleet-wide in the run summary. Run Volume by Vehicle *is*
 regional, because a leg is attributable through its shift profile.
 
+### The Dependencies sheet
+
+Every regional bundle carries one: what each figure is built from, what window
+it covers, and what is known to be wrong with it — as a table, one row per
+metric, with a `status` column that reads as triage (`Complete`, `Accruing --
+cannot be backfilled`, `Reads high`, `Not possible`).
+
+It exists because the caveats are not footnotes on this data; they are most of
+what several of the numbers mean. A director reading a UHU of 0.52 has no other
+way to learn it came from six days of hours because the shifts endpoint will not
+answer for the 3rd, or that utilized time reads high because Clear is pressed
+when the next call is assigned.
+
+It is generated from the constants actually in effect, not from fixed prose, so
+it cannot drift out of step with the report:
+
+- the arrival stamp named is the one `ARRIVAL_TIMESTAMP_KEYS` resolves to
+- the UHU span is spelled out from `UHU_SPAN`, and the wording changes with it —
+  the default `task` (`enroute → clear`) is flagged as reading high and points at
+  `UHU_SPAN=transport`; select `transport` and that warning is replaced rather
+  than repeated
+- the denominator names `worked_hours` or `scheduled_hours` per `UHU_DENOMINATOR`
+- the accrued-days counts are the real ones for that run, not a description of
+  the problem in the abstract
+
+In the month-to-date bundle it is the second sheet, after Summary. In a
+`--region` daily run it is its own workbook, `Report_Dependencies_<Region>_<date>.xlsx`,
+so it rides along in the zip and the email without being five copies of the same
+page bound into every book.
+
 ### Regional daily runs write no history
 
 `--region` produces a filtered view of a day the company-wide run already

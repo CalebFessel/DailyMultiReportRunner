@@ -321,6 +321,67 @@ def test_window_filtering_and_gaps():
           "shifts endpoint" not in whole_text)
 
 
+def test_dependency_notes():
+    print("\nDependency sheet")
+    notes = R.build_dependency_notes(
+        region="Indiana", window=(date(2026, 8, 1), date(2026, 8, 23)),
+        uhu_days=[date(2026, 8, 1), date(2026, 8, 2)], staffing_days=[],
+        unattributed=178,
+    )
+    check("the sheet has the documented columns",
+          list(notes.columns) == R.DEPENDENCY_COLUMNS, str(list(notes.columns)))
+    check("every row is filled in",
+          not notes.isna().any().any() and (notes != "").all().all())
+
+    text = " ".join(str(v) for v in notes.values.ravel())
+    check("no format placeholder leaked into the prose", "%%" not in text)
+    check("the UHU date limitation is stated", "THE DATE LIMITATION" in text)
+    check("it names the endpoint that causes it", "today-1..today+2" in text)
+    check("it says the days cannot be recovered",
+          "Nothing can recover a day that was missed" in text)
+    check("it says how many days actually accrued", "2 of 23 day(s)" in text)
+    check("a report with no accumulated days says zero", "0 of 23 day(s)" in text)
+    check("the summed-not-averaged rule is explained", "average of the daily ratios" in text)
+    check("the region file is named as hand-maintained", "state/regions.json" in text)
+    check("the unattributed legs are quantified", "178 leg(s)" in text)
+    check("the fleet sheets are explained", "no cost center on a vehicle" in text)
+
+    statuses = set(notes["status"])
+    check("statuses are usable as a triage column",
+          "Accruing -- cannot be backfilled" in statuses and "Complete" in statuses,
+          str(sorted(statuses)))
+
+    # The point of building it from the constants: change the span and the
+    # sheet has to change with it, or it quietly describes a different report.
+    original = R.UHU_SPAN
+    try:
+        R.UHU_SPAN = "task"
+        task_text = " ".join(
+            str(v) for v in R.build_dependency_notes().values.ravel())
+        check("the biased default span is flagged as reading high",
+              "tiles the shift" in task_text and "UHU_SPAN=transport" in task_text)
+        R.UHU_SPAN = "transport"
+        transport_text = " ".join(
+            str(v) for v in R.build_dependency_notes().values.ravel())
+        check("switching the span rewrites the note rather than repeating it",
+              "tiles the shift" not in transport_text
+              and "hit on arrival" in transport_text)
+    finally:
+        R.UHU_SPAN = original
+
+    daily = R.build_dependency_notes(region="Indiana", metrics_date=date(2026, 8, 23))
+    daily_text = " ".join(str(v) for v in daily.values.ravel())
+    check("a single-day bundle says the run date, not a window",
+          "2026-08-23" in daily_text and "day(s) in the window" not in daily_text)
+    check("a run with nothing unattributed omits that row",
+          "leg(s) in this window" not in daily_text)
+
+    no_region = R.build_dependency_notes()
+    check("without a region the region row is omitted",
+          "state/regions.json" not in
+          " ".join(str(v) for v in no_region.values.ravel()))
+
+
 def test_append_round_trip(tmpdir):
     print("\nRound trip through a real append workbook")
     append_dir = os.path.join(tmpdir, "Append")
@@ -414,6 +475,7 @@ def main():
         test_uhu_is_summed_not_averaged()
         test_staffing_rollup()
         test_window_filtering_and_gaps()
+        test_dependency_notes()
         test_append_round_trip(tmpdir)
         test_cli_parsing()
         test_daily_runner_region_flag()

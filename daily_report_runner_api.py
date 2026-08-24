@@ -12,6 +12,18 @@ original code, lifted unchanged into report_output.
     python daily_report_runner_api.py --zip           # also bundle the day into one .zip
     python daily_report_runner_api.py --no-email      # never attempt delivery
     python daily_report_runner_api.py --dry-run       # write nothing, report what would happen
+    python daily_report_runner_api.py --region Indiana  # the same day, one region only
+
+A regional run filters every sheet that names a cost center and writes its
+workbooks under that region's name. It appends nothing: the company-wide run
+already recorded the day for every cost center, that region's included. Which
+cost centers make up a region is read from state/regions.json.
+
+The Daily Vehicle Overview stays fleet-wide even under --region, because the
+API puts no cost center on a vehicle. Run Volume by Vehicle is regional -- a
+leg is attributable through its shift profile.
+
+For a month-to-date regional bundle, see monthly_region_report.py.
 
 Email is optional. With no SMTP server and no recipients configured the run
 writes its workbooks and stops there, which is the right behaviour when the
@@ -85,6 +97,25 @@ def has_flag(argv, flag):
     return any(a.lower() == flag for a in argv[1:])
 
 
+def parse_region(argv):
+    """
+    `--region Indiana` or `--region="West Virginia"`.
+
+    A regional run is a view of the same day, so it writes the day's workbooks
+    filtered and leaves the append history alone -- the company-wide run owns
+    that, and Indiana's rows are already in it. Two writers appending the same
+    dates would only mean the file's contents depended on which run went last.
+    """
+    args = argv[1:]
+    for index, arg in enumerate(args):
+        lowered = arg.lower()
+        if lowered.startswith("--region="):
+            return arg.split("=", 1)[1].strip() or None
+        if lowered == "--region":
+            return args[index + 1].strip() if index + 1 < len(args) else None
+    return None
+
+
 def email_is_configured():
     """
     Whether delivery is even possible.
@@ -100,9 +131,9 @@ def email_is_configured():
     return has_smtp and has_recipients
 
 
-def bundle_zip(paths, output_dir, run_date_str):
+def bundle_zip(paths, output_dir, run_date_str, tag=""):
     """Bundle the day's workbooks into one archive that is easy to attach."""
-    zip_path = os.path.join(output_dir, f"Daily_Reports_{run_date_str}.zip")
+    zip_path = os.path.join(output_dir, f"Daily_Reports{tag}_{run_date_str}.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in paths:
             if os.path.exists(path):
@@ -113,6 +144,26 @@ def bundle_zip(paths, output_dir, run_date_str):
 # =============================
 # WORKBOOKS
 # =============================
+def _out_name(base, tag, run_date_str):
+    """Reports/CompanyWide_OTP_Indiana_2026-08-23.xlsx, or without the region."""
+    return f"{base}{tag}_{run_date_str}.xlsx"
+
+
+def _append(append_dir, filename, sheet_name, df, dedupe_keys, snapshot_date_value):
+    """
+    Append a day's rows, unless this is a regional run.
+
+    A regional bundle is a filtered view of a day the company-wide run already
+    recorded, so it writes no history of its own.
+    """
+    if append_dir is None:
+        return
+    OUT._append_to_workbook_xlsx(
+        os.path.join(append_dir, filename), sheet_name, df,
+        dedupe_keys=dedupe_keys, snapshot_date_value=snapshot_date_value,
+    )
+
+
 def _write_workbook(out_path, sheets):
     """Write {sheet name: DataFrame} to one formatted workbook."""
     Path(os.path.dirname(out_path) or ".").mkdir(parents=True, exist_ok=True)
@@ -127,22 +178,21 @@ def _write_workbook(out_path, sheets):
     return out_path
 
 
-def write_otp(reports, run_date_str, output_dir, append_dir):
-    path = os.path.join(output_dir, f"CompanyWide_OTP_{run_date_str}.xlsx")
+def write_otp(reports, run_date_str, output_dir, append_dir, tag=""):
+    path = os.path.join(output_dir, _out_name("CompanyWide_OTP", tag, run_date_str))
     _write_workbook(path, {
         "OTP by Call Type": reports["otp_by_call_type"],
         "OTP by Cost Center": reports["otp_by_cost_center"],
     })
-    append_path = os.path.join(append_dir, "CompanyWide_OTP_APPEND.xlsx")
-    OUT._append_to_workbook_xlsx(
-        append_path, "OTP by Call Type", reports["otp_by_call_type"],
-        dedupe_keys=["snapshot_date", "cost_center", "call_type"],
-        snapshot_date_value=run_date_str,
+    _append(
+        append_dir, "CompanyWide_OTP_APPEND.xlsx",
+        "OTP by Call Type", reports["otp_by_call_type"],
+        ["snapshot_date", "cost_center", "call_type"], run_date_str,
     )
-    OUT._append_to_workbook_xlsx(
-        append_path, "OTP by Cost Center", reports["otp_by_cost_center"],
-        dedupe_keys=["snapshot_date", "cost_center"],
-        snapshot_date_value=run_date_str,
+    _append(
+        append_dir, "CompanyWide_OTP_APPEND.xlsx",
+        "OTP by Cost Center", reports["otp_by_cost_center"],
+        ["snapshot_date", "cost_center"], run_date_str,
     )
     return (
         f"CallType={len(reports['otp_by_call_type'])}, "
@@ -151,18 +201,17 @@ def write_otp(reports, run_date_str, output_dir, append_dir):
     )
 
 
-def write_staffing(reports, run_date_str, output_dir, append_dir):
-    path = os.path.join(output_dir, f"Staffing_Report_{run_date_str}.xlsx")
+def write_staffing(reports, run_date_str, output_dir, append_dir, tag=""):
+    path = os.path.join(output_dir, _out_name("Staffing_Report", tag, run_date_str))
     _write_workbook(path, {
         "Active Now": reports["staffing_active_now"],
         "Tomorrow": reports["staffing_tomorrow"],
     })
-    append_path = os.path.join(append_dir, "Staffing_Report_APPEND.xlsx")
     for sheet, key in (("Active Now", "staffing_active_now"), ("Tomorrow", "staffing_tomorrow")):
-        OUT._append_to_workbook_xlsx(
-            append_path, sheet, reports[key],
-            dedupe_keys=["snapshot_date", "cost_center", "shift_profile", "start_time", "end_time"],
-            snapshot_date_value=run_date_str,
+        _append(
+            append_dir, "Staffing_Report_APPEND.xlsx", sheet, reports[key],
+            ["snapshot_date", "cost_center", "shift_profile", "start_time", "end_time"],
+            run_date_str,
         )
     # Rows are now every unit on shift, not only the crewed ones, so the count
     # alone would read as a jump in coverage. Say how many are short.
@@ -180,8 +229,8 @@ def write_staffing(reports, run_date_str, output_dir, append_dir):
     )
 
 
-def write_vehicles(reports, run_date_str, output_dir, append_dir):
-    path = os.path.join(output_dir, f"Daily_Vehicle_Overview_{run_date_str}.xlsx")
+def write_vehicles(reports, run_date_str, output_dir, append_dir, tag=""):
+    path = os.path.join(output_dir, _out_name("Daily_Vehicle_Overview", tag, run_date_str))
     _write_workbook(path, {
         "Summary": reports["vehicle_summary"],
         "In Use": reports["vehicles_in_use"],
@@ -189,38 +238,39 @@ def write_vehicles(reports, run_date_str, output_dir, append_dir):
         "All In Service": reports["vehicles_all_in_service"],
         "Out Of Service": reports["vehicles_out_of_service"],
     })
-    append_path = os.path.join(append_dir, "Daily_Vehicle_Overview_APPEND.xlsx")
-    OUT._append_to_workbook_xlsx(
-        append_path, "Summary", reports["vehicle_summary"],
-        dedupe_keys=["snapshot_date", "metric"], snapshot_date_value=run_date_str,
+    _append(
+        append_dir, "Daily_Vehicle_Overview_APPEND.xlsx",
+        "Summary", reports["vehicle_summary"],
+        ["snapshot_date", "metric"], run_date_str,
     )
-    OUT._append_to_workbook_xlsx(
-        append_path, "Out Of Service", reports["vehicles_out_of_service"],
+    _append(
+        append_dir, "Daily_Vehicle_Overview_APPEND.xlsx",
+        "Out Of Service", reports["vehicles_out_of_service"],
         # Keyed on the name, not the id: Excel reads a column of digit strings
         # back as integers, so "7" never matches the 7 that comes out of the
         # append file and a same-day re-run appends instead of replacing.
-        dedupe_keys=["snapshot_date", "vehicle_name"], snapshot_date_value=run_date_str,
+        ["snapshot_date", "vehicle_name"], run_date_str,
     )
     return f"Summary={len(reports['vehicle_summary'])}, OOS={len(reports['vehicles_out_of_service'])}", path
 
 
-def write_runs(reports, run_date_str, output_dir, append_dir):
-    path = os.path.join(output_dir, f"Daily_Run_Volume_{run_date_str}.xlsx")
+def write_runs(reports, run_date_str, output_dir, append_dir, tag=""):
+    path = os.path.join(output_dir, _out_name("Daily_Run_Volume", tag, run_date_str))
     _write_workbook(path, {
         "Runs by Cost Center": reports["runs_by_cost_center"],
         "Runs by Vehicle": reports["runs_by_vehicle"],
     })
 
-    OUT._append_to_workbook_xlsx(
-        os.path.join(append_dir, "Daily_Run_Volume_By_Cost_Center_APPEND.xlsx"),
+    _append(
+        append_dir, "Daily_Run_Volume_By_Cost_Center_APPEND.xlsx",
         "Runs by Cost Center", reports["runs_by_cost_center"],
-        dedupe_keys=["snapshot_date", "cost_center_name"], snapshot_date_value=run_date_str,
+        ["snapshot_date", "cost_center_name"], run_date_str,
     )
-    OUT._append_to_workbook_xlsx(
-        os.path.join(append_dir, "Daily_Run_Volume_By_Vehicle_APPEND.xlsx"),
+    _append(
+        append_dir, "Daily_Run_Volume_By_Vehicle_APPEND.xlsx",
         "Runs by Vehicle", reports["runs_by_vehicle"],
         # Keyed on the name for the same reason as the vehicle overview above.
-        dedupe_keys=["snapshot_date", "vehicle_name"], snapshot_date_value=run_date_str,
+        ["snapshot_date", "vehicle_name"], run_date_str,
     )
 
     cc = reports["runs_by_cost_center"]
@@ -232,25 +282,25 @@ def write_runs(reports, run_date_str, output_dir, append_dir):
     )
 
 
-def write_uhu(reports, run_date_str, output_dir, append_dir):
+def write_uhu(reports, run_date_str, output_dir, append_dir, tag=""):
     paths = []
-    cc_path = os.path.join(output_dir, f"Daily_UHU_By_Cost_Center_{run_date_str}.xlsx")
+    cc_path = os.path.join(output_dir, _out_name("Daily_UHU_By_Cost_Center", tag, run_date_str))
     _write_workbook(cc_path, {"UHU by Cost Center": reports["uhu_by_cost_center"]})
     paths.append(cc_path)
 
-    sp_path = os.path.join(output_dir, f"Daily_UHU_By_Shift_Profile_{run_date_str}.xlsx")
+    sp_path = os.path.join(output_dir, _out_name("Daily_UHU_By_Shift_Profile", tag, run_date_str))
     _write_workbook(sp_path, {"UHU by Shift Profile": reports["uhu_by_shift_profile"]})
     paths.append(sp_path)
 
-    OUT._append_to_workbook_xlsx(
-        os.path.join(append_dir, "Daily_UHU_By_Cost_Center_APPEND.xlsx"),
+    _append(
+        append_dir, "Daily_UHU_By_Cost_Center_APPEND.xlsx",
         "UHU by Cost Center", reports["uhu_by_cost_center"],
-        dedupe_keys=["snapshot_date", "cost_center_name"], snapshot_date_value=run_date_str,
+        ["snapshot_date", "cost_center_name"], run_date_str,
     )
-    OUT._append_to_workbook_xlsx(
-        os.path.join(append_dir, "Daily_UHU_By_Shift_Profile_APPEND.xlsx"),
+    _append(
+        append_dir, "Daily_UHU_By_Shift_Profile_APPEND.xlsx",
         "UHU by Shift Profile", reports["uhu_by_shift_profile"],
-        dedupe_keys=["snapshot_date", "shift_profile_name"], snapshot_date_value=run_date_str,
+        ["snapshot_date", "shift_profile_name"], run_date_str,
     )
     return (
         f"ByCostCenter={len(reports['uhu_by_cost_center'])}, "
@@ -273,6 +323,9 @@ REQUIRED_BUILDERS = (
     "shift_instances",
     "resolve_shift_offset",
     "parse_shift_ts",
+    "Regions",
+    "cost_centers_in",
+    "filter_reports_to_region",
 )
 
 
@@ -299,6 +352,7 @@ def main():
     no_email = has_flag(sys.argv, "--no-email")
     dry_run = has_flag(sys.argv, "--dry-run")
     make_zip = has_flag(sys.argv, "--zip")
+    region = parse_region(sys.argv)
     run_date_str = metrics_date.isoformat()
 
     output_dir = OUT.OUTPUT_DIR
@@ -310,6 +364,29 @@ def main():
     logging.info("=== %s ===", JOB_NAME)
     logging.info("Metrics date: %s   test_mode=%s   dry_run=%s", run_date_str, TEST_MODE, dry_run)
     logging.info("Log: %s", log_path)
+
+    # Resolved before any API work: a mistyped region should cost a second, not
+    # a full fetch.
+    regions = R.Regions()
+    tag = ""
+    if region is not None:
+        canonical = regions.canonical(region)
+        if canonical is None:
+            logging.error(
+                "No region named %r in %s. Defined: %s. Copy "
+                "state/regions.example.json if that file does not exist yet.",
+                region, regions.path, ", ".join(regions.names()) or "(none)",
+            )
+            return 2
+        region = canonical
+        tag = "_" + region.replace(" ", "_")
+        # The company-wide run owns the append history and has already recorded
+        # this day for every cost center, Indiana's included.
+        append_dir = None
+        logging.info(
+            "Region: %s -- workbooks are filtered to it, and the append history "
+            "is left to the company-wide run.", region,
+        )
 
     if not check_modules():
         return 2
@@ -337,6 +414,20 @@ def main():
         logging.error("API failure: %s", exc, exc_info=True)
         return 1
 
+    unmatched = []
+    region_unattributed = 0
+    if region:
+        unmatched = regions.unmatched(R.cost_centers_in(reports))
+        reports = R.filter_reports_to_region(reports, regions, region)
+        # The sheets built by grouping legs are rebuilt from this region's legs
+        # rather than filtered afterwards, or a vehicle that worked two regions
+        # today lands wholly in one with the other's runs attached. Uses the
+        # map build_all just refreshed and saved.
+        rebuilt, _, region_unattributed = R.build_region_leg_reports(
+            data["legs"], data["vehicles"], R.CostCenterMap(), regions, region
+        )
+        reports.update(rebuilt)
+
     results = []
     attachments = []
 
@@ -354,7 +445,7 @@ def main():
             results.append((name, True, "dry run", None))
             continue
         try:
-            rows_info, path = writer(reports, run_date_str, output_dir, append_dir)
+            rows_info, path = writer(reports, run_date_str, output_dir, append_dir, tag)
             paths = path if isinstance(path, list) else [path]
             attachments.extend(paths)
             logging.info("--- OK: %s (%s)", name, rows_info)
@@ -364,10 +455,34 @@ def main():
             results.append((name, False, "", str(exc)))
 
     # --- summary ---
-    lines = [f"{JOB_NAME}", f"Metrics date: {run_date_str}", ""]
+    lines = [f"{JOB_NAME}", f"Metrics date: {run_date_str}"]
+    if region:
+        lines.append(f"Region: {region}")
+    lines.append("")
     for name, ok, info, detail in results:
         lines.append(f"{'OK  ' if ok else 'FAIL'}  {name}: {info or detail}")
     lines.append("")
+
+    if region:
+        lines.append(
+            "The Daily Vehicle Overview is fleet-wide, not regional: the API puts "
+            "no cost center on a vehicle, so its rosters cannot be scoped. Run "
+            "Volume by Vehicle is regional, because a leg is attributable through "
+            "its shift profile."
+        )
+        if region_unattributed:
+            lines.append(
+                f"{region_unattributed} leg(s) belong to no cost center and so to no "
+                "region -- mostly calls cancelled before reaching a unit. This is why "
+                "the regional totals do not sum to the company-wide sheet."
+            )
+        if unmatched:
+            lines.append(
+                f"Note: {len(unmatched)} cost center(s) belong to no region and are "
+                f"in no regional bundle: {', '.join(unmatched)}. Add them to "
+                f"{regions.path}."
+            )
+        lines.append("")
 
     ambiguous = R.CostCenterMap().ambiguous()
     if ambiguous:
@@ -392,7 +507,7 @@ def main():
 
     if make_zip and attachments:
         try:
-            zip_path = bundle_zip(attachments, output_dir, run_date_str)
+            zip_path = bundle_zip(attachments, output_dir, run_date_str, tag)
             logging.info("Bundled %s files into %s", len(attachments), zip_path)
         except Exception as exc:
             logging.warning("Could not build the zip bundle: %s", exc)
@@ -422,6 +537,8 @@ def main():
 
     recipients = [TEST_MODE_RECIPIENT] if TEST_MODE else PROD_RECIPIENTS
     subject = EMAIL_SUBJECT.format(date=run_date_str, test_suffix=" [TEST]" if TEST_MODE else "")
+    if region:
+        subject = f"{region} Reports Bundle - {run_date_str}" + (" [TEST]" if TEST_MODE else "")
     send_error = None
     try:
         OUT.send_email(subject, body, recipients, attachments)

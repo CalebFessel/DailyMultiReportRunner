@@ -191,7 +191,27 @@ def _append_to_workbook_xlsx(
             )
 
 
-# =============================
+def read_append_sheet(append_path: str, sheet_name: str):
+    """
+    Read one sheet back out of an append workbook.
+
+    Returns None when the file or the sheet is not there, which is the normal
+    state before the daily run has accumulated anything -- the caller says so
+    rather than reporting zeros as though the units had not worked.
+    """
+    if not os.path.exists(append_path):
+        return None
+    try:
+        return pd.read_excel(
+            append_path, sheet_name=_safe_sheet_name(sheet_name), engine="openpyxl"
+        )
+    except ValueError:
+        # openpyxl raises ValueError for a sheet that is not in the workbook.
+        return None
+    except Exception as exc:
+        logging.warning("Could not read %s from %s: %s", sheet_name, append_path, exc)
+        return None
+
 
 # =============================
 # EMAIL / HOUSEKEEPING

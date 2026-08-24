@@ -1,0 +1,48 @@
+{
+  "note": [
+    "Which cost centers make up each region, for the regional bundles:",
+    "",
+    "    python daily_report_runner_api.py --region Indiana",
+    "    python monthly_region_report.py Indiana",
+    "",
+    "The API cannot answer this. Cost center appears on employees and in the",
+    "Data/Organization division/district/group tree, but a district can span",
+    "several cost centers, so which stations are a region is a decision the",
+    "operation makes -- like the crew minimums next door, not an observation.",
+    "",
+    "cost_centers is the authority: exact names, matched case-insensitively.",
+    "cost_center_patterns is a convenience, matched only where no exact name",
+    "does, longest pattern first.",
+    "",
+    "Do NOT rely on the shift profile's state prefix. 'IN-A-SBG-07-19' is an",
+    "Indiana ambulance, but 'INDY WC' is Indiana too and carries no prefix,",
+    "and 'West Virginia Admin' spans five cost centers. That convention has",
+    "already caught out the crew-minimum rules once.",
+    "",
+    "The names below are PLACEHOLDERS. To get the real ones, run:",
+    "",
+    "    python monthly_region_report.py --list-cost-centers",
+    "",
+    "which prints every cost center in the accumulated state and appends, and",
+    "marks the ones no region currently claims. Any cost center left unclaimed",
+    "is reported on every regional run -- a station opened after this file was",
+    "written would otherwise vanish from its director's numbers with no sign."
+  ],
+  "regions": {
+    "Indiana": {
+      "cost_centers": [
+        "REPLACE ME - an Indiana cost center exactly as the API spells it",
+        "REPLACE ME - another one"
+      ],
+      "cost_center_patterns": ["indiana", "indy"]
+    },
+    "Ohio": {
+      "cost_centers": [],
+      "cost_center_patterns": ["ohio", "columbus", "cincinnati", "toledo"]
+    },
+    "West Virginia": {
+      "cost_centers": [],
+      "cost_center_patterns": ["west virginia"]
+    }
+  }
+}

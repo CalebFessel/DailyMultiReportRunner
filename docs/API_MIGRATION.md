@@ -241,6 +241,8 @@ rather than queried (`TS_STATE_DIR`, default `state/`):
 - **`vehicle_oos_history.json`** — first date each vehicle was observed out of
   service, which is what `oos_since` and days-out are derived from. Cleared
   when a vehicle returns to service.
+- **`regions.json`** — which cost centers make up each region, for the regional
+  and month-to-date bundles. A decision, not an observation; see below.
 
 Both are cold-start empty: a vehicle already out of service on changeover day
 shows a blank `oos_since` until it cycles, and a shift profile only becomes
@@ -263,6 +265,80 @@ The status strings replace the status id + `status_reason LIKE` filtering:
 
 An earlier draft listed `late_reasons` as a capability gained. It came back on
 **0 legs**. Do not build on it.
+
+## Regional and month-to-date reporting
+
+A regional director asks for their own region's numbers, on a monthly count
+that resets on the 1st. Both are possible; they are not equally possible.
+
+### Which cost centers are a region
+
+Nothing in the API answers this. Cost center is on employees and in the
+`Data/Organization` DDG tree, but a district can span several cost centers, so
+region membership is a decision and lives in `state/regions.json` beside the
+other decisions. `state/regions.example.json` is the template.
+
+Exact cost-center names are the authority; `cost_center_patterns` is a
+convenience matched only where no exact name does. **Do not** key on the shift
+profile's state prefix: `IN-A-SBG-07-19` is Indiana, but so is `INDY WC` with
+no prefix at all, and `West Virginia Admin` spans five cost centers. That is
+the same naming convention that already caught out the crew minimums.
+
+`python monthly_region_report.py --list-cost-centers` prints every cost center
+this deployment has learned and which region claims it. Anything unclaimed is
+reported on every regional run — a station opened after the file was written
+would otherwise vanish from its director's numbers with nothing to show for it.
+
+### The window is asymmetric, and the bundle says so
+
+| Half | Source | Covers |
+|---|---|---|
+| OTP, run volume | rebuilt from the API | the whole window, from the first run |
+| UHU, staffing | read back from the append workbooks | only the days already accrued |
+
+Trips backfill 90 days, so the first half is complete immediately. The second
+cannot be: `/Schedule/Shifts` returns `today-1..today+2` and ignores every
+filter, so the hours a unit was crewed on the 3rd exist only because the daily
+run wrote them down on the 3rd. A month's worth accrues a day at a time.
+
+The Summary sheet is first in the book and states both windows, which days are
+missing, and why. A month-to-date UHU built from five days of hours is a useful
+number and a misleading one, and the difference is entirely whether the reader
+was told. Append retention is 730 days, so nothing is lost once accrued.
+
+### UHU over a window is summed, not averaged
+
+`sum(utilized_hours) / sum(worked_hours)` across the days present. Averaging the
+daily ratios would give a Sunday with two trucks out the same weight as a Monday
+with twenty. The append sheets carry the raw hours columns, which is what makes
+the exact figure available rather than only the daily percentages.
+
+### Filtering happens at the leg, not at the finished frame
+
+A vehicle is filed under the cost center it served most, so filtering a built
+`Runs by Vehicle` sheet hands a truck that split the month between two regions
+wholly to one of them, carrying the other's runs with it — and the vehicle rows
+stop summing to the cost-center rows above them, which is the first thing anyone
+checks. `legs_in_region` cuts at the leg instead, and both callers go through
+`build_region_leg_reports` so the rule is written once.
+
+Legs that no cost center claims belong to no region and are dropped. That is the
+truth about a call cancelled before it reached a unit, and the count is reported
+so a regional total not summing to the company-wide one is explained rather than
+discovered.
+
+### The fleet sheets stay company-wide
+
+The API puts no cost center on a vehicle, so the in-service and out-of-service
+rosters cannot be scoped to a region. Under `--region` they pass through whole
+and are named as fleet-wide in the run summary. Run Volume by Vehicle *is*
+regional, because a leg is attributable through its shift profile.
+
+### Regional daily runs write no history
+
+`--region` produces a filtered view of a day the company-wide run already
+recorded for every cost center, so it appends nothing. Two writers appending the
+same dates would only mean the file's contents depended on which run went last.
 
 ## What is unaffected
 

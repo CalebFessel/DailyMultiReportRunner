@@ -45,6 +45,7 @@ STATE_DIR = os.getenv("TS_STATE_DIR", "state")
 COST_CENTER_MAP_FILE = os.path.join(STATE_DIR, "shift_cost_center_map.json")
 COST_CENTER_OVERRIDES_FILE = os.path.join(STATE_DIR, "shift_cost_center_overrides.json")
 OOS_HISTORY_FILE = os.path.join(STATE_DIR, "vehicle_oos_history.json")
+REGIONS_FILE = os.path.join(STATE_DIR, "regions.json")
 
 # Trip timestamp names this tenant emits, in preference order, for the moment a
 # unit reached the patient. The current SQL scores against ePCR field 549,
@@ -182,6 +183,12 @@ if os.getenv("STAFFING_MIN_CREW"):
 
 UNASSIGNED_COST_CENTER = "No Cost Center Assigned"
 UNASSIGNED_VEHICLE = "No Vehicle Assigned"
+
+# Cost center arrives under two different column names depending on the sheet:
+# OTP and staffing inherited `cost_center` from the SQL, run volume and UHU say
+# `cost_center_name`. Anything filtering by region has to read whichever one a
+# frame happens to carry.
+COST_CENTER_COLUMNS = ("cost_center", "cost_center_name")
 
 # A trip row with a blank trip_status. Excluded from run counts by default --
 # see is_run.
@@ -595,6 +602,223 @@ class UnitStaffingRules:
             if pattern and pattern in lowered:
                 return needed
         return self.default
+
+
+class Regions:
+    """
+    Cost centers grouped into the regions the operation is actually run by.
+
+    A regional director asks for their own numbers, and nothing in the API
+    answers "which cost centers are Indiana's". `Data/Organization` carries a
+    division/district/group tree, but a district can span several cost centers,
+    so which stations make up a region is a decision rather than an
+    observation. It lives in state/regions.json with the other decisions.
+
+    Exact cost-center names are the authority. Patterns are a convenience for
+    tenants whose names carry the region, and are matched only when no exact
+    name does. Deliberately *not* matched: the shift profile's state prefix.
+    `IN-A-SBG-07-19` is an Indiana ambulance, but `INDY WC` is Indiana too and
+    carries no prefix, and `West Virginia Admin` spans five cost centers -- the
+    same convention that already caught out the crew-minimum rules.
+
+    A cost center matching no region is reported rather than dropped. A station
+    opened after this file was written would otherwise disappear from its
+    director's report with nothing to show it had ever been there.
+    """
+
+    def __init__(self, path=REGIONS_FILE):
+        self.path = path
+        self.exact = {}      # lowered cost center name -> region
+        self.patterns = []   # (lowered pattern, region), longest first
+        self.configured = defaultdict(set)  # region -> exact names as written
+        self._load()
+
+    def _load(self):
+        stored = load_state_file(self.path, "region definitions")
+        if not stored:
+            return
+        regions = stored.get("regions") or {}
+        patterns = []
+        for region, spec in regions.items():
+            region = str(region).strip()
+            if not region:
+                continue
+            # A bare list of cost center names is allowed as shorthand for
+            # {"cost_centers": [...]}, since that is the common case.
+            if isinstance(spec, list):
+                spec = {"cost_centers": spec}
+            for name in (spec.get("cost_centers") or []):
+                name = str(name).strip()
+                if name:
+                    self.exact[name.lower()] = region
+                    self.configured[region].add(name)
+            for pattern in (spec.get("cost_center_patterns") or []):
+                pattern = str(pattern).strip().lower()
+                if pattern:
+                    patterns.append((pattern, region))
+        # Longest pattern first, so a specific one beats a general one -- the
+        # same precedence the staffing rules use.
+        self.patterns = sorted(patterns, key=lambda kv: -len(kv[0]))
+        if self.exact or self.patterns:
+            log.info(
+                "Regions: %s defined (%s), %s exact cost center(s), %s pattern(s), from %s",
+                len(self.names()), ", ".join(self.names()),
+                len(self.exact), len(self.patterns), self.path,
+            )
+
+    def names(self):
+        found = set(self.exact.values()) | {region for _, region in self.patterns}
+        return sorted(found)
+
+    def known(self, region):
+        """Whether this region is defined at all, compared case-insensitively."""
+        return self.canonical(region) is not None
+
+    def canonical(self, region):
+        """The region's name as written in the file, for a case-insensitive ask."""
+        wanted = str(region or "").strip().lower()
+        for name in self.names():
+            if name.lower() == wanted:
+                return name
+        return None
+
+    def resolve(self, cost_center):
+        """The region a cost center belongs to, or None."""
+        name = str(cost_center or "").strip()
+        if not name:
+            return None
+        exact = self.exact.get(name.lower())
+        if exact:
+            return exact
+        lowered = name.lower()
+        for pattern, region in self.patterns:
+            if pattern in lowered:
+                return region
+        return None
+
+    def unmatched(self, cost_centers):
+        """
+        Cost centers in the data that no region claims.
+
+        Reported by every regional run: this is the only warning anyone gets
+        that a new station is missing from the file, and so missing from the
+        numbers a director is reading.
+        """
+        seen = set()
+        for name in cost_centers:
+            name = str(name or "").strip()
+            if not name or name == UNASSIGNED_COST_CENTER:
+                continue
+            if self.resolve(name) is None:
+                seen.add(name)
+        return sorted(seen)
+
+
+def cost_center_column(df):
+    """Whichever cost-center column this frame carries, or None."""
+    if df is None:
+        return None
+    for column in COST_CENTER_COLUMNS:
+        if column in getattr(df, "columns", ()):
+            return column
+    return None
+
+
+def cost_centers_in(reports):
+    """Every cost center named anywhere in a built set of reports."""
+    seen = set()
+    for df in (reports or {}).values():
+        column = cost_center_column(df)
+        if column is None or getattr(df, "empty", True):
+            continue
+        seen.update(str(v).strip() for v in df[column].dropna().unique())
+    seen.discard("")
+    return sorted(seen)
+
+
+def filter_frame_to_region(df, regions, region):
+    """One frame narrowed to a region, or unchanged if it names no cost center."""
+    column = cost_center_column(df)
+    if column is None or df is None or df.empty:
+        return df
+    keep = df[column].map(lambda value: regions.resolve(value) == region)
+    return df.loc[keep].copy()
+
+
+def legs_in_region(legs, cost_center_map, regions, region):
+    """
+    The legs a region ran, attributed through shift profile -> cost center.
+
+    Filtering legs is not the same as filtering the frames built from them, and
+    the difference is the vehicle sheet. A vehicle is filed under the cost
+    center it served most, so filtering finished rows puts a truck that split
+    the month between Indiana and Ohio wholly into one of them, carrying the
+    other's runs with it -- and the vehicle rows stop summing to the cost
+    center rows, which is the first thing anyone checks. Cut at the leg and
+    both problems go away.
+
+    A leg no cost center claims belongs to no region and is dropped. That is
+    the truth about a call cancelled before it reached a unit; the count of
+    what went is reported rather than left to be noticed as a discrepancy
+    against the company-wide sheet.
+    """
+    kept, unattributed = [], 0
+    for leg in legs:
+        centre = cost_center_map.resolve(profile_name(leg))
+        if not centre:
+            unattributed += 1
+            continue
+        if regions.resolve(centre) == region:
+            kept.append(leg)
+    return kept, unattributed
+
+
+def build_region_leg_reports(legs, vehicles, cost_center_map, regions, region):
+    """
+    The leg-derived sheets, rebuilt from one region's legs.
+
+    Defined once and used by both the daily regional run and the monthly one,
+    because getting it wrong is silent: the vehicle rows simply stop summing to
+    the cost-center rows above them.
+
+    Returns the frames, the legs they were built from, and how many legs no
+    cost center claimed -- which is what explains a regional total not adding
+    up to the company-wide one.
+    """
+    region_legs, unattributed = legs_in_region(legs, cost_center_map, regions, region)
+    scored = scored_legs(region_legs, cost_center_map)
+    frames = {
+        "otp_by_call_type": build_otp_by_call_type(scored),
+        "otp_by_cost_center": build_otp_by_cost_center(scored),
+        "runs_by_cost_center": build_runs_by_cost_center(region_legs, cost_center_map),
+        "runs_by_vehicle": build_runs_by_vehicle(region_legs, vehicles or [], cost_center_map),
+    }
+    return frames, region_legs, unattributed
+
+
+def filter_reports_to_region(reports, regions, region):
+    """
+    Every report frame narrowed to one region.
+
+    Frames carrying no cost center -- the vehicle roster, which the API does
+    not attribute -- pass through whole and are named, so a regional bundle
+    never quietly implies its fleet sheets were filtered when they were not.
+    """
+    filtered = {}
+    unfiltered = []
+    for key, df in (reports or {}).items():
+        if cost_center_column(df) is None:
+            unfiltered.append(key)
+            filtered[key] = df
+        else:
+            filtered[key] = filter_frame_to_region(df, regions, region)
+    if unfiltered:
+        log.info(
+            "Region %s: %s sheet(s) carry no cost center and are fleet-wide: %s. "
+            "The API puts no cost center on a vehicle.",
+            region, len(unfiltered), ", ".join(sorted(unfiltered)),
+        )
+    return filtered
 
 
 class VehicleExclusions:

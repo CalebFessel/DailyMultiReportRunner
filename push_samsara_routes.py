@@ -20,9 +20,10 @@ read-only until then, so a bug cannot write on a dry run.
 
 WHAT GETS SKIPPED, AND WHY
     Legs with no scheduled pickup_time, no location on one end, no vehicle, or
-    a call type in SAMSARA_EXCLUDED_CALL_TYPES. 911 and on-demand work has no
-    schedule to route against. Every skipped leg is counted by reason in the
-    plan, so a day that pushes fewer runs than expected explains itself.
+    a call type in SAMSARA_EXCLUDED_CALL_TYPES, or a level of service in
+    SAMSARA_EXCLUDED_LOS. Work dispatched in the moment has no schedule to
+    route against. Every skipped leg is counted by reason in the plan, so a
+    day that pushes fewer runs than expected explains itself.
 
     Vehicles that could not be joined to Samsara are listed too. Fix those in
     state/samsara_vehicle_overrides.json rather than renaming units.
@@ -99,10 +100,11 @@ def print_plan(day, routes, notes, skipped, matched, unmatched, ambiguous, publi
           f"Legs routed: {sum(n['legs'] for n in notes)}")
     if offset is None:
         print()
-        print("  !! TENANT UTC OFFSET UNRESOLVED. Trip times are local with no zone,")
+        print("  !! TENANT TIME ZONE UNRESOLVED. Trip times are local with no zone,")
         print("     so they cannot be converted safely -- a 07:30 pickup would be")
         print("     sent as 07:30Z and dispatched hours early. Set")
-        print("     SAMSARA_TENANT_UTC_OFFSET=-04:00 (or your offset) and re-run.")
+        print("     SAMSARA_TENANT_TIMEZONE=America/New_York (it follows daylight")
+        print("     saving) and re-run.")
     else:
         print(f"  Times converted using {SR.format_offset(offset)} (from {offset_source})")
     print()
@@ -120,9 +122,17 @@ def print_plan(day, routes, notes, skipped, matched, unmatched, ambiguous, publi
         estimated = sum(n["estimated_dropoff_times"] for n in notes)
         capped = sum(n.get("capped_dropoff_times", 0) for n in notes)
         if estimated:
-            print(f"  {estimated} drop-off time(s) had no appointment time and were estimated at")
-            print(f"  pickup + {SR.DEFAULT_TRANSPORT_MINUTES} min "
-                  f"(SAMSARA_DEFAULT_TRANSPORT_MINUTES).")
+            model = (
+                f"distance ({SR.TRANSPORT_BASE_MINUTES:.0f} min + miles / "
+                f"{SR.TRANSPORT_SPEED_MPH:.0f} mph)"
+                if SR.TRANSPORT_MODEL == "distance"
+                else (f"per level of service, defaulting to "
+                      f"{SR.DEFAULT_TRANSPORT_MINUTES} min"
+                      if SR.TRANSPORT_MINUTES_BY_LOS
+                      else f"a flat {SR.DEFAULT_TRANSPORT_MINUTES} min")
+            )
+            print(f"  {estimated} drop-off time(s) had no appointment time and were")
+            print(f"  estimated using {model}.")
         if capped:
             print(f"  {capped} of those ran into the unit's next pickup and were pulled back")
             print("  short of it, so a guessed time never reorders a real one.")
@@ -229,8 +239,10 @@ def main(argv=None):
         print_plan(day, [], [], skipped, matched, unmatched, ambiguous, args.publish,
                    offset=None, offset_source=offset_source)
         log.error(
-            "No tenant UTC offset could be resolved, so no stop time can be "
-            "built. Set SAMSARA_TENANT_UTC_OFFSET (e.g. -04:00) and re-run."
+            "No tenant time zone could be resolved, so no stop time can be "
+            "built. Set SAMSARA_TENANT_TIMEZONE (e.g. America/New_York) and "
+            "re-run; a fixed SAMSARA_TENANT_UTC_OFFSET also works but does not "
+            "follow daylight saving."
         )
         return 2
 

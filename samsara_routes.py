@@ -22,10 +22,29 @@ import json
 import logging
 import os
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
+try:  # stdlib on 3.9+, but a machine can be missing the tzdata package
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None
+
 log = logging.getLogger(__name__)
+
+
+def normalize_los(value):
+    """
+    A level of service reduced to a comparable key.
+
+    Real data carries 'Non Emergency' and 'Non-Emergency' as one thing typed
+    two ways, and 'Non Amnbulatory' as a straight typo. Case, hyphens and
+    runs of whitespace are collapsed so a rule written once catches the
+    variants; genuine misspellings still need naming individually.
+    """
+    text = str(value or "").strip().lower().replace("-", " ")
+    return " ".join(text.split())
+
 
 STATE_DIR = os.getenv("TS_STATE_DIR", "state")
 VEHICLE_OVERRIDES_FILE = os.path.join(STATE_DIR, "samsara_vehicle_overrides.json")
@@ -49,6 +68,19 @@ MIN_STOP_GAP_MINUTES = 1
 # somebody makes rather than a default they inherit.
 INCLUDE_PATIENT_NAME = os.getenv("SAMSARA_INCLUDE_PATIENT_NAME", "").strip().lower() in (
     "1", "true", "yes", "y",
+)
+
+# The tenant's UTC offset, as '-04:00' or '-4'. Normally left unset and
+# resolved from the data -- see resolve_tenant_offset, which explains why this
+# escape hatch has to exist.
+TENANT_UTC_OFFSET = os.getenv("SAMSARA_TENANT_UTC_OFFSET", "").strip()
+
+# Levels of service never pushed. Emergency work is dispatched in the moment,
+# so a route built for it the night before describes nothing. Empty by
+# default: whether that is true of a given operation is its own call, and
+# probe_samsara_readiness.py prints the real vocabulary to decide against.
+EXCLUDED_LOS = tuple(
+    normalize_los(v) for v in os.getenv("SAMSARA_EXCLUDED_LOS", "").split(",") if v.strip()
 )
 
 # Call types that describe something other than a transport a driver can be
@@ -186,6 +218,109 @@ def match_vehicles(traumasoft_names, samsara_vehicles, overrides=None):
 
 
 # =============================
+# TIME ZONE
+# =============================
+def parse_offset_string(text):
+    """'-04:00', '-4', '+5:30' -> a timedelta. None if unparseable."""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    match = re.fullmatch(r"([+-]?)(\d{1,2})(?::?(\d{2}))?", text)
+    if not match:
+        return None
+    sign, hours, minutes = match.groups()
+    delta = timedelta(hours=int(hours), minutes=int(minutes or 0))
+    return -delta if sign == "-" else delta
+
+
+def format_offset(delta):
+    """A timedelta as '-04:00'. str() renders -4h as '-1 day, 20:00:00'."""
+    if delta is None:
+        return "unknown"
+    total = int(delta.total_seconds())
+    sign = "-" if total < 0 else "+"
+    total = abs(total)
+    return f"{sign}{total // 3600:02d}:{(total % 3600) // 60:02d}"
+
+
+def resolve_tenant_offset(legs, parse_ts_aware):
+    """
+    The UTC offset to stamp on a naive trip time, and where it came from.
+
+    This matters more than it looks. On this tenant `pickup_time` is naive on
+    every leg -- not one carries an offset -- so something has to supply it,
+    and getting it wrong is not a subtle error: it dispatches a 07:30 pickup
+    at 03:30 local.
+
+    The obvious source, the offset on the status timestamps, is exactly the
+    one that fails for the job's main use. A trip scheduled for tomorrow has
+    no status stamps yet, because nothing has happened to it, so a day of
+    future work carries no offset anywhere in it. Hence the chain:
+
+        1. SAMSARA_TENANT_UTC_OFFSET, when someone has stated it
+        2. an offset on pickup_time itself, if this tenant ever sends one
+        3. the leg's own `timezone` field, resolved for that actual date so
+           daylight saving is right
+        4. the status timestamps, which only works for days already worked
+
+    Returns (offset, source). A None offset means refuse to publish rather
+    than guess -- see push_samsara_routes.py.
+    """
+    explicit = parse_offset_string(TENANT_UTC_OFFSET)
+    if explicit is not None:
+        return explicit, "SAMSARA_TENANT_UTC_OFFSET"
+
+    offsets = Counter()
+    for leg in legs:
+        parsed = parse_ts_aware(leg.get("pickup_time"))
+        if parsed is not None and parsed.tzinfo is not None:
+            offsets[parsed.utcoffset()] += 1
+    if offsets:
+        return offsets.most_common(1)[0][0], "pickup_time offset"
+
+    if ZoneInfo is not None:
+        zones = Counter(
+            str(leg.get("timezone") or "").strip()
+            for leg in legs
+            if str(leg.get("timezone") or "").strip()
+        )
+        for zone_name, _ in zones.most_common():
+            try:
+                zone = ZoneInfo(zone_name)
+            except Exception:  # noqa: BLE001 -- unknown zone, try the next
+                continue
+            # Resolved against a pickup date, not today: a day the far side
+            # of a daylight-saving boundary has a different offset.
+            sample = None
+            for leg in legs:
+                sample = parse_ts_aware(leg.get("pickup_time"))
+                if sample is not None:
+                    break
+            moment = (sample or datetime.now()).replace(tzinfo=None)
+            return moment.replace(tzinfo=zone).utcoffset(), f"timezone field ({zone_name})"
+
+    from_stamps = _offset_from_status_stamps(legs, parse_ts_aware)
+    if from_stamps is not None:
+        return from_stamps, "status timestamps"
+
+    return None, "unresolved"
+
+
+def _offset_from_status_stamps(legs, parse_ts_aware):
+    """The most common offset across every status stamp on these legs."""
+    offsets = Counter()
+    for leg in legs:
+        for entry in leg.get("timestamps") or []:
+            if not isinstance(entry, dict):
+                continue
+            for value in entry.values():
+                parsed = parse_ts_aware(value)
+                if parsed is not None and parsed.tzinfo is not None:
+                    offsets[parsed.utcoffset()] += 1
+    return offsets.most_common(1)[0][0] if offsets else None
+
+
+# =============================
 # LEG SELECTION
 # =============================
 def _is_truthy_deleted(value):
@@ -202,6 +337,13 @@ def has_location(leg, side):
         except (TypeError, ValueError):
             pass
     return bool(str(leg.get(f"{side}_address1") or "").strip())
+
+
+def is_excluded_los(los):
+    """Whether this level of service is one the operation never pre-routes."""
+    if not EXCLUDED_LOS:
+        return False
+    return normalize_los(los) in EXCLUDED_LOS
 
 
 def is_excluded_call_type(call_type):
@@ -229,6 +371,9 @@ def eligible_legs(legs, parse_ts_aware):
         if is_excluded_call_type(leg.get("call_type")):
             skipped.append((leg, f"call type {leg.get('call_type')!r} excluded"))
             continue
+        if is_excluded_los(leg.get("los")):
+            skipped.append((leg, f"level of service {leg.get('los')!r} excluded"))
+            continue
         if not str(leg.get("vehicle_name") or "").strip():
             skipped.append((leg, "no vehicle assigned"))
             continue
@@ -250,14 +395,24 @@ def eligible_legs(legs, parse_ts_aware):
 # =============================
 def rfc3339(moment, default_offset=None):
     """
-    Samsara wants an RFC3339 instant. Traumasoft trip stamps usually carry an
-    offset; when one does not, the tenant's own offset is applied rather than
-    letting it be read as UTC and land hours out.
+    Samsara wants an RFC3339 instant.
+
+    A naive moment with no offset to apply raises rather than defaulting to
+    UTC. Silently reading tenant-local time as UTC is the failure that
+    dispatches an ambulance four hours early, and it looks like valid output
+    all the way to the driver's phone -- so it is refused at the point where
+    the information is missing.
     """
     if moment is None:
         return None
     if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone(default_offset or timedelta(0)))
+        if default_offset is None:
+            raise ValueError(
+                "Refusing to convert a naive timestamp without a tenant UTC "
+                "offset: it would be read as UTC and land hours out. Set "
+                "SAMSARA_TENANT_UTC_OFFSET."
+            )
+        moment = moment.replace(tzinfo=timezone(default_offset))
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -345,7 +500,8 @@ def stop_notes(leg, side):
     return " · ".join(bits)[:1000]
 
 
-def leg_stops(leg, parse_ts_aware, address_index=None, default_offset=None):
+def leg_stops(leg, parse_ts_aware, address_index=None, default_offset=None,
+              next_pickup=None):
     """
     The two stops for one leg, with a drop-off time that always follows the
     pickup.
@@ -353,6 +509,15 @@ def leg_stops(leg, parse_ts_aware, address_index=None, default_offset=None):
     Drop-off time is the appointment time where the trip has one -- that is
     the hour the patient is actually due -- then the drop-off ETA, and only
     then an estimate off the pickup.
+
+    `next_pickup` is when this vehicle is next due somewhere, and it exists
+    because Samsara sorts every stop on a route by arrival time. A drop-off
+    invented at pickup + 45 minutes will sort after the next leg's pickup
+    whenever the two are closer together than that, and the driver is then
+    told to collect the next patient before delivering the one on board. A
+    guessed time must never reorder real ones, so the estimate is capped just
+    short of the next pickup. A genuine appointment time is left alone: that
+    is data, and if it overlaps, the overlap is real.
     """
     pickup = parse_ts_aware(leg.get("pickup_time"))
     if pickup is None:
@@ -371,6 +536,10 @@ def leg_stops(leg, parse_ts_aware, address_index=None, default_offset=None):
         if dropoff is None:
             dropoff_source = "estimated"
             dropoff = pickup + timedelta(minutes=DEFAULT_TRANSPORT_MINUTES)
+            if next_pickup is not None and dropoff >= next_pickup:
+                capped = next_pickup - timedelta(minutes=MIN_STOP_GAP_MINUTES)
+                dropoff = max(floor, capped)
+                dropoff_source = "estimated (capped at next pickup)"
         else:
             # A real time that lands before its own pickup would make Samsara
             # sort the drop-off ahead of it. Keep the ordering, flag the data.
@@ -441,11 +610,21 @@ def build_routes(
             ),
         )
 
-        stops, estimated, run_numbers = [], 0, []
-        for leg in vehicle_legs:
-            leg_pair, source = leg_stops(leg, parse_ts_aware, address_index, default_offset)
+        # Each leg needs to know when this vehicle is next due somewhere, so a
+        # guessed drop-off cannot sort past a real pickup. See leg_stops.
+        pickups = [parse_ts_aware(l.get("pickup_time")) for l in vehicle_legs]
+
+        stops, estimated, capped, run_numbers = [], 0, 0, []
+        for index, leg in enumerate(vehicle_legs):
+            next_pickup = pickups[index + 1] if index + 1 < len(pickups) else None
+            leg_pair, source = leg_stops(
+                leg, parse_ts_aware, address_index, default_offset,
+                next_pickup=next_pickup,
+            )
             if not leg_pair:
                 continue
+            if source and source.startswith("estimated (capped"):
+                capped += 1
             stops.extend(leg_pair)
             if source and source != "appt_time":
                 estimated += 1
@@ -471,6 +650,7 @@ def build_routes(
                 "legs": len(vehicle_legs),
                 "stops": len(stops),
                 "estimated_dropoff_times": estimated,
+                "capped_dropoff_times": capped,
                 "run_numbers": run_numbers,
             }
         )

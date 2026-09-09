@@ -404,3 +404,169 @@ def test_the_shipped_example_overrides_file_parses():
     assert isinstance(
         SR.load_vehicle_overrides("state/samsara_vehicle_overrides.example.json"), dict
     )
+
+
+# =============================
+# TENANT OFFSET
+# =============================
+# Real trip data from this tenant carries a naive pickup_time on every single
+# leg, so the offset has to come from somewhere else -- and the obvious
+# source fails for the job's whole purpose. These pin that down.
+def test_pickup_times_with_no_offset_are_refused_rather_than_read_as_utc():
+    naive = parse_ts_aware("2026-09-10T07:30:00")
+    with pytest.raises(ValueError, match="naive timestamp"):
+        SR.rfc3339(naive, default_offset=None)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("-04:00", timedelta(hours=-4)),
+        ("-4", timedelta(hours=-4)),
+        ("+05:30", timedelta(hours=5, minutes=30)),
+        ("0", timedelta(0)),
+        ("", None),
+        ("nonsense", None),
+    ],
+)
+def test_parse_offset_string(text, expected):
+    assert SR.parse_offset_string(text) == expected
+
+
+def test_explicit_offset_wins(monkeypatch):
+    monkeypatch.setattr(SR, "TENANT_UTC_OFFSET", "-05:00")
+    offset, source = SR.resolve_tenant_offset([leg()], parse_ts_aware)
+    assert offset == timedelta(hours=-5)
+    assert source == "SAMSARA_TENANT_UTC_OFFSET"
+
+
+def test_offset_comes_from_pickup_time_when_it_carries_one(monkeypatch):
+    monkeypatch.setattr(SR, "TENANT_UTC_OFFSET", "")
+    offset, source = SR.resolve_tenant_offset([leg()], parse_ts_aware)
+    assert offset == timedelta(hours=-4)
+    assert source == "pickup_time offset"
+
+
+def test_offset_comes_from_the_timezone_field_on_future_dated_legs(monkeypatch):
+    """
+    The case that matters: tomorrow's trips have no status timestamps,
+    because nothing has happened to them yet.
+    """
+    monkeypatch.setattr(SR, "TENANT_UTC_OFFSET", "")
+    future = leg(pickup_time="2026-09-10T07:30:00", timezone="America/New_York",
+                 timestamps=[])
+    offset, source = SR.resolve_tenant_offset([future], parse_ts_aware)
+    assert offset == timedelta(hours=-4)          # September is daylight time
+    assert "timezone field" in source
+
+
+def test_the_timezone_field_is_resolved_for_the_trip_date_not_today(monkeypatch):
+    """A January trip is -05:00 even if the run happens in July."""
+    monkeypatch.setattr(SR, "TENANT_UTC_OFFSET", "")
+    winter = leg(pickup_time="2027-01-15T07:30:00", timezone="America/New_York",
+                 timestamps=[])
+    offset, _ = SR.resolve_tenant_offset([winter], parse_ts_aware)
+    assert offset == timedelta(hours=-5)
+
+
+def test_offset_falls_back_to_status_stamps_for_a_day_already_worked(monkeypatch):
+    monkeypatch.setattr(SR, "TENANT_UTC_OFFSET", "")
+    worked = leg(pickup_time="2026-09-10T07:30:00",
+                 timestamps=[{"at_scene": "2026-09-10T07:34:00-04:00"}])
+    offset, source = SR.resolve_tenant_offset([worked], parse_ts_aware)
+    assert offset == timedelta(hours=-4)
+    assert source == "status timestamps"
+
+
+def test_an_unresolvable_offset_is_reported_not_guessed(monkeypatch):
+    monkeypatch.setattr(SR, "TENANT_UTC_OFFSET", "")
+    blind = leg(pickup_time="2026-09-10T07:30:00", timezone=None, timestamps=[])
+    offset, source = SR.resolve_tenant_offset([blind], parse_ts_aware)
+    assert offset is None
+    assert source == "unresolved"
+
+
+# =============================
+# ESTIMATED DROP-OFFS vs REAL PICKUPS
+# =============================
+def test_an_estimated_dropoff_is_capped_short_of_the_next_pickup():
+    """
+    Two thirds of real drop-offs are guessed at pickup + 45 min. Samsara
+    sorts every stop by arrival time, so an uncapped guess sorts past a
+    pickup 30 minutes later and tells the driver to collect the next patient
+    before delivering the one on board.
+    """
+    next_pickup = parse_ts_aware("2026-09-10T08:00:00-04:00")
+    stops, source = SR.leg_stops(
+        leg(appt_time=None, dropoff_eta=None), parse_ts_aware, next_pickup=next_pickup
+    )
+    assert stops[1]["scheduledArrivalTime"] < SR.rfc3339(next_pickup)
+    assert "capped" in source
+
+
+def test_an_uncrowded_estimate_is_left_at_the_full_default():
+    next_pickup = parse_ts_aware("2026-09-10T15:00:00-04:00")
+    stops, source = SR.leg_stops(
+        leg(appt_time=None, dropoff_eta=None), parse_ts_aware, next_pickup=next_pickup
+    )
+    assert stops[1]["scheduledArrivalTime"] == "2026-09-10T12:15:00Z"
+    assert source == "estimated"
+
+
+def test_a_real_appointment_time_is_never_capped():
+    """An overlap in real data is real. Only a guess gets moved."""
+    next_pickup = parse_ts_aware("2026-09-10T07:40:00-04:00")
+    stops, source = SR.leg_stops(leg(), parse_ts_aware, next_pickup=next_pickup)
+    assert stops[1]["scheduledArrivalTime"] == "2026-09-10T12:05:00Z"
+    assert source == "appt_time"
+
+
+def test_capping_never_puts_the_dropoff_before_its_own_pickup():
+    next_pickup = parse_ts_aware("2026-09-10T07:30:30-04:00")
+    stops, _ = SR.leg_stops(
+        leg(appt_time=None, dropoff_eta=None), parse_ts_aware, next_pickup=next_pickup
+    )
+    assert stops[0]["scheduledArrivalTime"] < stops[1]["scheduledArrivalTime"]
+
+
+def test_a_whole_route_never_interleaves_a_guess_with_a_real_pickup():
+    """Back-to-back legs must come out PU, DO, PU, DO -- not PU, PU, DO, DO."""
+    legs = [
+        leg(leg_id=1, run_number="A", pickup_time="2026-09-10T07:30:00-04:00",
+            appt_time=None, dropoff_eta=None),
+        leg(leg_id=2, run_number="B", pickup_time="2026-09-10T08:00:00-04:00",
+            appt_time=None, dropoff_eta=None),
+    ]
+    routes, notes = SR.build_routes(
+        legs, {"M-12": vehicle("281", "M12")}, date(2026, 9, 10), parse_ts_aware
+    )
+    assert [s["name"][:2] for s in routes[0]["stops"]] == ["PU", "DO", "PU", "DO"]
+    assert notes[0]["capped_dropoff_times"] == 1
+
+
+# =============================
+# LEVEL OF SERVICE EXCLUSION
+# =============================
+def test_los_exclusion_is_off_by_default():
+    kept, _ = SR.eligible_legs([leg(los="Emergency")], parse_ts_aware)
+    assert len(kept) == 1
+
+
+def test_los_can_be_excluded(monkeypatch):
+    monkeypatch.setattr(SR, "EXCLUDED_LOS", ("emergency",))
+    kept, skipped = SR.eligible_legs([leg(los="Emergency")], parse_ts_aware)
+    assert not kept
+    assert "level of service" in skipped[0][1]
+
+
+@pytest.mark.parametrize(
+    "spelling", ["Non Emergency", "Non-Emergency", "non emergency", "  Non  Emergency "]
+)
+def test_los_spellings_normalise_to_one_value(spelling):
+    """Real data carries 'Non Emergency' and 'Non-Emergency' as one thing."""
+    assert SR.normalize_los(spelling) == "non emergency"
+
+
+def test_a_genuine_typo_stays_distinct():
+    """'Non Amnbulatory' is a typo, not a variant -- it must be named to be caught."""
+    assert SR.normalize_los("Non Amnbulatory") != SR.normalize_los("Non Ambulatory")

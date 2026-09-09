@@ -86,7 +86,8 @@ def resolve_date(text):
         raise SystemExit(f"Not a date: {text!r}. Use YYYY-MM-DD.")
 
 
-def print_plan(day, routes, notes, skipped, matched, unmatched, ambiguous, publishing):
+def print_plan(day, routes, notes, skipped, matched, unmatched, ambiguous, publishing,
+               offset=None, offset_source=None):
     """The whole decision surface in one screen, before anything is sent."""
     total_stops = sum(len(r["stops"]) for r in routes)
     print()
@@ -96,21 +97,36 @@ def print_plan(day, routes, notes, skipped, matched, unmatched, ambiguous, publi
     print("=" * 72)
     print(f"  Routes: {len(routes)}    Stops: {total_stops}    "
           f"Legs routed: {sum(n['legs'] for n in notes)}")
+    if offset is None:
+        print()
+        print("  !! TENANT UTC OFFSET UNRESOLVED. Trip times are local with no zone,")
+        print("     so they cannot be converted safely -- a 07:30 pickup would be")
+        print("     sent as 07:30Z and dispatched hours early. Set")
+        print("     SAMSARA_TENANT_UTC_OFFSET=-04:00 (or your offset) and re-run.")
+    else:
+        print(f"  Times converted using {SR.format_offset(offset)} (from {offset_source})")
     print()
 
     if notes:
-        print(f"  {'Unit':<16}{'Samsara vehicle':<26}{'Legs':>5}{'Stops':>7}{'Est. DO':>9}")
-        print(f"  {'-' * 62}")
+        print(f"  {'Unit':<16}{'Samsara vehicle':<26}{'Legs':>5}{'Stops':>7}"
+              f"{'Est. DO':>9}{'Capped':>8}")
+        print(f"  {'-' * 70}")
         for note in notes:
             print(f"  {note['vehicle_name'][:15]:<16}"
                   f"{(note['samsara_vehicle'] or '')[:25]:<26}"
-                  f"{note['legs']:>5}{note['stops']:>7}{note['estimated_dropoff_times']:>9}")
+                  f"{note['legs']:>5}{note['stops']:>7}"
+                  f"{note['estimated_dropoff_times']:>9}{note.get('capped_dropoff_times', 0):>8}")
         print()
         estimated = sum(n["estimated_dropoff_times"] for n in notes)
+        capped = sum(n.get("capped_dropoff_times", 0) for n in notes)
         if estimated:
             print(f"  {estimated} drop-off time(s) had no appointment time and were estimated at")
             print(f"  pickup + {SR.DEFAULT_TRANSPORT_MINUTES} min "
                   f"(SAMSARA_DEFAULT_TRANSPORT_MINUTES).")
+        if capped:
+            print(f"  {capped} of those ran into the unit's next pickup and were pulled back")
+            print("  short of it, so a guessed time never reorders a real one.")
+        if estimated or capped:
             print()
 
     if skipped:
@@ -172,9 +188,12 @@ def main(argv=None):
     kept, skipped = SR.eligible_legs(legs, R.parse_ts_aware)
     log.info("%d leg(s) eligible, %d skipped", len(kept), len(skipped))
 
-    # Trip stamps normally carry their own offset; this is the fallback for
-    # any that do not, taken from the day's own data.
-    default_offset = R.tenant_utc_offset(legs)
+    # On this tenant pickup_time is naive on every leg, so the offset has to
+    # come from elsewhere -- and a day of future work has no status stamps to
+    # take it from. resolve_tenant_offset explains the chain; what matters
+    # here is that an unresolved offset stops the run rather than silently
+    # dispatching everyone four hours early.
+    default_offset, offset_source = SR.resolve_tenant_offset(legs, R.parse_ts_aware)
 
     # --- Samsara: vehicles, addresses -----------------------------------
     # Read-only unless the caller asked to publish, so a dry run cannot write
@@ -202,6 +221,19 @@ def main(argv=None):
         if name not in matched:
             skipped.append((leg, f"vehicle {name!r} not found in Samsara"))
 
+    # Without an offset no stop time can be built at all, so route assembly is
+    # skipped rather than allowed to raise. The plan still prints -- the
+    # vehicle join and the skip reasons are exactly what is worth seeing while
+    # sorting the offset out.
+    if default_offset is None:
+        print_plan(day, [], [], skipped, matched, unmatched, ambiguous, args.publish,
+                   offset=None, offset_source=offset_source)
+        log.error(
+            "No tenant UTC offset could be resolved, so no stop time can be "
+            "built. Set SAMSARA_TENANT_UTC_OFFSET (e.g. -04:00) and re-run."
+        )
+        return 2
+
     routes, notes = SR.build_routes(
         routable,
         matched,
@@ -212,7 +244,8 @@ def main(argv=None):
         name_prefix=ROUTE_NAME_PREFIX,
     )
 
-    print_plan(day, routes, notes, skipped, matched, unmatched, ambiguous, args.publish)
+    print_plan(day, routes, notes, skipped, matched, unmatched, ambiguous, args.publish,
+               offset=default_offset, offset_source=offset_source)
 
     if args.json_path:
         with open(args.json_path, "w", encoding="utf-8") as handle:

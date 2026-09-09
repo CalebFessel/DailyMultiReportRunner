@@ -48,6 +48,10 @@ MAPPING_FIELDS = [
     "pu_facility_name", "pu_lat", "pu_lon", "pu_address1", "pu_city", "pu_state",
     "do_facility_name", "do_lat", "do_lon", "do_address1", "do_city", "do_state",
     "run_number", "trip_number", "response_priority", "transport_priority",
+    # Carries the tenant's zone. On a tenant whose pickup_time is naive this
+    # is the only thing that can date-correctly place a FUTURE day's trips,
+    # which is the whole point of the job.
+    "timezone",
 ]
 
 # Counted, never printed. Whether these are populated matters -- what they say
@@ -68,16 +72,6 @@ def populated(value):
     if text in ("0", "0.0"):
         return False
     return True
-
-
-def fmt_offset(delta):
-    """A timedelta as '-04:00'. repr() renders -4h as '-1 day, 20:00:00'."""
-    if delta is None:
-        return "unknown"
-    total = int(delta.total_seconds())
-    sign = "-" if total < 0 else "+"
-    total = abs(total)
-    return f"{sign}{total // 3600:02d}:{(total % 3600) // 60:02d}"
 
 
 def pct(count, total):
@@ -128,34 +122,39 @@ def report_timezones(legs, out):
             with_offset += 1
         else:
             without += 1
-    # tenant_utc_offset reads the `timestamps` array, which is empty on legs
-    # that never got a status stamp. pickup_time carries the same offset, so
-    # fall back to it rather than reporting "unknown" for a tenant whose data
-    # plainly states its offset.
-    tenant = R.tenant_utc_offset(legs)
-    source = "status timestamps"
-    if tenant is None:
-        offsets = Counter()
-        for leg in legs:
-            parsed = R.parse_ts_aware(leg.get("pickup_time"))
-            if parsed is not None and parsed.tzinfo is not None:
-                offsets[parsed.utcoffset()] += 1
-        if offsets:
-            tenant = offsets.most_common(1)[0][0]
-            source = "pickup_time"
+    # The same resolver the publisher uses, so the probe reports the answer
+    # that will actually be applied rather than a second opinion.
+    tenant, source = SR.resolve_tenant_offset(legs, R.parse_ts_aware)
 
     print(f"   pickup_time carries an offset : {with_offset}")
     print(f"   pickup_time is naive          : {without}")
-    print(f"   tenant offset                 : {fmt_offset(tenant)}  (from {source})")
+    print(f"   tenant offset                 : {SR.format_offset(tenant)}  (from {source})")
     if without and tenant is None:
-        print("   !! Naive stamps and no detectable tenant offset. Dispatch times")
-        print("      would be read as UTC and land hours early. Set the offset.")
+        print("   !! Naive stamps and no resolvable offset. Publishing is refused")
+        print("      rather than dispatching hours early. Set SAMSARA_TENANT_UTC_OFFSET.")
     elif without:
-        print(f"   Naive stamps will be treated as {fmt_offset(tenant)}.")
+        print(f"   Naive stamps will be treated as {SR.format_offset(tenant)}.")
+
+    # This window is history, so status timestamps are available to it. A day
+    # of FUTURE work has none, and that is the day this job exists to push.
+    zones = Counter(
+        str(leg.get("timezone") or "").strip() for leg in legs
+        if str(leg.get("timezone") or "").strip()
+    )
+    if source == "status timestamps":
+        print()
+        print("   NOTE: that offset came from status timestamps, which only exist on")
+        print("   trips that have already run. Tomorrow's trips carry none, so the")
+        if zones:
+            print(f"   publisher will fall back to the timezone field "
+                  f"({', '.join(sorted(zones))}).")
+        else:
+            print("   timezone field is empty too -- SET SAMSARA_TENANT_UTC_OFFSET, or")
+            print("   every future dispatch time will be refused (or wrong).")
     out["timestamps"] = {
         "with_offset": with_offset,
         "naive": without,
-        "tenant_offset": fmt_offset(tenant),
+        "tenant_offset": SR.format_offset(tenant),
     }
 
 

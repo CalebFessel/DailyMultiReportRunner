@@ -283,6 +283,27 @@ how many drop-offs were estimated. A real appointment time that lands *before*
 its own pickup is pushed one minute past it, because Samsara sorts stops by
 arrival time and would otherwise send the driver to the drop-off first.
 
+### Before the first run: the readiness probe
+
+`probe_samsara_readiness.py` is read-only and answers the questions the
+mapping would otherwise guess at — run it before configuring anything:
+
+```bash
+python probe_samsara_readiness.py --days 30
+```
+
+It reports field coverage on real legs (how often coordinates and appointment
+times are actually populated), whether trip stamps carry a UTC offset, your
+real `call_type` and `los` vocabulary against the exclusion list, the
+eligibility funnel with a reason for every dropped leg, how many drop-off
+times would be estimated rather than scheduled, and the actual
+Traumasoft↔Samsara vehicle match table. It works with or without a Samsara
+token — without one you still get the Traumasoft-side unit prefixes.
+
+**It never prints patient-identifying values.** Names, MRNs, phone numbers and
+street addresses are counted, never shown, so its output is safe to paste into
+an issue or a chat.
+
 ### Configuration
 
 ```env

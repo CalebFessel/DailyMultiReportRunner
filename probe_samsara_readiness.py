@@ -28,8 +28,10 @@ against. The output is safe to paste into a chat or an issue.
 """
 
 import argparse
+import hashlib
 import json
 import logging
+import os
 import sys
 from collections import Counter, defaultdict
 from datetime import date, timedelta
@@ -60,6 +62,26 @@ PHI_FIELDS = [
     "patient_first_name", "patient_last_name", "patient_mrn", "patient_id",
     "pu_phone", "do_phone",
 ]
+
+
+def build_id():
+    """
+    A short hash of the code actually running.
+
+    These files are copied onto the reporting machine by hand, and
+    raw.githubusercontent.com caches for a few minutes, so a download can
+    quietly hand back the previous version. A report that does not say which
+    build produced it can then be read as current when it is not -- which has
+    already happened once, and cost a recommendation that was wrong.
+    """
+    digest = hashlib.sha256()
+    for path in (__file__, SR.__file__):
+        try:
+            with open(path, "rb") as handle:
+                digest.update(handle.read())
+        except OSError:
+            return "unknown"
+    return digest.hexdigest()[:8]
 
 
 def populated(value):
@@ -649,7 +671,7 @@ def main(argv=None):
 
     print("=" * 72)
     print(f"  Samsara readiness probe -- {start} to {end} ({days}d, {len(legs)} legs)")
-    print("  Read-only. No patient-identifying value is printed.")
+    print(f"  Read-only. No patient-identifying value is printed.   build {build_id()}")
     print("=" * 72)
 
     if not legs:

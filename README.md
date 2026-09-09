@@ -280,19 +280,23 @@ leg. Samsara wants an absolute instant. Something has to bridge that, and
 getting it wrong is not subtle: a 07:30 pickup sent as `07:30Z` dispatches the
 unit at 03:30 local.
 
+Measured on 30 days of this tenant's data: `pickup_time` is naive on **all
+18,026 legs**, and the per-leg `timezone` field is empty on **100%** of them.
+
 The offset is resolved in this order:
 
-1. `SAMSARA_TENANT_UTC_OFFSET`, if set
-2. an offset on `pickup_time` itself, if the tenant ever sends one
-3. the leg's `timezone` field, resolved **for that trip's date** so daylight
-   saving is right
-4. the status timestamps on the legs
+1. `SAMSARA_TENANT_TIMEZONE` — an IANA zone (`America/New_York`), resolved
+   against each trip's own date so daylight saving is handled
+2. `SAMSARA_TENANT_UTC_OFFSET` — a fixed offset, wrong half the year
+3. an offset on `pickup_time` itself, if the tenant ever sends one
+4. the leg's `timezone` field
+5. the status timestamps on the legs
 
-Step 4 is the trap. It works fine for a day already worked, which is why a
-30-day probe reports a clean offset — but tomorrow's trips have no status
-timestamps, because nothing has happened to them yet, and tomorrow is exactly
-what this job pushes. If nothing in the chain resolves, **the run refuses to
-publish** and tells you to set the offset. It will not guess.
+**Set one of the first two.** Step 5 is the trap: it works fine for a day
+already worked, which is why a 30-day probe reports a clean `-04:00` — but
+tomorrow's trips have no status timestamps, because nothing has happened to
+them yet, and tomorrow is exactly what this job pushes. If nothing in the
+chain resolves, **the run refuses to publish** and says so. It will not guess.
 
 ### Drop-off times
 

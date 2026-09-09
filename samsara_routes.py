@@ -70,9 +70,14 @@ INCLUDE_PATIENT_NAME = os.getenv("SAMSARA_INCLUDE_PATIENT_NAME", "").strip().low
     "1", "true", "yes", "y",
 )
 
-# The tenant's UTC offset, as '-04:00' or '-4'. Normally left unset and
-# resolved from the data -- see resolve_tenant_offset, which explains why this
-# escape hatch has to exist.
+# The tenant's time zone as an IANA name, e.g. 'America/New_York'. Preferred
+# over a fixed offset because it follows daylight saving on its own, resolved
+# against each trip's own date. Needed because this tenant sends naive trip
+# times and leaves the per-leg `timezone` field empty.
+TENANT_TIMEZONE = os.getenv("SAMSARA_TENANT_TIMEZONE", "").strip()
+
+# A fixed UTC offset, '-04:00' or '-4'. Works, but is wrong for half the year
+# unless somebody remembers to change it twice. Prefer SAMSARA_TENANT_TIMEZONE.
 TENANT_UTC_OFFSET = os.getenv("SAMSARA_TENANT_UTC_OFFSET", "").strip()
 
 # Levels of service never pushed. Emergency work is dispatched in the moment,
@@ -257,15 +262,30 @@ def resolve_tenant_offset(legs, parse_ts_aware):
     no status stamps yet, because nothing has happened to it, so a day of
     future work carries no offset anywhere in it. Hence the chain:
 
-        1. SAMSARA_TENANT_UTC_OFFSET, when someone has stated it
-        2. an offset on pickup_time itself, if this tenant ever sends one
-        3. the leg's own `timezone` field, resolved for that actual date so
-           daylight saving is right
-        4. the status timestamps, which only works for days already worked
+        1. SAMSARA_TENANT_TIMEZONE, an IANA zone resolved against the trip's
+           own date, so daylight saving is handled without anyone's diary
+        2. SAMSARA_TENANT_UTC_OFFSET, a fixed offset
+        3. an offset on pickup_time itself, if this tenant ever sends one
+        4. the leg's own `timezone` field -- empty on this tenant, but it
+           costs nothing to prefer real data where it exists
+        5. the status timestamps, which only works for days already worked
 
     Returns (offset, source). A None offset means refuse to publish rather
     than guess -- see push_samsara_routes.py.
     """
+    sample_date = _first_pickup(legs, parse_ts_aware)
+
+    if TENANT_TIMEZONE and ZoneInfo is not None:
+        try:
+            zone = ZoneInfo(TENANT_TIMEZONE)
+        except Exception:  # noqa: BLE001
+            log.warning("SAMSARA_TENANT_TIMEZONE=%r is not a known zone", TENANT_TIMEZONE)
+        else:
+            return (
+                sample_date.replace(tzinfo=zone).utcoffset(),
+                f"SAMSARA_TENANT_TIMEZONE ({TENANT_TIMEZONE})",
+            )
+
     explicit = parse_offset_string(TENANT_UTC_OFFSET)
     if explicit is not None:
         return explicit, "SAMSARA_TENANT_UTC_OFFSET"
@@ -289,21 +309,31 @@ def resolve_tenant_offset(legs, parse_ts_aware):
                 zone = ZoneInfo(zone_name)
             except Exception:  # noqa: BLE001 -- unknown zone, try the next
                 continue
-            # Resolved against a pickup date, not today: a day the far side
-            # of a daylight-saving boundary has a different offset.
-            sample = None
-            for leg in legs:
-                sample = parse_ts_aware(leg.get("pickup_time"))
-                if sample is not None:
-                    break
-            moment = (sample or datetime.now()).replace(tzinfo=None)
-            return moment.replace(tzinfo=zone).utcoffset(), f"timezone field ({zone_name})"
+            return (
+                sample_date.replace(tzinfo=zone).utcoffset(),
+                f"timezone field ({zone_name})",
+            )
 
     from_stamps = _offset_from_status_stamps(legs, parse_ts_aware)
     if from_stamps is not None:
         return from_stamps, "status timestamps"
 
     return None, "unresolved"
+
+
+def _first_pickup(legs, parse_ts_aware):
+    """
+    A naive date to resolve a zone against.
+
+    It has to be a trip's own date, not today: a run the far side of a
+    daylight-saving boundary sits at a different offset, and resolving
+    November's trips against an August clock is an hour wrong.
+    """
+    for leg in legs:
+        parsed = parse_ts_aware(leg.get("pickup_time"))
+        if parsed is not None:
+            return parsed.replace(tzinfo=None)
+    return datetime.now()
 
 
 def _offset_from_status_stamps(legs, parse_ts_aware):

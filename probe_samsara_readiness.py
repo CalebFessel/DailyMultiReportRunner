@@ -48,9 +48,9 @@ MAPPING_FIELDS = [
     "pu_facility_name", "pu_lat", "pu_lon", "pu_address1", "pu_city", "pu_state",
     "do_facility_name", "do_lat", "do_lon", "do_address1", "do_city", "do_state",
     "run_number", "trip_number", "response_priority", "transport_priority",
-    # Carries the tenant's zone. On a tenant whose pickup_time is naive this
-    # is the only thing that can date-correctly place a FUTURE day's trips,
-    # which is the whole point of the job.
+    # Would carry the tenant's zone, and would place a future day's trips
+    # date-correctly without configuring anything. Empty on this tenant, which
+    # is exactly why SAMSARA_TENANT_TIMEZONE has to be set instead.
     "timezone",
 ]
 
@@ -131,7 +131,8 @@ def report_timezones(legs, out):
     print(f"   tenant offset                 : {SR.format_offset(tenant)}  (from {source})")
     if without and tenant is None:
         print("   !! Naive stamps and no resolvable offset. Publishing is refused")
-        print("      rather than dispatching hours early. Set SAMSARA_TENANT_UTC_OFFSET.")
+        print("      rather than dispatching hours early.")
+        print("      Set SAMSARA_TENANT_TIMEZONE=America/New_York (follows DST).")
     elif without:
         print(f"   Naive stamps will be treated as {SR.format_offset(tenant)}.")
 
@@ -149,13 +150,20 @@ def report_timezones(legs, out):
             print(f"   publisher will fall back to the timezone field "
                   f"({', '.join(sorted(zones))}).")
         else:
-            print("   timezone field is empty too -- SET SAMSARA_TENANT_UTC_OFFSET, or")
-            print("   every future dispatch time will be refused (or wrong).")
+            print("   timezone field is empty on this tenant too, so nothing in a day")
+            print("   of future work states its zone.")
+            print()
+            print("   ACTION: set SAMSARA_TENANT_TIMEZONE=America/New_York in .env.")
+            print("   An IANA zone is resolved against each trip's own date, so it")
+            print("   follows daylight saving; a fixed SAMSARA_TENANT_UTC_OFFSET works")
+            print("   but is wrong for half the year unless changed twice a year.")
     out["timestamps"] = {
         "with_offset": with_offset,
         "naive": without,
         "tenant_offset": SR.format_offset(tenant),
+        "offset_source": source,
     }
+    return tenant
 
 
 def report_vocabulary(legs, out):
@@ -198,24 +206,59 @@ def report_funnel(legs, out):
     return kept
 
 
-def report_dropoff_sources(kept, out):
+def report_dropoff_sources(kept, out, offset):
+    """
+    Where each drop-off time would come from, and how often a guessed one
+    would have collided with the unit's next pickup.
+
+    Grouped by vehicle and day exactly as the publisher groups a route, so
+    the collision count is the real one rather than a hypothetical.
+
+    The offset only affects how a time is rendered, never which source it
+    came from, so an unresolved offset still gives a truthful breakdown.
+    """
     print("\n5. DROP-OFF TIME PROVENANCE")
     print("   " + "-" * 66)
-    sources = Counter()
+    offset = offset if offset is not None else timedelta(0)
+
+    by_unit_day = defaultdict(list)
     for leg in kept:
-        _, source = SR.leg_stops(leg, R.parse_ts_aware)
-        sources[(source or "none").split(" (")[0]] += 1
+        pickup = R.parse_ts_aware(leg.get("pickup_time"))
+        if pickup is None:
+            continue
+        by_unit_day[(str(leg.get("vehicle_name") or "").strip(), pickup.date())].append(leg)
+
+    sources = Counter()
+    for legs_for_unit in by_unit_day.values():
+        legs_for_unit.sort(key=lambda l: R.parse_ts_aware(l.get("pickup_time")))
+        pickups = [R.parse_ts_aware(l.get("pickup_time")) for l in legs_for_unit]
+        for index, leg in enumerate(legs_for_unit):
+            next_pickup = pickups[index + 1] if index + 1 < len(pickups) else None
+            _, source = SR.leg_stops(
+                leg, R.parse_ts_aware, default_offset=offset, next_pickup=next_pickup
+            )
+            sources[(source or "none")] += 1
+    total = sum(sources.values())
     for source, count in sources.most_common():
         label = {
             "appt_time": "appointment time (best -- a real due time)",
             "dropoff_eta": "drop-off ETA",
-            "estimated": f"ESTIMATED at pickup + {SR.DEFAULT_TRANSPORT_MINUTES} min",
+            "estimated": f"estimated at pickup + {SR.DEFAULT_TRANSPORT_MINUTES} min",
+            "estimated (capped at next pickup)":
+                "estimated, then CAPPED -- the guess ran into the next pickup",
         }.get(source, source)
-        print(f"     {count:>6}  {pct(count, len(kept))}  {label}")
-    if sources.get("estimated", 0) > len(kept) * 0.5 if kept else False:
-        print("\n   !! Most drop-offs would be guessed. Either raise/lower")
-        print("      SAMSARA_DEFAULT_TRANSPORT_MINUTES per LOS, or accept that")
-        print("      Samsara's stop ordering is driven by the pickup times only.")
+        print(f"     {count:>6}  {pct(count, total)}  {label}")
+
+    capped = sources.get("estimated (capped at next pickup)", 0)
+    guessed = capped + sources.get("estimated", 0)
+    if guessed:
+        print(f"\n   {pct(guessed, total).strip()} of drop-offs are guesses.")
+    if capped:
+        print(f"   {capped} of them would have sorted past the unit's next pickup and")
+        print("   told the driver to collect the next patient before delivering the")
+        print(f"   one aboard. Lowering SAMSARA_DEFAULT_TRANSPORT_MINUTES from "
+              f"{SR.DEFAULT_TRANSPORT_MINUTES} would")
+        print("   reduce that; capping already prevents the misordering either way.")
     out["dropoff_sources"] = dict(sources)
 
 
@@ -319,11 +362,11 @@ def main(argv=None):
 
     out = {"window": {"start": start.isoformat(), "end": end.isoformat(), "days": days}}
     report_coverage(legs, out)
-    report_timezones(legs, out)
+    offset = report_timezones(legs, out)
     report_vocabulary(legs, out)
     kept = report_funnel(legs, out)
     if kept:
-        report_dropoff_sources(kept, out)
+        report_dropoff_sources(kept, out, offset)
         report_vehicle_join(kept, out)
 
     print("\n" + "=" * 72)

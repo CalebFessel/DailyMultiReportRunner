@@ -20,6 +20,7 @@ THE JOIN
 
 import json
 import logging
+import math
 import os
 import re
 from collections import Counter, defaultdict
@@ -72,6 +73,23 @@ for _pair in os.getenv("SAMSARA_TRANSPORT_MINUTES_BY_LOS", "").split(","):
         TRANSPORT_MINUTES_BY_LOS[normalize_los(_key)] = int(_value.strip())
     except ValueError:
         log.warning("Ignoring unparseable SAMSARA_TRANSPORT_MINUTES_BY_LOS entry %r", _pair)
+
+# 'flat' uses the numbers above. 'distance' computes each leg from how far it
+# actually goes, which the flat numbers cannot express: within one level of
+# service the allowed interval runs from 30 to 60 minutes, and the thing that
+# varies is the trip, not the category. Both ends of every leg carry
+# coordinates on ~100% of this tenant's data, so the input is there.
+# probe_samsara_readiness.py measures which model predicts better and fits
+# the two constants below -- do not switch on a hunch.
+TRANSPORT_MODEL = os.getenv("SAMSARA_TRANSPORT_MODEL", "flat").strip().lower()
+
+# Minutes that do not scale with distance: loading, securing, handover.
+TRANSPORT_BASE_MINUTES = float(os.getenv("SAMSARA_TRANSPORT_BASE_MINUTES", "12"))
+# Door-to-door average, well under road speed once junctions and parking count.
+TRANSPORT_SPEED_MPH = float(os.getenv("SAMSARA_TRANSPORT_SPEED_MPH", "30"))
+# Guard rails, so a bad coordinate cannot produce a two-minute or ten-hour leg.
+TRANSPORT_MIN_MINUTES = float(os.getenv("SAMSARA_TRANSPORT_MIN_MINUTES", "10"))
+TRANSPORT_MAX_MINUTES = float(os.getenv("SAMSARA_TRANSPORT_MAX_MINUTES", "240"))
 
 # Samsara sorts stops by scheduledArrivalTime. A drop-off stamped at or before
 # its own pickup would jump ahead of it, so the drop-off is pushed at least
@@ -387,8 +405,52 @@ def has_location(leg, side):
     return bool(str(leg.get(f"{side}_address1") or "").strip())
 
 
-def transport_minutes(los):
-    """How long to allow for a transport at this level of service."""
+def haversine_miles(lat1, lon1, lat2, lon2):
+    """
+    Great-circle miles between two points, or None if either is unusable.
+
+    Straight-line, so it understates road distance -- by a fairly consistent
+    factor, which the fitted speed absorbs. That is why the speed constant
+    comes out well below any real road speed and should not be "corrected".
+    """
+    try:
+        lat1, lon1, lat2, lon2 = (float(v) for v in (lat1, lon1, lat2, lon2))
+    except (TypeError, ValueError):
+        return None
+    if not any((lat1, lon1)) or not any((lat2, lon2)):
+        return None
+    r1, r2 = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(r1) * math.cos(r2) * math.sin(dlon / 2) ** 2
+    return 3958.8 * 2 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def distance_minutes(leg, base=None, mph=None):
+    """A leg's duration from how far it goes. None when it cannot be measured."""
+    miles = haversine_miles(
+        leg.get("pu_lat"), leg.get("pu_lon"), leg.get("do_lat"), leg.get("do_lon")
+    )
+    if miles is None:
+        return None
+    base = TRANSPORT_BASE_MINUTES if base is None else base
+    mph = TRANSPORT_SPEED_MPH if mph is None else mph
+    if mph <= 0:
+        return None
+    return max(TRANSPORT_MIN_MINUTES, min(TRANSPORT_MAX_MINUTES, base + (miles / mph) * 60.0))
+
+
+def transport_minutes(los, leg=None):
+    """
+    How long to allow for this transport.
+
+    Distance where the model is switched on and the leg can be measured,
+    otherwise the flat per-level-of-service number, otherwise the default.
+    """
+    if TRANSPORT_MODEL == "distance" and leg is not None:
+        estimate = distance_minutes(leg)
+        if estimate is not None:
+            return estimate
     return TRANSPORT_MINUTES_BY_LOS.get(normalize_los(los), DEFAULT_TRANSPORT_MINUTES)
 
 
@@ -588,7 +650,7 @@ def leg_stops(leg, parse_ts_aware, address_index=None, default_offset=None,
     if dropoff is None or dropoff <= floor:
         if dropoff is None:
             dropoff_source = "estimated"
-            dropoff = pickup + timedelta(minutes=transport_minutes(leg.get("los")))
+            dropoff = pickup + timedelta(minutes=transport_minutes(leg.get("los"), leg))
             if next_pickup is not None and dropoff >= next_pickup:
                 capped = next_pickup - timedelta(minutes=MIN_STOP_GAP_MINUTES)
                 dropoff = max(floor, capped)

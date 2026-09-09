@@ -331,6 +331,101 @@ def report_transport_calibration(kept, out):
     out["transport_minutes"] = summary
 
 
+def report_model_comparison(kept, out):
+    """
+    Which way of guessing a drop-off time is least wrong on this tenant.
+
+    Scored against the legs that carry an appointment time, which is the only
+    ground truth available. Three candidates: the flat default, the per-level
+    medians, and distance -- with the distance constants fitted here rather
+    than assumed, because a straight-line mile is not a road mile and the
+    speed has to absorb the difference.
+
+    Reported as median absolute error, not mean: a handful of next-day
+    appointments would drag a mean around and say nothing about the typical
+    leg.
+    """
+    print("\n5c. WHICH ESTIMATE IS LEAST WRONG")
+    print("   " + "-" * 66)
+
+    samples = []          # (actual minutes, leg)
+    by_los = defaultdict(list)
+    for leg in kept:
+        pickup = R.parse_ts_aware(leg.get("pickup_time"))
+        appt = R.parse_ts_aware(leg.get("appt_time"))
+        if pickup is None or appt is None or appt <= pickup:
+            continue
+        minutes = (appt - pickup).total_seconds() / 60.0
+        if minutes > 12 * 60:
+            continue
+        samples.append((minutes, leg))
+        by_los[SR.normalize_los(leg.get("los"))].append(minutes)
+
+    measurable = [
+        (actual, leg) for actual, leg in samples
+        if SR.haversine_miles(leg.get("pu_lat"), leg.get("pu_lon"),
+                              leg.get("do_lat"), leg.get("do_lon")) is not None
+    ]
+    if len(measurable) < 50:
+        print(f"   Only {len(measurable)} leg(s) have both an appointment time and")
+        print("   coordinates on each end -- too few to choose between models.")
+        out["model_comparison"] = {}
+        return
+
+    def score(predict):
+        errors = [abs(predict(leg) - actual) for actual, leg in measurable]
+        within = sum(1 for e in errors if e <= 15) / len(errors)
+        return percentile(errors, 0.5), within
+
+    los_medians = {k: percentile(v, 0.5) for k, v in by_los.items() if len(v) >= 20}
+    flat_value = SR.DEFAULT_TRANSPORT_MINUTES
+
+    # Fit the distance model: coarse grid, then report the best. Small enough
+    # to brute force on a reporting machine, and transparent about what it did.
+    best = None
+    for base in range(0, 31, 2):
+        for mph in range(10, 61, 2):
+            err, within = score(lambda l, b=base, m=mph: SR.distance_minutes(l, b, m))
+            if best is None or err < best[0]:
+                best = (err, within, base, mph)
+    dist_err, dist_within, fit_base, fit_mph = best
+
+    candidates = [
+        (f"flat {flat_value} min (current)", *score(lambda l: flat_value)),
+        ("per level of service", *score(
+            lambda l: los_medians.get(SR.normalize_los(l.get("los")), flat_value))),
+        (f"distance: {fit_base} min + miles / {fit_mph} mph", dist_err, dist_within),
+    ]
+
+    print(f"   Scored on {len(measurable)} legs that carry an appointment time.")
+    print()
+    print(f"   {'Model':<40}{'median err':>12}{'within 15m':>12}")
+    print("   " + "-" * 66)
+    for label, err, within in candidates:
+        print(f"   {label:<40}{err:>10.0f}m{within * 100:>11.0f}%")
+
+    winner = min(candidates, key=lambda c: c[1])
+    print()
+    print(f"   Best: {winner[0]}")
+    improvement = candidates[0][1] - winner[1]
+    if winner[0].startswith("distance") and improvement >= 3:
+        print(f"   That is {improvement:.0f} min/leg better than the flat default. To use it:")
+        print(f"     SAMSARA_TRANSPORT_MODEL=distance")
+        print(f"     SAMSARA_TRANSPORT_BASE_MINUTES={fit_base}")
+        print(f"     SAMSARA_TRANSPORT_SPEED_MPH={fit_mph}")
+        print("   (The speed sits below road speed on purpose: it absorbs the")
+        print("   difference between a straight line and a road.)")
+    elif improvement < 3:
+        print("   No model is meaningfully better than the flat default here.")
+        print("   Keep it simple and leave SAMSARA_TRANSPORT_MODEL=flat.")
+    out["model_comparison"] = {
+        "n": len(measurable),
+        "candidates": [{"model": c[0], "median_error": c[1], "within_15m": c[2]}
+                       for c in candidates],
+        "fitted": {"base_minutes": fit_base, "speed_mph": fit_mph},
+    }
+
+
 def report_forward_look(api, out, days=7):
     """
     The days this job would actually push, as they look right now.
@@ -490,6 +585,7 @@ def main(argv=None):
     if kept:
         report_dropoff_sources(kept, out, offset)
         report_transport_calibration(kept, out)
+        report_model_comparison(kept, out)
         report_vehicle_join(kept, out)
     report_forward_look(api, out)
 

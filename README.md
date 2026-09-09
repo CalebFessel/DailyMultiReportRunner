@@ -316,11 +316,28 @@ real appointment time is never moved — if it overlaps, the overlap is real.
 A time landing *before* its own pickup is still pushed one minute past it.
 
 On real data 18% of estimated drop-offs collided with the unit's next pickup
-at a flat 45 minutes, which is a sign the number is too long rather than a
-sign capping is enough. `SAMSARA_TRANSPORT_MINUTES_BY_LOS` sets it per level
-of service — a wheelchair van and a stretcher transport are not the same job —
-and the probe's section 5b prints a ready-made line for it, calibrated from
-the legs that do carry an appointment time.
+at a flat 45 minutes. Capping stops that misordering the driver, but it is
+still a sign the estimate is too blunt.
+
+There are three ways to make it, and the probe measures which one is actually
+least wrong on your data rather than leaving it to taste:
+
+| Model | What it does |
+|---|---|
+| `flat` (default) | `SAMSARA_DEFAULT_TRANSPORT_MINUTES` for everything |
+| per level of service | `SAMSARA_TRANSPORT_MINUTES_BY_LOS`, e.g. a wheelchair van and a stretcher transport differ |
+| `distance` | each leg from its own straight-line distance, `base + miles / mph` |
+
+Section **5b** calibrates the flat numbers from the legs that do carry an
+appointment time; section **5c** scores all three against that same ground
+truth and prints the config for whichever wins. If none beats the flat
+default it says so and tells you to leave it alone.
+
+The distance model exists because the spread is mostly *within* a level of
+service, not between: `Non Emergency` alone runs p25=30 to p90=60, and what
+varies there is the trip, not the category. Its fitted speed comes out well
+below any road speed — that is the straight line absorbing the difference from
+the road, and it should not be "corrected" upward.
 
 ### Excluding by level of service
 

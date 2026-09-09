@@ -605,3 +605,78 @@ def test_an_estimated_dropoff_honours_the_per_los_estimate(monkeypatch):
     assert source == "estimated"
     # 07:30 -04:00 is 11:30Z, plus 20 minutes.
     assert stops[1]["scheduledArrivalTime"] == "2026-09-10T11:50:00Z"
+
+
+# =============================
+# DISTANCE-BASED ESTIMATES
+# =============================
+# Within one level of service the allowed interval runs 30 to 60 minutes, and
+# what varies is the trip, not the category. Both ends carry coordinates on
+# ~100% of real legs, so distance is available as a better predictor -- but
+# only where the probe shows it actually predicts better.
+def test_haversine_matches_a_known_distance():
+    """Charleston WV to Huntington WV is about 44 straight-line miles."""
+    miles = SR.haversine_miles(38.3498, -81.6326, 38.4192, -82.4452)
+    assert 42 < miles < 46
+
+
+def test_haversine_is_symmetric_and_zero_for_one_point():
+    assert SR.haversine_miles(38.0, -81.0, 38.0, -81.0) == pytest.approx(0)
+    assert SR.haversine_miles(38.0, -81.0, 39.0, -82.0) == pytest.approx(
+        SR.haversine_miles(39.0, -82.0, 38.0, -81.0)
+    )
+
+
+@pytest.mark.parametrize(
+    "coords",
+    [
+        (None, -81.0, 38.0, -82.0),
+        (38.0, -81.0, "", -82.0),
+        ("bad", -81.0, 38.0, -82.0),
+        (0, 0, 38.0, -82.0),        # 0,0 is the Atlantic, not a facility
+    ],
+)
+def test_haversine_refuses_unusable_coordinates(coords):
+    assert SR.haversine_miles(*coords) is None
+
+
+def test_distance_estimate_grows_with_distance():
+    near = SR.distance_minutes(
+        {"pu_lat": 38.0, "pu_lon": -81.0, "do_lat": 38.02, "do_lon": -81.0})
+    far = SR.distance_minutes(
+        {"pu_lat": 38.0, "pu_lon": -81.0, "do_lat": 38.6, "do_lon": -81.0})
+    assert far > near
+
+
+def test_distance_estimate_is_bounded(monkeypatch):
+    """A bad coordinate must not produce a ten-hour leg or a two-minute one."""
+    monkeypatch.setattr(SR, "TRANSPORT_MIN_MINUTES", 10)
+    monkeypatch.setattr(SR, "TRANSPORT_MAX_MINUTES", 240)
+    same = SR.distance_minutes({"pu_lat": 38.0, "pu_lon": -81.0,
+                                "do_lat": 38.0001, "do_lon": -81.0})
+    across = SR.distance_minutes({"pu_lat": 38.0, "pu_lon": -81.0,
+                                  "do_lat": 47.6, "do_lon": -122.3})
+    assert same >= 10
+    assert across <= 240
+
+
+def test_the_flat_model_ignores_distance_by_default(monkeypatch):
+    monkeypatch.setattr(SR, "TRANSPORT_MODEL", "flat")
+    monkeypatch.setattr(SR, "DEFAULT_TRANSPORT_MINUTES", 45)
+    monkeypatch.setattr(SR, "TRANSPORT_MINUTES_BY_LOS", {})
+    assert SR.transport_minutes("Non Emergency", leg()) == 45
+
+
+def test_the_distance_model_is_used_when_switched_on(monkeypatch):
+    monkeypatch.setattr(SR, "TRANSPORT_MODEL", "distance")
+    monkeypatch.setattr(SR, "TRANSPORT_BASE_MINUTES", 12)
+    monkeypatch.setattr(SR, "TRANSPORT_SPEED_MPH", 30)
+    # The fixture leg runs ~44 miles: 12 + 44/30*60 is far more than the flat 45.
+    assert SR.transport_minutes("Non Emergency", leg()) > 60
+
+
+def test_the_distance_model_falls_back_when_a_leg_cannot_be_measured(monkeypatch):
+    monkeypatch.setattr(SR, "TRANSPORT_MODEL", "distance")
+    monkeypatch.setattr(SR, "TRANSPORT_MINUTES_BY_LOS", {"ambulatory": 30})
+    unmeasurable = leg(los="Ambulatory", pu_lat=None, pu_lon=None)
+    assert SR.transport_minutes("Ambulatory", unmeasurable) == 30

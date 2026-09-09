@@ -315,6 +315,13 @@ back to just short of the next pickup; the plan counts those as "Capped". A
 real appointment time is never moved — if it overlaps, the overlap is real.
 A time landing *before* its own pickup is still pushed one minute past it.
 
+On real data 18% of estimated drop-offs collided with the unit's next pickup
+at a flat 45 minutes, which is a sign the number is too long rather than a
+sign capping is enough. `SAMSARA_TRANSPORT_MINUTES_BY_LOS` sets it per level
+of service — a wheelchair van and a stretcher transport are not the same job —
+and the probe's section 5b prints a ready-made line for it, calibrated from
+the legs that do carry an appointment time.
+
 ### Excluding by level of service
 
 `SAMSARA_EXCLUDED_LOS` drops legs by `los`, case- and hyphen-insensitively

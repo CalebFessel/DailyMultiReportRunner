@@ -262,6 +262,128 @@ def report_dropoff_sources(kept, out, offset):
     out["dropoff_sources"] = dict(sources)
 
 
+def percentile(values, fraction):
+    """Nearest-rank percentile. No numpy on the reporting machine."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int(round(fraction * (len(ordered) - 1)))))
+    return ordered[index]
+
+
+def report_transport_calibration(kept, out):
+    """
+    What the schedulers themselves allow between a pickup and the appointment.
+
+    This is the evidence for SAMSARA_DEFAULT_TRANSPORT_MINUTES, which
+    otherwise is a number somebody made up and which drives two thirds of all
+    drop-off times.
+
+    It is a proxy, not a measurement: appt_time is when the patient is due,
+    not when the unit actually arrived, so it includes whatever slack the
+    scheduler left. That makes it the right thing to copy -- the estimate is
+    trying to reproduce a scheduler's intent, not a stopwatch.
+    """
+    print("\n5b. HOW LONG A TRANSPORT IS ALLOWED  (from legs with an appointment time)")
+    print("   " + "-" * 66)
+    by_los = defaultdict(list)
+    overall = []
+    for leg in kept:
+        pickup = R.parse_ts_aware(leg.get("pickup_time"))
+        appt = R.parse_ts_aware(leg.get("appt_time"))
+        if pickup is None or appt is None or appt <= pickup:
+            continue
+        minutes = (appt - pickup).total_seconds() / 60.0
+        if minutes > 12 * 60:        # a next-day appointment, not a transport
+            continue
+        overall.append(minutes)
+        by_los[str(leg.get("los") or "(blank)").strip()].append(minutes)
+
+    if not overall:
+        print("   No leg carried both a pickup and a later appointment time.")
+        out["transport_minutes"] = {}
+        return
+
+    print(f"   {'Level of service':<24}{'n':>7}{'p25':>7}{'median':>8}{'p75':>7}{'p90':>7}")
+    print("   " + "-" * 66)
+    rows = [("ALL", overall)] + sorted(by_los.items(), key=lambda kv: -len(kv[1]))
+    summary = {}
+    for label, values in rows:
+        if len(values) < 20 and label != "ALL":
+            continue
+        p25, p50, p75, p90 = (percentile(values, f) for f in (0.25, 0.5, 0.75, 0.9))
+        print(f"   {label[:23]:<24}{len(values):>7}{p25:>7.0f}{p50:>8.0f}{p75:>7.0f}{p90:>7.0f}")
+        summary[label] = {"n": len(values), "p25": p25, "median": p50, "p75": p75, "p90": p90}
+
+    median_all = summary["ALL"]["median"]
+    print()
+    print(f"   The current default is {SR.DEFAULT_TRANSPORT_MINUTES} min; the observed median is "
+          f"{median_all:.0f} min.")
+    spread = {k: v["median"] for k, v in summary.items() if k != "ALL"}
+    if spread and (max(spread.values()) - min(spread.values())) >= 15:
+        print("   The levels of service differ enough that one number is wrong for")
+        print("   several of them. Set them separately:")
+        print("     SAMSARA_TRANSPORT_MINUTES_BY_LOS=" + ",".join(
+            f"{k.lower()}={v:.0f}" for k, v in sorted(spread.items(), key=lambda kv: -kv[1])
+        )[:400])
+    else:
+        print(f"   Suggested: SAMSARA_DEFAULT_TRANSPORT_MINUTES={median_all:.0f}")
+    out["transport_minutes"] = summary
+
+
+def report_forward_look(api, out, days=7):
+    """
+    The days this job would actually push, as they look right now.
+
+    The 30-day window above is history, and history has had a dispatcher
+    assign a vehicle to nearly everything. What matters is whether TOMORROW
+    has vehicles on it yet, because a leg with no vehicle cannot be routed --
+    and that decides what time of day this job is worth running.
+    """
+    print(f"\n7. FORWARD LOOK  (the next {days} days -- what this job would push)")
+    print("   " + "-" * 66)
+    start = date.today()
+    try:
+        legs = api.get_trips(start.isoformat(), range_days=days)
+    except Exception as exc:  # noqa: BLE001
+        print(f"   Could not fetch upcoming trips: {exc}")
+        return
+
+    by_day = defaultdict(list)
+    for leg in legs:
+        pickup = R.parse_ts_aware(leg.get("pickup_time"))
+        if pickup is not None:
+            by_day[pickup.date()].append(leg)
+
+    if not by_day:
+        print("   No upcoming trips found.")
+        return
+
+    print(f"   {'Day':<14}{'legs':>7}{'with vehicle':>14}{'routable':>10}{'':>4}")
+    print("   " + "-" * 66)
+    forward = {}
+    for day in sorted(by_day):
+        day_legs = by_day[day]
+        with_vehicle = sum(
+            1 for l in day_legs if str(l.get("vehicle_name") or "").strip()
+        )
+        routable, _ = SR.eligible_legs(day_legs, R.parse_ts_aware)
+        flag = ""
+        if day_legs and len(routable) / len(day_legs) < 0.25:
+            flag = "  <- little assigned yet"
+        print(f"   {day.isoformat():<14}{len(day_legs):>7}"
+              f"{pct(with_vehicle, len(day_legs)):>14}{len(routable):>10}{flag}")
+        forward[day.isoformat()] = {
+            "legs": len(day_legs), "with_vehicle": with_vehicle, "routable": len(routable)
+        }
+
+    print()
+    print("   A leg with no vehicle cannot be routed. If tomorrow is mostly")
+    print("   unassigned at the hour you read this, run the push later in the")
+    print("   day -- or re-run it with --replace once dispatch has assigned units.")
+    out["forward_look"] = forward
+
+
 def report_vehicle_join(kept, out):
     print("\n6. VEHICLE JOIN")
     print("   " + "-" * 66)
@@ -367,7 +489,9 @@ def main(argv=None):
     kept = report_funnel(legs, out)
     if kept:
         report_dropoff_sources(kept, out, offset)
+        report_transport_calibration(kept, out)
         report_vehicle_join(kept, out)
+    report_forward_look(api, out)
 
     print("\n" + "=" * 72)
     print("  Safe to paste. Values shown are operational, never patient data.")

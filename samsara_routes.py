@@ -53,7 +53,25 @@ VEHICLE_OVERRIDES_FILE = os.path.join(STATE_DIR, "samsara_vehicle_overrides.json
 # says when it should arrive, but Samsara requires a scheduledArrivalTime on
 # every stop after the first. Rather than drop the leg, the drop-off is placed
 # this many minutes after the pickup and the plan reports it as estimated.
+#
+# Two thirds of real legs land here, so the number matters. Calibrate it from
+# the legs that DO carry an appointment time --
+# `probe_samsara_readiness.py --days 30` prints the observed interval.
 DEFAULT_TRANSPORT_MINUTES = int(os.getenv("SAMSARA_DEFAULT_TRANSPORT_MINUTES", "45"))
+
+# Per level of service, as 'ambulatory=25,non ambulatory=50'. A wheelchair
+# van's day and an ALS transport's are not the same shape, and one number for
+# both is wrong for both. Keys are normalised the same way as EXCLUDED_LOS,
+# so the Non Emergency / Non-Emergency split does not need writing twice.
+TRANSPORT_MINUTES_BY_LOS = {}
+for _pair in os.getenv("SAMSARA_TRANSPORT_MINUTES_BY_LOS", "").split(","):
+    if "=" not in _pair:
+        continue
+    _key, _, _value = _pair.partition("=")
+    try:
+        TRANSPORT_MINUTES_BY_LOS[normalize_los(_key)] = int(_value.strip())
+    except ValueError:
+        log.warning("Ignoring unparseable SAMSARA_TRANSPORT_MINUTES_BY_LOS entry %r", _pair)
 
 # Samsara sorts stops by scheduledArrivalTime. A drop-off stamped at or before
 # its own pickup would jump ahead of it, so the drop-off is pushed at least
@@ -369,6 +387,11 @@ def has_location(leg, side):
     return bool(str(leg.get(f"{side}_address1") or "").strip())
 
 
+def transport_minutes(los):
+    """How long to allow for a transport at this level of service."""
+    return TRANSPORT_MINUTES_BY_LOS.get(normalize_los(los), DEFAULT_TRANSPORT_MINUTES)
+
+
 def is_excluded_los(los):
     """Whether this level of service is one the operation never pre-routes."""
     if not EXCLUDED_LOS:
@@ -565,7 +588,7 @@ def leg_stops(leg, parse_ts_aware, address_index=None, default_offset=None,
     if dropoff is None or dropoff <= floor:
         if dropoff is None:
             dropoff_source = "estimated"
-            dropoff = pickup + timedelta(minutes=DEFAULT_TRANSPORT_MINUTES)
+            dropoff = pickup + timedelta(minutes=transport_minutes(leg.get("los")))
             if next_pickup is not None and dropoff >= next_pickup:
                 capped = next_pickup - timedelta(minutes=MIN_STOP_GAP_MINUTES)
                 dropoff = max(floor, capped)

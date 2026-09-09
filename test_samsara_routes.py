@@ -570,3 +570,38 @@ def test_los_spellings_normalise_to_one_value(spelling):
 def test_a_genuine_typo_stays_distinct():
     """'Non Amnbulatory' is a typo, not a variant -- it must be named to be caught."""
     assert SR.normalize_los("Non Amnbulatory") != SR.normalize_los("Non Ambulatory")
+
+
+# =============================
+# PER-LEVEL-OF-SERVICE TRANSPORT ESTIMATES
+# =============================
+# Two thirds of real drop-offs are estimates, and 18% of those collided with
+# the unit's next pickup at a flat 45 minutes. One number is wrong for a fleet
+# that runs ambulatory vans and stretcher transports off the same schedule.
+def test_transport_minutes_falls_back_to_the_default(monkeypatch):
+    monkeypatch.setattr(SR, "TRANSPORT_MINUTES_BY_LOS", {})
+    monkeypatch.setattr(SR, "DEFAULT_TRANSPORT_MINUTES", 45)
+    assert SR.transport_minutes("Ambulatory") == 45
+
+
+def test_transport_minutes_uses_the_level_of_service(monkeypatch):
+    monkeypatch.setattr(SR, "TRANSPORT_MINUTES_BY_LOS", {"ambulatory": 22})
+    monkeypatch.setattr(SR, "DEFAULT_TRANSPORT_MINUTES", 45)
+    assert SR.transport_minutes("Ambulatory") == 22
+    assert SR.transport_minutes("Non Ambulatory") == 45
+
+
+@pytest.mark.parametrize("spelling", ["Non Emergency", "Non-Emergency", "non  emergency"])
+def test_transport_minutes_keys_survive_the_hyphen_split(monkeypatch, spelling):
+    monkeypatch.setattr(SR, "TRANSPORT_MINUTES_BY_LOS", {"non emergency": 30})
+    assert SR.transport_minutes(spelling) == 30
+
+
+def test_an_estimated_dropoff_honours_the_per_los_estimate(monkeypatch):
+    monkeypatch.setattr(SR, "TRANSPORT_MINUTES_BY_LOS", {"ambulatory": 20})
+    stops, source = SR.leg_stops(
+        leg(los="Ambulatory", appt_time=None, dropoff_eta=None), parse_ts_aware
+    )
+    assert source == "estimated"
+    # 07:30 -04:00 is 11:30Z, plus 20 minutes.
+    assert stops[1]["scheduledArrivalTime"] == "2026-09-10T11:50:00Z"

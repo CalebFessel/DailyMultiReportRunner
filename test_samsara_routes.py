@@ -276,7 +276,18 @@ def test_notes_carry_the_call_type_and_level_of_service():
     assert "24-10871" in notes
 
 
-def test_patient_name_is_only_on_the_pickup():
+def test_patient_name_is_off_by_default():
+    """
+    A name plus a pickup address is PHI. It does not go to a third-party
+    system unless somebody deliberately turns it on.
+    """
+    stops, _ = SR.leg_stops(leg(), parse_ts_aware)
+    assert "Jane" not in stops[0]["notes"]
+    assert "Doe" not in stops[0]["notes"]
+
+
+def test_patient_name_can_be_enabled_and_is_then_only_on_the_pickup(monkeypatch):
+    monkeypatch.setattr(SR, "INCLUDE_PATIENT_NAME", True)
     stops, _ = SR.leg_stops(leg(), parse_ts_aware)
     assert "Jane Doe" in stops[0]["notes"]
     assert "Jane Doe" not in stops[1]["notes"]

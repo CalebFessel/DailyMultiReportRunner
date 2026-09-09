@@ -41,6 +41,16 @@ DEFAULT_TRANSPORT_MINUTES = int(os.getenv("SAMSARA_DEFAULT_TRANSPORT_MINUTES", "
 # this far past the pickup.
 MIN_STOP_GAP_MINUTES = 1
 
+# Whether the patient's name rides along in the pickup stop notes. OFF by
+# default: a name plus a pickup address is PHI, and pushing it into Samsara
+# discloses it to a third party, which is only defensible if Samsara is
+# covered by a business associate agreement. Crews often do want it to confirm
+# they have the right patient -- so it is one env var away, as a decision
+# somebody makes rather than a default they inherit.
+INCLUDE_PATIENT_NAME = os.getenv("SAMSARA_INCLUDE_PATIENT_NAME", "").strip().lower() in (
+    "1", "true", "yes", "y",
+)
+
 # Call types that describe something other than a transport a driver can be
 # routed to. Matched case-insensitively as substrings of call_type.
 EXCLUDED_CALL_TYPE_PATTERNS = tuple(
@@ -307,6 +317,9 @@ def stop_notes(leg, side):
     Call type and level of service on the stop itself, so a driver opening a
     stop sees what the call is and what the unit is expected to be, not just
     an address.
+
+    The patient name is omitted unless SAMSARA_INCLUDE_PATIENT_NAME is set --
+    see INCLUDE_PATIENT_NAME.
     """
     bits = []
     run = str(leg.get("run_number") or leg.get("trip_number") or "").strip()
@@ -322,7 +335,7 @@ def stop_notes(leg, side):
     priority = str(leg.get(priority_key) or "").strip()
     if priority:
         bits.append(f"Priority {priority}")
-    if side == "pu":
+    if side == "pu" and INCLUDE_PATIENT_NAME:
         patient = " ".join(
             str(leg.get(k) or "").strip()
             for k in ("patient_first_name", "patient_last_name")

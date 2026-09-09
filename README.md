@@ -212,6 +212,90 @@ If `--no-email` is passed, both the main and status emails are skipped but loggi
 
 ---
 
+## Samsara Route Dispatch (Optional)
+
+`push_samsara_routes.py` turns a day of Traumasoft trips into Samsara routes,
+so a driver sees their scheduled transports as stops on the Samsara app
+instead of only in CAD. It is independent of the reporting job: the daily run
+neither needs nor touches it.
+
+**Dry run is the default.** Without `--publish` the script reads both systems,
+builds the exact payloads it would send, prints the plan, and stops. The
+Samsara client is constructed read-only until `--publish` is passed, so a dry
+run cannot write even if something else is wrong.
+
+```bash
+python push_samsara_routes.py                     # tomorrow, dry run
+python push_samsara_routes.py 2026-09-10          # that day, dry run
+python push_samsara_routes.py --json plan.json    # write the payloads out to read
+python push_samsara_routes.py --publish           # actually create them
+python push_samsara_routes.py --replace --publish # delete ours for that day first
+python push_samsara_routes.py --vehicle M-12      # one unit only
+```
+
+### What it builds
+
+One route per vehicle per day, named `[TS] M-12 — Thu Sep 10`. Every eligible
+leg contributes two stops — pickup then drop-off — and Samsara orders the whole
+list by scheduled arrival time, so the driver sees the day in sequence. Each
+stop carries the run number, call type, level of service and priority in its
+notes; the pickup also carries the patient name.
+
+A stop uses a **registered Samsara address** when one matches the Traumasoft
+facility name, because that brings the geofence somebody already drew around
+the site. Otherwise it falls back to a single-use location built from the
+leg's coordinates and postal address, which Samsara treats as a 300 m circle —
+good enough for a house, coarse on a hospital campus. Registering your busiest
+facilities in Samsara measurably improves arrival detection.
+
+### How units are matched
+
+Traumasoft and Samsara name the same unit differently — `M-12 Ford E450` and
+`M12 - Medic 12` — but share the unit designator. Both names are collapsed to
+`M12` and joined on that, so `M-12`, `M12`, `m 12` and `M-012` all agree while
+`M12A` and `M12B` stay distinct.
+
+Two cases are never guessed at, only reported:
+
+- a unit with no Samsara vehicle at all
+- a unit whose prefix matched several Samsara vehicles
+
+Both are listed in the plan with the prefix that was tried. Fix them in
+`state/samsara_vehicle_overrides.json` (copy the `.example.json`) rather than
+renaming units in either system. An override always wins over the prefix rule.
+
+### What is not pushed
+
+Only legs a driver can actually be routed to. A leg is skipped when it has no
+scheduled `pickup_time`, no location on one end, no vehicle assigned, or a
+call type listed in `SAMSARA_EXCLUDED_CALL_TYPES`. 911 and on-demand work has
+no schedule to route against and falls out here rather than landing in Samsara
+with a guessed arrival time. Every skipped leg is counted by reason in the
+plan, so a day that pushes fewer runs than expected explains itself.
+
+### Drop-off times
+
+Samsara requires a scheduled arrival on every stop, but Traumasoft only
+schedules the pickup. The drop-off time is taken from `appt_time` — the hour
+the patient is actually due — then `dropoff_eta`, and only then estimated at
+pickup + `SAMSARA_DEFAULT_TRANSPORT_MINUTES` (45 by default). The plan counts
+how many drop-offs were estimated. A real appointment time that lands *before*
+its own pickup is pushed one minute past it, because Samsara sorts stops by
+arrival time and would otherwise send the driver to the drop-off first.
+
+### Configuration
+
+```env
+SAMSARA_API_TOKEN=...                    # required
+# SAMSARA_DEFAULT_TRANSPORT_MINUTES=45
+# SAMSARA_EXCLUDED_CALL_TYPES=standby,cancel,no transport,dry run
+```
+
+The token needs read access to Vehicles and Addresses and write access to
+Routes (Settings → Organization → API Tokens).
+
+---
+
 ## Status Dashboard Integration (Optional)
 
 The bottom of the script contains optional integration with a “status dashboard” via a separate `status_logger` module. [file:1]

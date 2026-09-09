@@ -331,6 +331,37 @@ def report_transport_calibration(kept, out):
     out["transport_minutes"] = summary
 
 
+def count_collisions(kept, predict):
+    """
+    How often an estimate would overrun the unit's own next pickup.
+
+    Grouped by vehicle and day the way a route is built, and counted only on
+    legs that would actually be estimated -- a leg with a real appointment
+    time never uses the model at all.
+    """
+    by_unit_day = defaultdict(list)
+    for leg in kept:
+        pickup = R.parse_ts_aware(leg.get("pickup_time"))
+        if pickup is None:
+            continue
+        by_unit_day[(str(leg.get("vehicle_name") or "").strip(), pickup.date())].append(leg)
+
+    collisions = considered = 0
+    for legs_for_unit in by_unit_day.values():
+        legs_for_unit.sort(key=lambda l: R.parse_ts_aware(l.get("pickup_time")))
+        pickups = [R.parse_ts_aware(l.get("pickup_time")) for l in legs_for_unit]
+        for index, leg in enumerate(legs_for_unit):
+            if R.parse_ts_aware(leg.get("appt_time")) or R.parse_ts_aware(leg.get("dropoff_eta")):
+                continue          # a real time; the model is not consulted
+            next_pickup = pickups[index + 1] if index + 1 < len(pickups) else None
+            if next_pickup is None:
+                continue
+            considered += 1
+            if pickups[index] + timedelta(minutes=predict(leg)) >= next_pickup:
+                collisions += 1
+    return collisions, considered
+
+
 def report_model_comparison(kept, out):
     """
     Which way of guessing a drop-off time is least wrong on this tenant.
@@ -380,15 +411,25 @@ def report_model_comparison(kept, out):
     los_medians = {k: percentile(v, 0.5) for k, v in by_los.items() if len(v) >= 20}
     flat_value = SR.DEFAULT_TRANSPORT_MINUTES
 
-    # Fit the distance model: coarse grid, then report the best. Small enough
-    # to brute force on a reporting machine, and transparent about what it did.
+    # Fit the distance model by grid search. The range has to be wide enough
+    # that the answer is not sitting on its edge: an optimum at a boundary
+    # means the real one is outside the grid, and the constants reported would
+    # be an artefact of where the search stopped rather than of the data.
+    base_range = range(0, 91, 2)
+    mph_range = range(8, 91, 2)
     best = None
-    for base in range(0, 31, 2):
-        for mph in range(10, 61, 2):
+    for base in base_range:
+        for mph in mph_range:
             err, within = score(lambda l, b=base, m=mph: SR.distance_minutes(l, b, m))
             if best is None or err < best[0]:
                 best = (err, within, base, mph)
     dist_err, dist_within, fit_base, fit_mph = best
+
+    at_edge = [
+        name for name, value, span in (
+            ("base minutes", fit_base, base_range), ("speed", fit_mph, mph_range)
+        ) if value in (min(span), max(span))
+    ]
 
     candidates = [
         (f"flat {flat_value} min (current)", *score(lambda l: flat_value)),
@@ -404,25 +445,63 @@ def report_model_comparison(kept, out):
     for label, err, within in candidates:
         print(f"   {label:<40}{err:>10.0f}m{within * 100:>11.0f}%")
 
-    winner = min(candidates, key=lambda c: c[1])
+    # The metric that actually matters. Median error is a proxy; what a bad
+    # estimate DOES is overrun the unit's next pickup, which is the thing
+    # capping then has to paper over.
+    collisions = {
+        label: count_collisions(kept, predict)
+        for label, predict in (
+            ("flat", lambda l: flat_value),
+            ("per level of service",
+             lambda l: los_medians.get(SR.normalize_los(l.get("los")), flat_value)),
+            ("distance",
+             lambda l: SR.distance_minutes(l, fit_base, fit_mph) or flat_value),
+        )
+    }
     print()
-    print(f"   Best: {winner[0]}")
+    print(f"   {'Model':<40}{'collides with next pickup':>26}")
+    print("   " + "-" * 66)
+    for label, (count, total) in collisions.items():
+        print(f"   {label:<40}{count:>10} of {total:<6} {pct(count, total):>7}")
+
+    print()
+    if at_edge:
+        print(f"   !! The fitted {' and '.join(at_edge)} landed on the edge of the")
+        print("      search range, so these constants describe where the search")
+        print("      stopped, not the data. Treat the distance row as unreliable.")
+        print()
+
+    best_collisions = min(collisions.items(), key=lambda kv: kv[1][0])
+    winner = min(candidates, key=lambda c: c[1])
+    print(f"   Lowest typical error : {winner[0]}")
+    print(f"   Fewest collisions    : {best_collisions[0]}")
+
     improvement = candidates[0][1] - winner[1]
-    if winner[0].startswith("distance") and improvement >= 3:
-        print(f"   That is {improvement:.0f} min/leg better than the flat default. To use it:")
+    flat_collisions = collisions["flat"][0]
+    collision_gain = flat_collisions - best_collisions[1][0]
+
+    print()
+    if at_edge:
+        print("   No recommendation while the fit is pinned to the grid edge.")
+    elif winner[0].startswith("distance") and improvement >= 3 and collision_gain >= 0:
+        print(f"   Distance is {improvement:.0f} min/leg better and collides "
+              f"{collision_gain} time(s) less. To use it:")
         print(f"     SAMSARA_TRANSPORT_MODEL=distance")
         print(f"     SAMSARA_TRANSPORT_BASE_MINUTES={fit_base}")
         print(f"     SAMSARA_TRANSPORT_SPEED_MPH={fit_mph}")
         print("   (The speed sits below road speed on purpose: it absorbs the")
         print("   difference between a straight line and a road.)")
-    elif improvement < 3:
-        print("   No model is meaningfully better than the flat default here.")
-        print("   Keep it simple and leave SAMSARA_TRANSPORT_MODEL=flat.")
+    elif collision_gain > 0 and best_collisions[0] != "flat":
+        print(f"   The models are close on error, but '{best_collisions[0]}' collides")
+        print(f"   {collision_gain} time(s) less, which is the difference a driver notices.")
+    else:
+        print("   Nothing clearly beats the flat default. Keep it simple.")
     out["model_comparison"] = {
         "n": len(measurable),
         "candidates": [{"model": c[0], "median_error": c[1], "within_15m": c[2]}
                        for c in candidates],
-        "fitted": {"base_minutes": fit_base, "speed_mph": fit_mph},
+        "fitted": {"base_minutes": fit_base, "speed_mph": fit_mph, "at_grid_edge": at_edge},
+        "collisions": {k: {"count": v[0], "of": v[1]} for k, v in collisions.items()},
     }
 
 

@@ -1,0 +1,75 @@
+{
+  "note": [
+    "Which cost centers make up each region, for the regional bundles:",
+    "",
+    "    python daily_report_runner_api.py --region Indiana",
+    "    python monthly_region_report.py Indiana",
+    "",
+    "The API cannot answer this. Cost center appears on employees and in the",
+    "Data/Organization division/district/group tree, but a district can span",
+    "several cost centers, so which stations are a region is a decision the",
+    "operation makes -- like the crew minimums next door, not an observation.",
+    "",
+    "EXACT NAMES ONLY, DELIBERATELY.",
+    "",
+    "cost_center_patterns is supported but is not used here, because these",
+    "names carry no state in them: 'Boardman', 'Ellicott', 'Salem' say nothing",
+    "about which region they belong to. Worse, a plausible pattern would",
+    "eventually claim the wrong station -- 'columbus' matches Columbus, Ohio",
+    "and Columbus, Indiana alike, and the report would not say which it meant.",
+    "Exact names cannot do that.",
+    "",
+    "The trade is that a station opened after this file was written belongs to",
+    "no region and appears in no regional bundle. That is why every regional",
+    "run names the cost centers nothing claims, and why",
+    "",
+    "    python monthly_region_report.py --list-cost-centers",
+    "",
+    "prints the lot with the region against each. When a new station shows up",
+    "as unclaimed, add it here.",
+    "",
+    "Do NOT infer a region from the shift profile's state prefix. 'IN-A-SBG-07-19'",
+    "is Indiana, but so is 'INDY WC' with no prefix, and 'West Virginia Admin'",
+    "spans five cost centers.",
+    "",
+    "Copy to state/regions.json to put it in effect."
+  ],
+  "regions": {
+    "Indiana": {
+      "cost_centers": [
+        "Indianapolis",
+        "Salem",
+        "Sellersburg"
+      ]
+    },
+    "Ohio": {
+      "cost_centers": [
+        "Boardman",
+        "Cincinnati",
+        "Columbus",
+        "Dayton",
+        "Massillon",
+        "Parma Heights",
+        "Sandusky",
+        "Shelby",
+        "Toledo"
+      ]
+    },
+    "West Virginia": {
+      "cost_centers": [
+        "Berkeley Springs",
+        "Charles Town",
+        "Charleston",
+        "Clarksburg",
+        "McDowell",
+        "Morgantown",
+        "Parkersburg"
+      ]
+    },
+    "Maryland": {
+      "cost_centers": [
+        "Ellicott"
+      ]
+    }
+  }
+}

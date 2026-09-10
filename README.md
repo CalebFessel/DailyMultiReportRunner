@@ -381,6 +381,98 @@ Routes (Settings → Organization → API Tokens).
 
 ---
 
+## Punch Quality and the Paycor Timecard Push (Optional)
+
+Crews currently clock in twice — Traumasoft and Paycor — and only Paycor decides
+what they are paid. Nothing rewards a complete Traumasoft punch, so punch-outs
+there are unreliable by construction. That is a reporting problem, not just an
+HR one: every unit-hour figure in this bundle rests on those punches.
+
+`unit_punches_by_instance` bounds a punch with no end at the shift's end. For a
+crew still on the road that is right. For a crew who simply never clocked out it
+credits the whole scheduled shift — so `worked_hours` quietly becomes
+`scheduled_hours` for that unit, and the gap the worked-hours denominator exists
+to expose closes itself. Utilization then reads low by exactly that much.
+
+### Measuring it first
+
+```
+python probe_punch_quality.py                      # the window as it stands
+python probe_punch_quality.py --json punches.json  # append a daily baseline
+```
+
+Read-only, Traumasoft alone, no Paycor credentials needed. It reports punch-out
+completion, who is not closing punches, where it concentrates, crew rostered who
+never clocked in at all, and the headline number: **how many unit hours in the
+UHU denominator are measured versus manufactured by the fallback.** That last
+figure is computed by running the real worked-hours path twice, once over a feed
+with open punches stripped — it is the fallback's contribution itself, not an
+estimate of it.
+
+**It is a four-day window, not a history.** `/Schedule/Shifts` returns
+`today-1..today+2` and ignores every date filter, so punches cannot be
+backfilled. A baseline accrues by running this daily and keeping the output;
+a day not captured is gone. `--json` appends a row per run for that purpose.
+
+### Pushing punches into Paycor
+
+`push_paycor_timecards.py` sends Traumasoft punches to Paycor as timecard
+punches. Three modes, meant to be used in order:
+
+```
+python push_paycor_timecards.py                       # 1. dry run
+python push_paycor_timecards.py --reconcile           # 2. compare, write nothing
+python push_paycor_timecards.py --reconcile --publish # 3. send them
+```
+
+**Mode 2 is the one that matters before going live.** It reads what Paycor
+already holds for the same window and compares it punch by punch, so you can
+prove the employee mapping resolves, the clocks agree, and the two systems are
+describing the same shifts — while both sides are still read-only. A window
+where every Traumasoft punch already matches Paycor is the result you want:
+it means making Traumasoft authoritative changes who is trusted, not what
+anyone is paid.
+
+Rails that cannot be configured away:
+
+- **An open punch is never sent.** A punch with no clock-out is not a payable
+  record, and the shift-end fallback that makes it usable for reporting would
+  here mean inventing the end of somebody's paid day.
+- **An employee who cannot be mapped unambiguously is refused, not guessed.**
+  Two people sharing a payroll number is exactly the case where a guess pays
+  the wrong person. `state/paycor_employee_overrides.json` takes the decisions.
+- **A punch Paycor already holds is skipped**, so a re-run does not double-pay.
+  A publish without a reconciliation read is refused outright.
+- **The first failure stops the run.** One bad punch is a fix; two hundred is
+  an incident.
+- **Production needs `PAYCOR_ENVIRONMENT=production` *and*
+  `--i-understand-this-is-payroll`.** The client defaults to Paycor's sandbox,
+  and anything but the exact string `production` resolves there, so a typo
+  fails safe.
+
+`--limit N` sends only the first N punches, for a first live test.
+
+### The write shape is unverified
+
+`developers.paycor.com` was unreachable from the environment this was built in,
+so the read endpoints are corroborated only from secondary sources and the write
+endpoint is a best reading of them. Every part of the write that could differ —
+path, method, field names, timestamp format — is an environment variable rather
+than a literal, so correcting it against Paycor's real reference costs an `.env`
+edit and not a code change. Every run prints the contract in effect; check that
+output against their docs before publishing anything.
+
+### Credentials
+
+Paycor wants both an OAuth 2.0 bearer token and an APIm subscription key on
+every call. The bearer comes from an authorization-code grant, which needs a
+human in a browser once; the refresh token that falls out is what goes in
+`.env` as `PAYCOR_REFRESH_TOKEN`. `PAYCOR_ACCESS_TOKEN` accepts a token pasted
+straight out of the developer portal, which is enough to try a read before
+wiring the flow up properly. See the Paycor block in `.env.example`.
+
+---
+
 ## Status Dashboard Integration (Optional)
 
 The bottom of the script contains optional integration with a “status dashboard” via a separate `status_logger` module. [file:1]

@@ -882,6 +882,19 @@ def build_dependency_notes(region=None, window=None, uhu_days=None, staffing_day
         "on a sampled morning 23 were running and 11 were genuinely missed "
         "punch-outs, which is a timekeeping finding this report can surface but "
         "not fix.")
+    add("UHU", "what the punches are worth", "Reads low",
+        "shift punches, which crews enter in Traumasoft while being paid from "
+        "a separate clock in Paycor",
+        covers,
+        "THE CAVEAT UNDER EVERY UHU FIGURE. Nothing rewards a complete "
+        "Traumasoft punch, so punch-outs are unreliable by construction. Where "
+        "a crew never clocks out, the bounding above credits the whole "
+        "scheduled shift -- so worked_hours silently becomes scheduled_hours "
+        "for that unit and utilization reads low by exactly that much. The gap "
+        "this denominator exists to expose closes itself. Run "
+        "probe_punch_quality.py to see how much of the denominator is measured "
+        "rather than manufactured; it cannot be recovered after the fact, since "
+        "the punch window is the same today-1..today+2.")
     add("UHU", "which units count at all", "Depends on a hand-maintained file",
         "state/unit_staffing_rules.json -- crew each profile needs on the clock "
         f"together, defaulting to {UHU_DEFAULT_MIN_CREW}",

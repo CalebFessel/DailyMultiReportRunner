@@ -31,6 +31,7 @@ import push_paycor_timecards as PUSH
 
 PASSED = 0
 FAILED = []
+SKIPPED = []
 
 
 def check(label, condition, detail=""):
@@ -39,6 +40,18 @@ def check(label, condition, detail=""):
         PASSED += 1
     else:
         FAILED.append(f"{label}{(' -- ' + detail) if detail else ''}")
+
+
+def skip(label, why):
+    """
+    Record a check that could not run here, distinctly from one that failed.
+
+    The reporting machine gets these files copied by hand, so a repo artifact
+    that is not a .py file may simply be absent. That says nothing about
+    whether the code is correct, and reporting it as a failure teaches people
+    to ignore failures -- which is worse than not checking at all.
+    """
+    SKIPPED.append(f"{label} -- {why}")
 
 
 def section(title):
@@ -528,21 +541,36 @@ check("a bare-array response is handled too", len(bare) == 2, str(bare))
 # =============================
 section("overrides file")
 
-example = os.path.join("state", "paycor_employee_overrides.example.json")
-check("the example overrides file exists", os.path.exists(example))
+# Relative to this file, not the working directory: the suite is run from
+# wherever the operator happens to be standing.
+example = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "state", "paycor_employee_overrides.example.json",
+)
 if os.path.exists(example):
     import json
     with open(example, encoding="utf-8") as handle:
         data = json.load(handle)
-    check("it is valid JSON with an overrides block", "overrides" in data)
+    check("the example overrides file is valid JSON", isinstance(data, dict))
+    check("it carries an overrides block", "overrides" in data)
     check("and explains itself", "note" in data)
+    check("its overrides map strings to strings",
+          all(isinstance(k, str) and isinstance(v, str)
+              for k, v in (data.get("overrides") or {}).items()))
+else:
+    skip("example overrides file checks",
+         f"not present at {example}; expected in a full checkout, and not "
+         "needed on a machine where the files were copied by hand")
 
 
 # =============================
 print("\n" + "=" * 60)
+for note in SKIPPED:
+    print(f"SKIPPED: {note}")
 if FAILED:
     print(f"FAILED {len(FAILED)} of {PASSED + len(FAILED)} checks:")
     for failure in FAILED:
         print(f"  - {failure}")
     sys.exit(1)
-print(f"All {PASSED} checks passed.")
+print(f"All {PASSED} checks passed."
+      + (f" ({len(SKIPPED)} skipped)" if SKIPPED else ""))

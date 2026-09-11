@@ -359,6 +359,77 @@ def test_route_name_carries_the_prefix_and_the_unit():
     assert "Sep 10" in routes[0]["name"]
 
 
+def test_route_name_uses_no_platform_specific_date_directive():
+    """
+    A single-digit day renders without a zero pad and without crashing.
+
+    This is the shape of a bug that shipped: `%-d` suppresses the zero pad on
+    glibc and raises ValueError on Windows, where this job actually runs. The
+    tests passed on Linux for exactly that reason, so the assertion below is
+    necessary but not sufficient -- see the source guard that follows it.
+    """
+    routes, _ = SR.build_routes(
+        [leg(pickup_time="2026-09-05T12:00:00-04:00",
+             appt_time="2026-09-05T13:00:00-04:00")],
+        {"M-12": vehicle("281", "M12")}, date(2026, 9, 5),
+        parse_ts_aware, name_prefix="[TS]",
+    )
+    name = routes[0]["name"]
+    assert "Sep 5" in name, name          # not "Sep 05"
+    assert "%" not in name, name
+
+
+def test_no_module_uses_a_glibc_only_strftime_directive():
+    """
+    Guard the platform constraint itself, since behaviour tests cannot.
+
+    `%-d` and friends are fine on the machine these tests usually run on and
+    fatal on the machine the job runs on, so no amount of asserting on output
+    catches them here. Scanning the source does. `%#d` is the MSVC spelling of
+    the same non-portable idea and is caught too; portable code interpolates
+    the integer instead.
+
+    Walks the AST rather than the text, so that prose describing the problem --
+    this docstring included -- is not mistaken for the problem.
+    """
+    import ast
+    import pathlib
+    import re
+
+    bad = re.compile(r"%[-#][a-zA-Z]")
+
+    def literal_parts(node):
+        """Every constant string inside a node, flattened."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            yield node.value
+        elif isinstance(node, ast.JoinedStr):
+            for value in node.values:
+                yield from literal_parts(value)
+
+    offenders = []
+    for path in sorted(pathlib.Path(__file__).parent.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            formats = []
+            # x.strftime("...")
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "strftime"
+                    and node.args):
+                formats.extend(literal_parts(node.args[0]))
+            # f"{x:%...}" -- the format spec goes through strftime too
+            elif isinstance(node, ast.FormattedValue) and node.format_spec is not None:
+                formats.extend(literal_parts(node.format_spec))
+            for spec in formats:
+                if bad.search(spec):
+                    offenders.append(f"{path.name}:{node.lineno}: {spec!r}")
+
+    assert not offenders, (
+        "non-portable strftime directive(s) -- these raise ValueError on "
+        "Windows:\n" + "\n".join(offenders)
+    )
+
+
 def test_estimated_dropoffs_are_counted_for_the_plan():
     legs = [leg(), leg(leg_id=2, appt_time=None, dropoff_eta=None,
                        pickup_time="2026-09-10T14:00:00-04:00")]

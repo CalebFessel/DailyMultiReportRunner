@@ -688,8 +688,16 @@ def route_name(vehicle_name, day, prefix=None):
     The unit and the date are enough for a dispatcher to find it, and the
     prefix lets push_samsara_routes.py recognise a route it created earlier
     when replacing the day.
+
+    The day number is interpolated rather than formatted. `%-d` (no zero pad)
+    is a glibc extension that Windows rejects outright with ValueError, and
+    `%#d` is the MSVC spelling of the same thing -- so neither is portable and
+    this job runs on Windows. `day.day` is an int and needs no directive.
     """
-    label = f"{vehicle_name} — {day.strftime('%a %b %-d')}" if hasattr(day, "strftime") else str(day)
+    if hasattr(day, "strftime"):
+        label = f"{vehicle_name} - {day.strftime('%a %b')} {day.day}"
+    else:
+        label = str(day)
     return f"{prefix} {label}" if prefix else label
 
 

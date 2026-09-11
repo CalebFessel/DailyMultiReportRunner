@@ -1,0 +1,31 @@
+{
+  "note": [
+    "Traumasoft employee -> Paycor employee id, for people the employee_num",
+    "join cannot resolve on its own.",
+    "",
+    "push_paycor_timecards.py normally matches a Traumasoft employee to a",
+    "Paycor one by employee_num, compared case-insensitively against the",
+    "Paycor roster. You only need a line here when that fails, and the dry",
+    "run names exactly who those people are:",
+    "",
+    "  - a Traumasoft employee carrying no employee_num at all",
+    "  - an employee_num that matches nothing in Paycor, because the two",
+    "    systems number people differently",
+    "  - an employee_num that matches SEVERAL Paycor employees, which is",
+    "    refused rather than guessed at -- paying the wrong person is the",
+    "    one failure this script must never make quietly",
+    "",
+    "The key is either the Traumasoft employee_num, or 'user_id:<n>' when",
+    "the person has no employee_num to key on. The value is the Paycor",
+    "employee id, which is what the API addresses a punch to -- not their",
+    "employee number, unless Paycor happens to use the same string for both.",
+    "An override always wins over the employee_num match, being a decision",
+    "rather than an observation.",
+    "",
+    "Rename this file to paycor_employee_overrides.json to put it in effect."
+  ],
+  "overrides": {
+    "10482": "a1b2c3d4-0000-4000-8000-000000000001",
+    "user_id:5517": "a1b2c3d4-0000-4000-8000-000000000002"
+  }
+}

@@ -212,6 +212,287 @@ If `--no-email` is passed, both the main and status emails are skipped but loggi
 
 ---
 
+## Samsara Route Dispatch (Optional)
+
+`push_samsara_routes.py` turns a day of Traumasoft trips into Samsara routes,
+so a driver sees their scheduled transports as stops on the Samsara app
+instead of only in CAD. It is independent of the reporting job: the daily run
+neither needs nor touches it.
+
+**Dry run is the default.** Without `--publish` the script reads both systems,
+builds the exact payloads it would send, prints the plan, and stops. The
+Samsara client is constructed read-only until `--publish` is passed, so a dry
+run cannot write even if something else is wrong.
+
+```bash
+python push_samsara_routes.py                     # tomorrow, dry run
+python push_samsara_routes.py 2026-09-10          # that day, dry run
+python push_samsara_routes.py --json plan.json    # write the payloads out to read
+python push_samsara_routes.py --publish           # actually create them
+python push_samsara_routes.py --replace --publish # delete ours for that day first
+python push_samsara_routes.py --vehicle M-12      # one unit only
+```
+
+### What it builds
+
+One route per vehicle per day, named `[TS] M-12 — Thu Sep 10`. Every eligible
+leg contributes two stops — pickup then drop-off — and Samsara orders the whole
+list by scheduled arrival time, so the driver sees the day in sequence. Each
+stop carries the run number, call type, level of service and priority in its
+notes; the pickup also carries the patient name.
+
+A stop uses a **registered Samsara address** when one matches the Traumasoft
+facility name, because that brings the geofence somebody already drew around
+the site. Otherwise it falls back to a single-use location built from the
+leg's coordinates and postal address, which Samsara treats as a 300 m circle —
+good enough for a house, coarse on a hospital campus. Registering your busiest
+facilities in Samsara measurably improves arrival detection.
+
+### How units are matched
+
+Traumasoft and Samsara name the same unit differently — `M-12 Ford E450` and
+`M12 - Medic 12` — but share the unit designator. Both names are collapsed to
+`M12` and joined on that, so `M-12`, `M12`, `m 12` and `M-012` all agree while
+`M12A` and `M12B` stay distinct.
+
+Two cases are never guessed at, only reported:
+
+- a unit with no Samsara vehicle at all
+- a unit whose prefix matched several Samsara vehicles
+
+Both are listed in the plan with the prefix that was tried. Fix them in
+`state/samsara_vehicle_overrides.json` (copy the `.example.json`) rather than
+renaming units in either system. An override always wins over the prefix rule.
+
+### What is not pushed
+
+Only legs a driver can actually be routed to. A leg is skipped when it has no
+scheduled `pickup_time`, no location on one end, no vehicle assigned, or a
+call type listed in `SAMSARA_EXCLUDED_CALL_TYPES`. 911 and on-demand work has
+no schedule to route against and falls out here rather than landing in Samsara
+with a guessed arrival time. Every skipped leg is counted by reason in the
+plan, so a day that pushes fewer runs than expected explains itself.
+
+### Time zones — read this before publishing
+
+Traumasoft returns `pickup_time` as **local time with no UTC offset** on every
+leg. Samsara wants an absolute instant. Something has to bridge that, and
+getting it wrong is not subtle: a 07:30 pickup sent as `07:30Z` dispatches the
+unit at 03:30 local.
+
+Measured on 30 days of this tenant's data: `pickup_time` is naive on **all
+18,026 legs**, and the per-leg `timezone` field is empty on **100%** of them.
+
+The offset is resolved in this order:
+
+1. `SAMSARA_TENANT_TIMEZONE` — an IANA zone (`America/New_York`), resolved
+   against each trip's own date so daylight saving is handled
+2. `SAMSARA_TENANT_UTC_OFFSET` — a fixed offset, wrong half the year
+3. an offset on `pickup_time` itself, if the tenant ever sends one
+4. the leg's `timezone` field
+5. the status timestamps on the legs
+
+**Set one of the first two.** Step 5 is the trap: it works fine for a day
+already worked, which is why a 30-day probe reports a clean `-04:00` — but
+tomorrow's trips have no status timestamps, because nothing has happened to
+them yet, and tomorrow is exactly what this job pushes. If nothing in the
+chain resolves, **the run refuses to publish** and says so. It will not guess.
+
+### Drop-off times
+
+Samsara requires a scheduled arrival on every stop, but Traumasoft only
+schedules the pickup. The drop-off time is taken from `appt_time` — the hour
+the patient is actually due — then `dropoff_eta`, and only then estimated at
+pickup + `SAMSARA_DEFAULT_TRANSPORT_MINUTES` (45 by default). On real data only
+about a third of legs carry an appointment time, so most drop-offs are
+estimates — the plan counts them.
+
+That matters because Samsara sorts **every** stop on a route by arrival time.
+An uncapped 45-minute guess sorts past the unit's next pickup whenever two
+legs are closer together than that, and the driver is told to collect the next
+patient before delivering the one on board. So an estimated drop-off is pulled
+back to just short of the next pickup; the plan counts those as "Capped". A
+real appointment time is never moved — if it overlaps, the overlap is real.
+A time landing *before* its own pickup is still pushed one minute past it.
+
+On real data 18% of estimated drop-offs collided with the unit's next pickup
+at a flat 45 minutes. Capping stops that misordering the driver, but it is
+still a sign the estimate is too blunt.
+
+There are three ways to make it, and the probe measures which one is actually
+least wrong on your data rather than leaving it to taste:
+
+| Model | What it does |
+|---|---|
+| `flat` (default) | `SAMSARA_DEFAULT_TRANSPORT_MINUTES` for everything |
+| per level of service | `SAMSARA_TRANSPORT_MINUTES_BY_LOS`, e.g. a wheelchair van and a stretcher transport differ |
+| `distance` | each leg from its own straight-line distance, `base + miles / mph` |
+
+Section **5b** calibrates the flat numbers from the legs that do carry an
+appointment time; section **5c** scores all three against that same ground
+truth and prints the config for whichever wins. If none beats the flat
+default it says so and tells you to leave it alone.
+
+The distance model exists because the spread is mostly *within* a level of
+service, not between: `Non Emergency` alone runs p25=30 to p90=60, and what
+varies there is the trip, not the category. Its fitted speed comes out well
+below any road speed — that is the straight line absorbing the difference from
+the road, and it should not be "corrected" upward.
+
+### Excluding by level of service
+
+`SAMSARA_EXCLUDED_LOS` drops legs by `los`, case- and hyphen-insensitively
+(real data carries `Non Emergency` and `Non-Emergency` as one thing typed two
+ways). Empty by default. `Emergency` is the usual candidate — it is dispatched
+in the moment, so a route built the night before describes nothing. Genuine
+typos in the source data still have to be named individually.
+
+### Before the first run: the readiness probe
+
+`probe_samsara_readiness.py` is read-only and answers the questions the
+mapping would otherwise guess at — run it before configuring anything:
+
+```bash
+python probe_samsara_readiness.py --days 30
+```
+
+It reports field coverage on real legs (how often coordinates and appointment
+times are actually populated), whether trip stamps carry a UTC offset, your
+real `call_type` and `los` vocabulary against the exclusion list, the
+eligibility funnel with a reason for every dropped leg, how many drop-off
+times would be estimated rather than scheduled, and the actual
+Traumasoft↔Samsara vehicle match table. It works with or without a Samsara
+token — without one you still get the Traumasoft-side unit prefixes.
+
+**It never prints patient-identifying values.** Names, MRNs, phone numbers and
+street addresses are counted, never shown, so its output is safe to paste into
+an issue or a chat.
+
+### Configuration
+
+```env
+SAMSARA_API_TOKEN=...                    # required
+# SAMSARA_DEFAULT_TRANSPORT_MINUTES=45
+# SAMSARA_EXCLUDED_CALL_TYPES=standby,cancel,no transport,dry run
+```
+
+The token needs read access to Vehicles and Addresses and write access to
+Routes (Settings → Organization → API Tokens).
+
+---
+
+## Punch Quality and the Paycor Timecard Push (Optional)
+
+Crews currently clock in twice — Traumasoft and Paycor — and only Paycor decides
+what they are paid. Nothing rewards a complete Traumasoft punch, so punch-outs
+there are unreliable by construction. That is a reporting problem, not just an
+HR one: every unit-hour figure in this bundle rests on those punches.
+
+`unit_punches_by_instance` bounds a punch with no end at the shift's end. For a
+crew still on the road that is right. For a crew who simply never clocked out it
+credits the whole scheduled shift — so `worked_hours` quietly becomes
+`scheduled_hours` for that unit, and the gap the worked-hours denominator exists
+to expose closes itself. Utilization then reads low by exactly that much.
+
+### Measuring it first
+
+```
+python probe_punch_quality.py                      # the window as it stands
+python probe_punch_quality.py --json punches.json  # append a daily baseline
+```
+
+Read-only, Traumasoft alone, no Paycor credentials needed. It reports punch-out
+completion, who is not closing punches, where it concentrates, crew rostered who
+never clocked in at all, and the headline number: **how many unit hours in the
+UHU denominator are measured versus manufactured by the fallback.** That last
+figure is computed by running the real worked-hours path twice, once over a feed
+with open punches stripped — it is the fallback's contribution itself, not an
+estimate of it.
+
+**It is a four-day window, not a history.** `/Schedule/Shifts` returns
+`today-1..today+2` and ignores every date filter, so punches cannot be
+backfilled. A baseline accrues by running this daily and keeping the output;
+a day not captured is gone. `--json` appends a row per run for that purpose.
+
+### Pushing punches into Paycor
+
+`push_paycor_timecards.py` sends Traumasoft punches to Paycor as timecard
+punches. Three modes, meant to be used in order:
+
+```
+python push_paycor_timecards.py                       # 1. dry run
+python push_paycor_timecards.py --reconcile           # 2. compare, write nothing
+python push_paycor_timecards.py --reconcile --publish # 3. send them
+```
+
+**Mode 2 is the one that matters before going live.** It reads what Paycor
+already holds for the same window and compares it punch by punch, so you can
+prove the employee mapping resolves, the clocks agree, and the two systems are
+describing the same shifts — while both sides are still read-only. A window
+where every Traumasoft punch already matches Paycor is the result you want:
+it means making Traumasoft authoritative changes who is trusted, not what
+anyone is paid.
+
+Rails that cannot be configured away:
+
+- **An open punch is never sent.** A punch with no clock-out is not a payable
+  record, and the shift-end fallback that makes it usable for reporting would
+  here mean inventing the end of somebody's paid day.
+- **An employee who cannot be mapped unambiguously is refused, not guessed.**
+  Two people sharing a payroll number is exactly the case where a guess pays
+  the wrong person. `state/paycor_employee_overrides.json` takes the decisions.
+- **A punch Paycor already holds is skipped**, so a re-run does not double-pay.
+  A publish without a reconciliation read is refused outright.
+- **The first failure stops the run.** One bad punch is a fix; two hundred is
+  an incident.
+- **Production needs `PAYCOR_ENVIRONMENT=production` *and*
+  `--i-understand-this-is-payroll`.** The client defaults to Paycor's sandbox,
+  and anything but the exact string `production` resolves there, so a typo
+  fails safe.
+
+`--limit N` sends only the first N punches, for a first live test.
+
+### What the write actually looks like
+
+Built against Paycor's own OpenAPI spec, committed at
+`docs/paycor-public-api-v1.json`. Three things in it are worth knowing before
+you read the plan, because each one contradicts a reasonable assumption:
+
+- **Punches are events, not intervals.** `POST /v1/legalentities/{id}/CreatePunches`
+  takes an array where each object is a *single clock event* with one
+  `punchDateTime` and a `punchStatusType` of In/Out/Auto/Transfer. So one
+  Traumasoft punch row becomes **two** Paycor punches. The plan prints both.
+- **Three guids are required and Paycor defaults none of them.** `employeeId`
+  and `departmentId` come from the Paycor employee record; `activityTypeId` is
+  a per-tenant choice (`PAYCOR_ACTIVITY_TYPE`, default `Work`). A punch missing
+  any of them is refused rather than sent with a placeholder.
+- **A 202 is not success.** CreatePunches validates asynchronously: it returns a
+  tracking id, and whether the punches landed is only visible by reading
+  `GET /v1/legalentities/{id}/punchErrorLog/{trackingId}` afterwards. Every
+  publish here reads that log back before reporting anything as sent, and a
+  batch whose log cannot be read is reported as **unverified** rather than
+  counted either way.
+
+Idempotency is by correlation id, not timestamps. Each punch carries a
+`correlationId` derived deterministically from the Traumasoft punch id, and
+Paycor returns it on read — so "have I sent this already?" is an exact lookup
+that survives a re-run, a restart, and clocks that disagree by a minute.
+
+A sandbox test is also reversible: `GET /v1/employees/{id}/employeePunches`
+returns each punch's `punchId`, and `DELETE /v1/employees/{id}/DeletePunches`
+takes those ids. A test you cannot undo is not a test to run against payroll.
+
+### Credentials
+
+Paycor wants both an OAuth 2.0 bearer token and an APIm subscription key on
+every call. The bearer comes from an authorization-code grant, which needs a
+human in a browser once; the refresh token that falls out is what goes in
+`.env` as `PAYCOR_REFRESH_TOKEN`. `PAYCOR_ACCESS_TOKEN` accepts a token pasted
+straight out of the developer portal, which is enough to try a read before
+wiring the flow up properly. See the Paycor block in `.env.example`.
+
+---
+
 ## Status Dashboard Integration (Optional)
 
 The bottom of the script contains optional integration with a “status dashboard” via a separate `status_logger` module. [file:1]

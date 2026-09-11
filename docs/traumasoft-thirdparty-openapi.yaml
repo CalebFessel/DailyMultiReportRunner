@@ -1,0 +1,4635 @@
+openapi: 3.0.3
+info:
+  title: Traumasoft ThirdParty API
+  version: 1.0.0
+  description: |
+    Partner-facing REST API for Traumasoft EMS integrations.
+
+    This OpenAPI specification is the **source of truth** for ThirdParty Data and Lists endpoints.
+    It supersedes the legacy Postman collection.
+
+    ### Not included in this spec
+
+    Private or non–partner integrations are **excluded** (use dedicated credentials / internal docs):
+
+    - **Huly / ePCR** (`ThirdParty/Data/Epcr/Huly` and `Trip?rtype=HulyUpdateTrip`)
+    - Hub, Banquest, ChatServer, SAML, Twilio, AniAli, and other non–Data/Lists ThirdParty surfaces
+
+    Partner write-path enums/schemas still **deferred** until those endpoints are documented here:
+
+    - **LocationTypeId** — ship when facility/location write paths are documented
+
+    ---
+
+    ## Authentication (HMAC-SHA256)
+
+    All ThirdParty Data and Lists endpoints use HMAC authentication.
+    Every request must send these headers:
+
+    | Header | Description |
+    | --- | --- |
+    | **X-TS-APIKEY** | Configured API Key |
+    | **X-TS-TIMESTAMP** | Current UNIX timestamp (valid for 300 seconds) |
+    | **X-TS-ID** | Randomly generated number for every request |
+    | **X-TS-AUTHORIZATION** | This is the generated HMAC hash |
+
+    ### Generate hmac hash using
+
+    **Default (most endpoints)**
+
+    ```php
+    hash_hmac('sha256', $requestBody . $timestamp . $randNum, $secret);
+    ```
+
+    Use an empty string for `$requestBody` when there is no body (typical GET).
+
+    **Alternate (GPS Geofence / legacy Postman style)**
+
+    ```php
+    hash_hmac('sha256', $apiKey, $timestamp . $secret . $randNum);
+    ```
+
+    | Variable | Meaning |
+    | --- | --- |
+    | `$apiKey` | Same value as `X-TS-APIKEY` |
+    | `$timestamp` | Same value as `X-TS-TIMESTAMP` |
+    | `$randNum` | Same value as `X-TS-ID` |
+    | `$secret` | The secret for that API key |
+    | `$requestBody` | Raw HTTP body string |
+
+    ---
+
+    ## Rate limiting
+
+    When per-API-key rate limiting is enabled, typical limits are:
+
+    - **100** read requests / minute
+    - **50** write requests / minute
+
+    Clients may receive **HTTP 429** with a `Retry-After` header (commonly `60` seconds) when those limits are exceeded. Treat 429 as a transient condition and retry after the indicated wait.
+
+    ---
+
+    ## Routing conventions
+
+    | Pattern | Maps to |
+    |---------|---------|
+    | `GET /ThirdParty/Data/{Controller}` | List |
+    | `GET /ThirdParty/Data/{Controller}/{id}` | Read by ID |
+    | `GET` or `POST` `...?rtype={Action}` | Custom action |
+    | `GET /ThirdParty/Lists/...` | Dropdown lookups (`id` + `name`) |
+
+    ---
+
+    ## Write-only fields
+
+    `ssn` is **write-only** and is never returned on GET/list responses
+    (see `SsnField` on Users Create/Update).
+servers:
+  - url: '{baseUrl}/api'
+    description: Tenant API base
+    variables:
+      baseUrl:
+        default: https://your-tenant.traumasoft.com
+        description: Your Traumasoft host (no trailing slash)
+tags:
+  - name: Attachments
+    description: Upload files and list attachment types.
+  - name: Billing
+    description: Payor records with schedules and fees.
+  - name: CAD
+    description: CAD reference data, patients, facilities, and trips.
+  - name: CAD Lists
+    description: CAD dropdown lookups (id + name).
+  - name: Fleet
+    description: Vehicles and GPS geofence endpoints.
+  - name: Fleet Lists
+    description: Fleet dropdown lookups (id + name).
+  - name: HR
+    description: HR reference data endpoints.
+  - name: HR Lists
+    description: HR dropdown lookups (id + name).
+  - name: Organization
+    description: Division/district/group hierarchy with associated cost center IDs.
+  - name: Schedule
+    description: Shift assignments and punch data.
+  - name: Schedule Lists
+    description: Schedule dropdown lookups (id + name).
+  - name: User
+    description: Employee / user roster data.
+  - name: User Lists
+    description: User/employee dropdown lookups (id + name).
+paths:
+  /ThirdParty/Data/Attachments:
+    get:
+      summary: List attachment types
+      tags:
+      - Attachments
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Attachment types
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  attachment_types:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AttachmentType'
+      parameters:
+      - name: rtype
+        in: query
+        required: true
+        schema:
+          type: string
+          enum:
+          - GetTypes
+    post:
+      summary: Upload attachments
+      tags:
+      - Attachments
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      parameters:
+      - name: rtype
+        in: query
+        required: true
+        schema:
+          type: string
+          enum:
+          - Upload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - files
+              properties:
+                files:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/AttachmentUploadFile'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Upload result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  files:
+                    type: array
+                    items:
+                      type: string
+                    description: Per-file status messages.
+        '400':
+          $ref: '#/components/responses/Error4xx'
+  /ThirdParty/Data/Billing/FeeSchedules:
+    get:
+      summary: List FeeSchedule
+      description: |
+        Read-only lookup of billing fee schedules.
+        Use `id` values when resolving fee_schedule on payor-related writes.
+        Small reference list — returns all matching rows (no pagination).
+        Excludes deleted and inactive fee schedules by default.
+      tags:
+      - Billing
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Fee schedules list
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - fee_schedules
+                properties:
+                  fee_schedules:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FeeSchedule'
+      parameters:
+      - $ref: '#/components/parameters/nameFilter'
+      - $ref: '#/components/parameters/includeDeleted'
+      - $ref: '#/components/parameters/includeInactive'
+  /ThirdParty/Data/Billing/PayorCategories:
+    get:
+      summary: List PayorCategory
+      description: |
+        Read-only lookup of payor categories.
+        Use `id` values when resolving category on payor-related writes.
+        Small reference list — returns all matching rows (no pagination).
+      tags:
+      - Billing
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Payor categories list
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - payor_categories
+                properties:
+                  payor_categories:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PayorCategory'
+      parameters:
+      - $ref: '#/components/parameters/nameFilter'
+  /ThirdParty/Data/Billing/Payors:
+    get:
+      summary: List Payor
+      description: |
+        Paginated payor list. System payors named NONE and BILL_PATIENT system-type
+        rows are always excluded. Page size defaults to 100 (max 100). Optional sparse
+        fields via `fields[payors]`.
+      tags:
+      - Billing
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/JqGridPaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Payor'
+        '400':
+          $ref: '#/components/responses/Error4xx'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - name: rows
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 100
+        description: |
+          Page size for Payors List. Defaults to 100 when omitted.
+          Must be between 1 and 100 when provided.
+      - $ref: '#/components/parameters/includeInactive'
+      - $ref: '#/components/parameters/nameFilter'
+      - $ref: '#/components/parameters/fieldsPayors'
+    post:
+      summary: Create Payor
+      description: |
+        Create a payor. Required: `name`, `system_type`, `primary_schedule_id`,
+        `address1`, `city`, `state`, `zipcode`.
+        `billing_desc` defaults to `name` when omitted; `payment_rate` defaults to 100.
+        Reserved system payors cannot be created: name NONE, or `system_type` BILL_PATIENT (5).
+        When `system_type` is INSURANCE (3), `default_source` is required and must exist.
+        When `system_type` is FACILITY_CONTRACT (4), `facility_id` is required and must exist;
+        after save, `ibd_facilities.payor_id` is set to the new payor (422 if the facility is
+        already linked to a different payor).
+        Optional FKs (`secondary_schedule_id`, `fee_schedule_id`, `category_id`) must exist when sent.
+        `require_zip_plus_four_dropoff` always mirrors `require_zip_plus_four_pickup`.
+        Writes are transaction-wrapped. Field diffs go to `cad_payors_history`
+        (source: ThirdParty API).
+      tags:
+      - Billing
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayorCreate'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '201':
+          description: Created payor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayorWriteResponse'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+        '500':
+          $ref: '#/components/responses/Error5xx'
+  /ThirdParty/Data/Billing/Payors/{id}:
+    get:
+      summary: Read Payor by ID
+      description: |
+        Single payor by id. NONE (by name) and BILL_PATIENT system-type payors
+        return 404. Optional sparse fields via `fields[payors]`.
+      tags:
+      - Billing
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payor'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+      - $ref: '#/components/parameters/fieldsPayors'
+    put:
+      summary: Update Payor
+      description: |
+        Partial update of a payor. Blank `name` → 422.
+        NONE (by name) and BILL_PATIENT payors → 422 on all writes.
+        FACILITY_CONTRACT payors with `facility_id` already set cannot be updated via this
+        endpoint (422); the facility owns that link.
+        Generic FACILITY_CONTRACT (`facility_id` null) may be updated without re-sending
+        `facility_id`; linking a facility sets `ibd_facilities.payor_id` (422 if the facility
+        is already linked to a different payor).
+        Changing `system_type` to FACILITY_CONTRACT requires `facility_id`.
+        Changing to / remaining INSURANCE requires `default_source` (existing value is kept
+        when omitted on update).
+        Optional FKs must exist when sent.
+        `require_zip_plus_four_dropoff` always mirrors `require_zip_plus_four_pickup`.
+      tags:
+      - Billing
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayorWrite'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Updated payor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayorWriteResponse'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+        '500':
+          $ref: '#/components/responses/Error5xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+    delete:
+      summary: Deactivate Payor
+      description: |
+        Soft-deactivate a payor by setting `inactive=1`. Does not set `deleted`
+        (unused for payors). NONE and BILL_PATIENT system payors → 422.
+      tags:
+      - Billing
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Deactivated payor
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  inactive:
+                    type: boolean
+                    example: true
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+        '500':
+          $ref: '#/components/responses/Error5xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Billing/Schedules:
+    get:
+      summary: List Schedule
+      description: |
+        Read-only lookup of billing schedules.
+        Use `id` values when resolving schedule on payor and facility-related writes.
+        Small reference list — returns all matching rows (no pagination).
+        Excludes deleted schedules by default; pass `include_deleted=true` to include them.
+      tags:
+      - Billing
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Schedules list
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - schedules
+                properties:
+                  schedules:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BillingSchedule'
+      parameters:
+      - $ref: '#/components/parameters/nameFilter'
+      - $ref: '#/components/parameters/includeDeleted'
+  /ThirdParty/Data/Cad/CallTypes:
+    get:
+      summary: List CallType
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/CallType'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/includeDeleted'
+      - $ref: '#/components/parameters/nameFilter'
+  /ThirdParty/Data/Cad/CallTypes/{id}:
+    get:
+      summary: Read CallType by ID
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CallType'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Cad/CancelReasons:
+    get:
+      summary: List CancelReason
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/CancelReason'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/includeDisabled'
+      - $ref: '#/components/parameters/nameFilter'
+  /ThirdParty/Data/Cad/CancelReasons/{id}:
+    get:
+      summary: Read CancelReason by ID
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelReason'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Cad/Departments:
+    get:
+      summary: List Department
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Department'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/includeDeleted'
+      - $ref: '#/components/parameters/nameFilter'
+      - name: facility_id
+        in: query
+        schema:
+          type: integer
+        description: Filter by facility. Resolve via GET /ThirdParty/Data/Cad/Facilities.
+  /ThirdParty/Data/Cad/Departments/{id}:
+    get:
+      summary: Read Department by ID
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Department'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Cad/Facilities:
+    get:
+      summary: List Facility
+      description: |
+        Paginated list of facilities. Soft-deleted rows are excluded by default.
+        `rows` defaults to 100 when omitted; when provided must be between 1 and 100 (400 otherwise).
+        Optional `fields[facilities]` selects a subset of allowlisted columns (JSON:API style).
+        Field names are matched case-insensitively. Omit `fields[facilities]` for the full
+        allowlisted response. Unknown field names are ignored.
+        If `fields[facilities]` is provided and none are allowlisted, returns 422.
+        A non-object `fields` value returns 422.
+        Optional `company_id` exact-matches `ibd_facilities.company_id`
+        (resolve via GET /ThirdParty/Lists/Cad/Companies).
+        When provided, `company_id` must be a positive integer; otherwise returns 422.
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Facility'
+        '400':
+          $ref: '#/components/responses/Error4xx'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - name: rows
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 100
+        description: |
+          Page size for Facilities List. Defaults to 100 when omitted.
+          Must be between 1 and 100 when provided.
+      - $ref: '#/components/parameters/includeDeleted'
+      - $ref: '#/components/parameters/nameFilter'
+      - $ref: '#/components/parameters/companyIdFilter'
+      - $ref: '#/components/parameters/fieldsFacilities'
+    post:
+      summary: Create Facility
+      description: |
+        Create a facility. Required: `name`. `company_id` is optional.
+        When `contract_payor` is provided: if a FACILITY_CONTRACT payor with that
+        name already exists, attach it (`facility.payor_id` only; schedule not required)
+        unless that payor already has `facility_id` set for a different facility (422).
+        Otherwise create a new FACILITY_CONTRACT and require `primary_schedule_id`
+        (must exist). Existing shared facility-contract payors are never mutated.
+        Writes are transaction-wrapped. Field diffs go to `ibd_facilities_history`
+        (source: ThirdParty API).
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FacilityCreate'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '201':
+          description: Created facility
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FacilityWriteResponse'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+        '500':
+          $ref: '#/components/responses/Error5xx'
+  /ThirdParty/Data/Cad/Facilities/{id}:
+    get:
+      summary: Read Facility by ID
+      description: |
+        Optional `fields[facilities]` selects a subset of allowlisted columns (JSON:API style).
+        Field names are matched case-insensitively. Omit `fields[facilities]` for the full
+        allowlisted response. Unknown field names are ignored.
+        If `fields[facilities]` is provided and none are allowlisted, returns 422.
+        A non-object `fields` value returns 422.
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Facility'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+      - $ref: '#/components/parameters/fieldsFacilities'
+    put:
+      summary: Update Facility
+      description: |
+        Partial update of a facility. Blank `name` → 422.
+        When the linked CadPayors row already has `facility_id` set (specific contract),
+        sending `contract_payor` to replace/rebind is blocked with 422. Otherwise
+        `contract_payor` attaches an existing FACILITY_CONTRACT by name or creates a
+        new one (same as Create). Facility field updates still sync an existing
+        specific contract via the dedicated payor scenario.
+        Delete is always allowed even when a linked payor exists.
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FacilityWrite'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Updated facility
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FacilityWriteResponse'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+        '500':
+          $ref: '#/components/responses/Error5xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+    delete:
+      summary: Delete Facility
+      description: |
+        Soft-delete a facility by setting `deleted=1` and `disabled=1`.
+        Always allowed even when a linked contract payor exists.
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Soft-deleted facility
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  facility_id:
+                    type: integer
+                    description: Same domain key as List/Read (`ibd_facilities.facility_id`).
+                  deleted:
+                    type: boolean
+                  disabled:
+                    type: boolean
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+        '500':
+          $ref: '#/components/responses/Error5xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Cad/FacilityTypes:
+    get:
+      summary: List FacilityType
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/FacilityType'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/includeDeleted'
+      - $ref: '#/components/parameters/nameFilter'
+  /ThirdParty/Data/Cad/FacilityTypes/{id}:
+    get:
+      summary: Read FacilityType by ID
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FacilityType'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Cad/LevelOfService:
+    get:
+      summary: List LevelOfService
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/LevelOfService'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/includeDeleted'
+      - $ref: '#/components/parameters/nameFilter'
+  /ThirdParty/Data/Cad/LevelOfService/{id}:
+    get:
+      summary: Read LevelOfService by ID
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LevelOfService'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Cad/Natures:
+    get:
+      summary: List Nature
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Nature'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/includeDeleted'
+      - $ref: '#/components/parameters/nameFilter'
+  /ThirdParty/Data/Cad/Natures/{id}:
+    get:
+      summary: Read Nature by ID
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Nature'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Cad/Patients:
+    get:
+      summary: List patients
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated patients
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Patient'
+        '400':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - name: rows
+        in: query
+        required: true
+        schema:
+          type: integer
+          maximum: 1000
+          default: 1000
+      - $ref: '#/components/parameters/includeDeleted'
+      - name: last_name
+        in: query
+        schema:
+          type: string
+      - name: first_name
+        in: query
+        schema:
+          type: string
+  /ThirdParty/Data/Cad/Patients/{id}:
+    get:
+      summary: Read patient by ID
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Patient
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Patient'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Cad/Priorities:
+    get:
+      summary: List Priority
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Priority'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/includeDeleted'
+      - $ref: '#/components/parameters/nameFilter'
+  /ThirdParty/Data/Cad/Priorities/{id}:
+    get:
+      summary: Read Priority by ID
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Priority'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Cad/Subzones:
+    get:
+      summary: List Subzone
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Subzone'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/includeDeleted'
+      - $ref: '#/components/parameters/nameFilter'
+  /ThirdParty/Data/Cad/Subzones/{id}:
+    get:
+      summary: Read Subzone by ID
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subzone'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Cad/Timestamps:
+    get:
+      summary: List Timestamp
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Timestamp'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/includeDeleted'
+      - $ref: '#/components/parameters/nameFilter'
+  /ThirdParty/Data/Cad/Timestamps/{id}:
+    get:
+      summary: Read Timestamp by ID
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Timestamp'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Cad/Trip:
+    get:
+      summary: Get trip(s)
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Without rtype, a single TripByOrigin object (or empty). With rtype=GetTrips, an array of TripLegSummary.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/TripByOrigin'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/TripLegSummary'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - name: rtype
+        in: query
+        schema:
+          type: string
+          enum:
+          - GetTrips
+        description: Omit for single trip by origin lookup.
+      - name: origin
+        in: query
+        schema:
+          type: string
+      - name: trip_date
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: trip_number
+        in: query
+        schema:
+          type: string
+      - name: incident_num
+        in: query
+        schema:
+          type: string
+      - name: leg_ids
+        in: query
+        schema:
+          type: array
+          items:
+            type: integer
+      - name: zone_id
+        in: query
+        schema:
+          type: integer
+        description: Filter GetTrips by pickup zone. Resolve via GET /ThirdParty/Lists/Cad/Zones.
+      - name: response_subzone_id
+        in: query
+        schema:
+          type: integer
+        description: Filter GetTrips by response subzone.
+      - name: dispatch_subzone_id
+        in: query
+        schema:
+          type: integer
+        description: Filter GetTrips by dispatch subzone.
+      - name: external_reference
+        in: query
+        schema:
+          type: string
+        description: Filter GetTrips by misc.external_reference.
+      - name: trip_statuses
+        in: query
+        schema:
+          type: string
+        description: Comma-separated last_status_id values for GetTrips.
+      - name: range_days
+        in: query
+        schema:
+          type: integer
+          maximum: 31
+        description: Inclusive day range from trip_date for GetTrips (max 31).
+    post:
+      summary: Set trip leg timestamps
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Success
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - name: rtype
+        in: query
+        required: true
+        schema:
+          type: string
+          enum:
+          - SetTimestamps
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - leg_id
+              - timestamps
+              properties:
+                leg_id:
+                  type: integer
+                  description: CAD trip leg id for this update.
+                timestamps:
+                  type: object
+                  additionalProperties:
+                    type: string
+  /ThirdParty/Data/Cad/Zones:
+    get:
+      summary: List Zone
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Zone'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/includeDeleted'
+      - $ref: '#/components/parameters/nameFilter'
+  /ThirdParty/Data/Cad/Zones/{id}:
+    get:
+      summary: Read Zone by ID
+      tags:
+      - CAD
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Zone'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Fleet/CustomStatus:
+    get:
+      summary: List CustomStatus
+      description: |
+        Read-only lookup of fleet custom statuses (vehicles, equipment, etc.).
+        Use `id` values when resolving status on vehicle and equipment-related writes.
+        Small reference list — returns all matching rows (no pagination).
+        Excludes deleted custom statuses by default.
+        Maps `vm_custom_status.status` to response `name`.
+        Includes `notify_group` (domain key, e.g. vehicles, equipment) so partners can
+        distinguish shared statuses across vehicle/equipment/vendor domains.
+      tags:
+      - Fleet
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Custom statuses list
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - custom_statuses
+                properties:
+                  custom_statuses:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CustomStatus'
+      parameters:
+      - $ref: '#/components/parameters/nameFilter'
+      - $ref: '#/components/parameters/includeDeleted'
+  /ThirdParty/Data/Fleet/GpsGeofence:
+    get:
+      summary: GPS geofence configs or vehicle fences
+      tags:
+      - Fleet
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Geofence data
+      parameters:
+      - name: rtype
+        in: query
+        required: true
+        schema:
+          type: string
+          enum:
+          - GetConfigs
+          - GetVehicleFences
+    post:
+      summary: Dispatch GPS auto-update jobs
+      tags:
+      - Fleet
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Queued
+      parameters:
+      - name: rtype
+        in: query
+        required: true
+        schema:
+          type: string
+          enum:
+          - DispatchAutoUpdates
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+  /ThirdParty/Data/Fleet/Vehicles:
+    get:
+      summary: List Vehicle
+      description: |
+        Paginated vehicle list.
+        `rows` defaults to 100 when omitted; when provided must be between 1 and 100 (400 otherwise).
+        Optional `fields[vehicles]` selects a subset of allowlisted columns (JSON:API style).
+        Field names are matched case-insensitively. Omit `fields[vehicles]` for the full
+        allowlisted set (SQL columns + live-shift enrichment). Unknown names are ignored.
+        If `fields[vehicles]` is provided and none are allowlisted, returns 422.
+        Enrichment fields (`shift_name`, `trip_status`, `trip_timestamp`, `post_id`,
+        `post_status`, `post_timestamp`) are returned only when requested (or when
+        `fields[vehicles]` is omitted).
+      tags:
+      - Fleet
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/JqGridPaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Vehicle'
+        '400':
+          $ref: '#/components/responses/Error4xx'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - name: rows
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 100
+        description: |
+          Page size for Vehicles List. Defaults to 100 when omitted.
+          Must be between 1 and 100 when provided.
+      - $ref: '#/components/parameters/includeDeleted'
+      - $ref: '#/components/parameters/includeDisabled'
+      - $ref: '#/components/parameters/nameFilter'
+      - $ref: '#/components/parameters/fieldsVehicles'
+    post:
+      summary: Create Vehicle
+      description: |
+        Create a vehicle.
+        Required: name, division_id, district_id, group_id.
+        VIN must be unique among non-deleted vehicles when supplied.
+        `status` must reference an existing `vm_custom_status.id` when supplied.
+        Writes a Layer 1 audit log entry on success.
+        Response combines List default fields with writable request fields.
+      tags:
+      - Fleet
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VehicleCreate'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '201':
+          description: |
+            Created vehicle: List default fields (including `vehicle_status` + enrichment)
+            plus writable fields from the request (`status`, DDG, make/model/year/color/plate).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VehicleWriteResponse'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+        '500':
+          $ref: '#/components/responses/Error5xx'
+  /ThirdParty/Data/Fleet/Vehicles/{id}:
+    get:
+      summary: Read Vehicle by ID
+      description: |
+        Single vehicle by id.
+        Optional `fields[vehicles]` selects a subset of allowlisted columns (JSON:API style).
+        Field names are matched case-insensitively. Omit `fields[vehicles]` for the full
+        SQL allowlisted columns plus the legacy Read enrichment set (`shift_name`,
+        `trip_status`, `post_status` only — not trip/post timestamps or `post_id`).
+        Unknown names are ignored.
+        If `fields[vehicles]` is provided and none are allowlisted, returns 422.
+        Enrichment fields are returned only when requested (or when `fields[vehicles]`
+        is omitted, using the legacy Read enrichment set above).
+      tags:
+      - Fleet
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Vehicle'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+      - $ref: '#/components/parameters/fieldsVehicles'
+    put:
+      summary: Update Vehicle
+      description: |
+        Partial update of a vehicle.
+        VIN must be unique among non-deleted vehicles when supplied.
+        `status` must reference an existing `vm_custom_status.id` when supplied.
+        Name cannot be blank when provided.
+        Writes a Layer 1 audit log entry on success.
+        Response combines List default fields with writable request fields.
+      tags:
+      - Fleet
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VehicleWrite'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: |
+            Updated vehicle: List default fields (including `vehicle_status` + enrichment)
+            plus writable fields (`status`, DDG, make/model/year/color/plate).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VehicleWriteResponse'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+        '500':
+          $ref: '#/components/responses/Error5xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+    delete:
+      summary: Delete Vehicle
+      description: |
+        Soft-delete a vehicle by setting `deleted` to 1.
+        Writes a Layer 1 audit log entry on success.
+      tags:
+      - Fleet
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Soft-deleted vehicle
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - id
+                - deleted
+                properties:
+                  id:
+                    type: integer
+                  deleted:
+                    type: boolean
+                    enum:
+                    - true
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+        '500':
+          $ref: '#/components/responses/Error5xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+  /ThirdParty/Data/Hr/EmployeeLevels:
+    get:
+      summary: List EmployeeLevel
+      description: |
+        Read-only lookup of employee levels.
+        Use `id` values when resolving employee levels on user certification-related writes.
+        Small reference list — returns all matching rows (no pagination).
+      tags:
+      - HR
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Employee levels list
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - employee_levels
+                properties:
+                  employee_levels:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EmployeeLevel'
+      parameters:
+      - $ref: '#/components/parameters/nameFilter'
+  /ThirdParty/Data/Organization:
+    get:
+      operationId: listOrganizationHierarchy
+      summary: List division, district, and group hierarchy
+      description: >
+        Returns the division/district/group (DDG) hierarchy with associated
+        cost center IDs. Only complete DDG chains are returned (groups without
+        a full division and district link are excluded). Each unique
+        division/district/group chain is returned as its own row. Callers use
+        this lookup to resolve division_id, district_id, and group_id before
+        creating users or vehicles.
+      tags:
+      - Organization
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Flat list of sched groups with DDG names and IDs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OrganizationGroup'
+  /ThirdParty/Data/Schedule/EarningCodes:
+    get:
+      summary: List EarningCode
+      description: |
+        Read-only lookup of schedule earning codes (`sched_earning_codes`).
+        Use `id` values when resolving earning_code_id on schedule-related writes.
+        `name` is the display label (column `description` in the database).
+        Soft-deleted codes are excluded by default; pass `include_deleted=true` to include them.
+        The response has no `deleted` field.
+      tags:
+      - Schedule
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/PaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/EarningCode'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/includeDeleted'
+      - $ref: '#/components/parameters/nameFilter'
+      - $ref: '#/components/parameters/earningCodeTypeFilter'
+  /ThirdParty/Data/Schedule/PayTypes:
+    get:
+      summary: List PayType
+      description: |
+        Read-only lookup of schedule pay types.
+        Use `id` values when resolving paytype on user-related writes.
+        Small reference list — returns all matching rows (no pagination).
+      tags:
+      - Schedule
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Pay types list
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - pay_types
+                properties:
+                  pay_types:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PayType'
+      parameters:
+      - $ref: '#/components/parameters/nameFilter'
+  /ThirdParty/Data/Schedule/Shifts:
+    get:
+      summary: List shifts
+      tags:
+      - Schedule
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Shifts with punches
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Shift'
+      parameters:
+      - $ref: '#/components/parameters/includeDeleted'
+  /ThirdParty/Data/User/Employees:
+    get:
+      summary: List employees
+      tags:
+      - User
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Employees
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/JqGridPaginatorResponse'
+                - type: object
+                  properties:
+                    rows:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/Employee'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/includeDisabled'
+  /ThirdParty/Data/User/Users:
+    get:
+      summary: List User
+      description: |
+        Paginated list of user accounts.
+        Excludes disabled users by default.
+        `rows` defaults to 100 when omitted; when provided must be between 1 and 100 (400 otherwise).
+        Optional `name` filters by first name, last name, or username (OR, LIKE; trimmed).
+        Optional `fields[users]` selects a subset of allowlisted columns (JSON:API style).
+        Field names are matched case-insensitively. Omit `fields[users]` for the full
+        allowlisted response. Unknown field names are ignored.
+        If `fields[users]` is provided and none are allowlisted, returns 422.
+        A non-object `fields` value returns 422.
+        Never returns SSN.
+      tags:
+      - User
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated users list
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - users
+                - current_page
+                - total_pages
+                - total_records
+                properties:
+                  users:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/User'
+                  current_page:
+                    type: integer
+                  total_pages:
+                    type: integer
+                  total_records:
+                    type: integer
+        '400':
+          $ref: '#/components/responses/Error4xx'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - name: rows
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 100
+        description: |
+          Page size for Users List. Defaults to 100 when omitted.
+          Must be between 1 and 100 when provided.
+      - $ref: '#/components/parameters/nameFilter'
+      - $ref: '#/components/parameters/includeDisabled'
+      - $ref: '#/components/parameters/fieldsUsers'
+    post:
+      summary: Create User
+      description: |
+        Create a user account.
+        Required: first_name, last_name, user_role, division_id, district_id, group_id.
+        Username is auto-generated when omitted.
+        SSN and password may be supplied but are never returned.
+        Optional HR fields: primary_cost_center_id, employee_num, hire_date, paycode,
+        license_id, level_id, password (none required). Omit or empty → not applied.
+        Provided FK IDs are validated (unknown IDs rejected with 422).
+        division_id, district_id, and group_id must exist and form a valid
+        Division→District→Group hierarchy (unknown or mismatched IDs → 422).
+        When user_role is `employee`, employee permissions are granted automatically.
+      tags:
+      - User
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreate'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '201':
+          description: Created user (SSN never included)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+        '500':
+          $ref: '#/components/responses/Error5xx'
+
+  /ThirdParty/Data/User/Users/{id}:
+    get:
+      summary: Read User by ID
+      description: |
+        Single user by ID. Never returns SSN.
+        Optional `fields[users]` selects a subset of allowlisted columns (JSON:API style).
+        Field names are matched case-insensitively. Omit `fields[users]` for the full
+        allowlisted response. Unknown field names are ignored.
+        If `fields[users]` is provided and none are allowlisted, returns 422.
+        A non-object `fields` value returns 422.
+      tags:
+      - User
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Single user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+      - $ref: '#/components/parameters/fieldsUsers'
+    put:
+      summary: Update User
+      description: |
+        Partial update of a user account.
+        SSN and password may be supplied but are never returned.
+        Optional HR fields: primary_cost_center_id, employee_num, hire_date, paycode,
+        license_id, level_id, password (none required). Omit or empty → leave existing
+        values unchanged. Provided FK IDs are validated (unknown IDs rejected with 422).
+        When any of division_id, district_id, or group_id is sent, the resulting triplet
+        (merged with existing values for omitted fields) must exist and form a valid
+        Division→District→Group hierarchy (unknown or mismatched IDs → 422).
+        Setting `termination_date` also sets `disabled=true` and `status=terminated`.
+      tags:
+      - User
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserWrite'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Updated user (SSN never included)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+        '500':
+          $ref: '#/components/responses/Error5xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+    delete:
+      summary: Delete User
+      description: |
+        Soft-delete a user by setting `disabled` to true.
+      tags:
+      - User
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Soft-deleted user
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - id
+                - disabled
+                properties:
+                  id:
+                    type: integer
+                  disabled:
+                    type: boolean
+                    enum:
+                    - true
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Error4xx'
+        '500':
+          $ref: '#/components/responses/Error5xx'
+      parameters:
+      - $ref: '#/components/parameters/idPath'
+
+  /ThirdParty/Lists/Cad/CallTypes:
+    get:
+      summary: List CallTypes
+      tags:
+      - CAD Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Cad/Companies:
+    get:
+      summary: List Companies
+      tags:
+      - CAD Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Cad/CostCenters:
+    get:
+      summary: List CostCenters
+      tags:
+      - CAD Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Cad/Facilities:
+    get:
+      summary: List Facilities
+      tags:
+      - CAD Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Cad/Mds:
+    get:
+      summary: List Mds
+      tags:
+      - CAD Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Cad/Payors:
+    get:
+      summary: List Payors
+      tags:
+      - CAD Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Cad/Posts:
+    get:
+      summary: List Posts
+      tags:
+      - CAD Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Cad/Priorities:
+    get:
+      summary: List Priorities
+      tags:
+      - CAD Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Cad/Subzones:
+    get:
+      summary: List Subzones
+      tags:
+      - CAD Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Cad/Zones:
+    get:
+      summary: List Zones
+      tags:
+      - CAD Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Fleet/Equipment:
+    get:
+      summary: List Equipment
+      tags:
+      - Fleet Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Fleet/Vehicles:
+    get:
+      summary: List Vehicles
+      tags:
+      - Fleet Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Fleet/Vendors:
+    get:
+      summary: List Vendors
+      tags:
+      - Fleet Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/HumanResources/Certifications:
+    get:
+      summary: List Certifications
+      tags:
+      - HR Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/HumanResources/JobTitles:
+    get:
+      summary: List JobTitles
+      tags:
+      - HR Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Schedule/Radios:
+    get:
+      summary: List Radios
+      tags:
+      - Schedule Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Schedule/ShiftProfiles:
+    get:
+      summary: List ShiftProfiles
+      tags:
+      - Schedule Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/Schedule/Stations:
+    get:
+      summary: List Stations
+      tags:
+      - Schedule Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/User/Employees:
+    get:
+      summary: List Employees
+      tags:
+      - User Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/User/LicenseLevels:
+    get:
+      summary: List LicenseLevels
+      tags:
+      - User Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+  /ThirdParty/Lists/User/Supervisors:
+    get:
+      summary: List Supervisors
+      tags:
+      - User Lists
+      security:
+      - HmacApiKey: []
+        HmacTimestamp: []
+        HmacNonce: []
+        HmacAuthorization: []
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '429':
+          $ref: '#/components/responses/RateLimit429'
+        '200':
+          description: Paginated lookup
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsPaginatedResponse'
+      parameters:
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/rows'
+      - $ref: '#/components/parameters/search'
+components:
+  securitySchemes:
+    HmacApiKey:
+      type: apiKey
+      in: header
+      name: X-TS-APIKEY
+      description: Configured API Key.
+    HmacTimestamp:
+      type: apiKey
+      in: header
+      name: X-TS-TIMESTAMP
+      description: Current UNIX timestamp (valid for 300 seconds).
+    HmacNonce:
+      type: apiKey
+      in: header
+      name: X-TS-ID
+      description: Randomly generated number for every request.
+    HmacAuthorization:
+      type: apiKey
+      in: header
+      name: X-TS-AUTHORIZATION
+      description: >
+        This is the generated hmac hash.
+        Default (most endpoints): hash_hmac('sha256', $requestBody . $timestamp . $randNum, $secret).
+        Alternate (GPS Geofence / legacy): hash_hmac('sha256', $apiKey, $timestamp . $secret . $randNum).
+
+  parameters:
+    page:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    rows:
+      name: rows
+      in: query
+      schema:
+        type: integer
+        minimum: 0
+      description: Page size. Omit or 0 to return all (where supported).
+    search:
+      name: search
+      in: query
+      schema:
+        type: string
+      description: Name search (Lists).
+    nameFilter:
+      name: name
+      in: query
+      schema:
+        type: string
+      description: Name filter.
+    companyIdFilter:
+      name: company_id
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+      description: |
+        Exact match on `ibd_facilities.company_id`.
+        Must be a positive integer when provided; otherwise the API returns 422.
+        Resolve via GET /ThirdParty/Lists/Cad/Companies.
+    includeDeleted:
+      name: include_deleted
+      in: query
+      schema:
+        type: boolean
+        default: false
+    includeDisabled:
+      name: include_disabled
+      in: query
+      schema:
+        type: boolean
+        default: false
+    fieldsUsers:
+      name: fields[users]
+      in: query
+      required: false
+      schema:
+        oneOf:
+          - type: string
+          - type: array
+            items:
+              type: string
+      description: |
+        Optional allowlisted user fields (JSON:API style). Supported shapes:
+        - comma-separated string: `fields[users]=id,first_name,last_name`
+        - repeated array form: `fields[users][]=id&fields[users][]=first_name`
+        Field names are matched case-insensitively against the allowlist.
+        Omit for the full allowlisted response.
+        Unknown names are silently ignored.
+        If provided and none match the allowlist, the API returns 422.
+        If `fields` is sent but is not an object (e.g. a bare string), the API returns 422.
+        Allowlisted: id, username, first_name, last_name, email, user_role, status,
+        division_id, district_id, group_id.
+    fieldsFacilities:
+      name: fields[facilities]
+      in: query
+      required: false
+      schema:
+        oneOf:
+          - type: string
+          - type: array
+            items:
+              type: string
+      description: |
+        Optional allowlisted facility fields (JSON:API style). Supported shapes:
+        - comma-separated string: `fields[facilities]=facility_id,name,city`
+        - repeated array form: `fields[facilities][]=facility_id&fields[facilities][]=name`
+        Field names are matched case-insensitively against the allowlist.
+        Omit for the full allowlisted response.
+        Unknown names are silently ignored.
+        If provided and none match the allowlist, the API returns 422.
+        If `fields` is sent but is not an object (e.g. a bare string), the API returns 422.
+        Allowlisted: facility_id, company_id, facility_type_id, name, dba, abbv, address1,
+        address2, city, state, zipcode, county_code, phone, fax_number, email, lat, lon,
+        default_zone_id, default_subzone_id, default_dispatch_subzone_id, external_code,
+        npi, disabled, deleted.
+    fieldsVehicles:
+      name: fields[vehicles]
+      in: query
+      required: false
+      schema:
+        oneOf:
+          - type: string
+          - type: array
+            items:
+              type: string
+      description: |
+        Optional allowlisted vehicle fields (JSON:API style). Supported shapes:
+        - comma-separated string: `fields[vehicles]=id,name,vin`
+        - repeated array form: `fields[vehicles][]=id&fields[vehicles][]=name`
+        Field names are matched case-insensitively against the allowlist.
+        Omit for the full allowlisted response.
+        Unknown names are silently ignored.
+        If provided and none match the allowlist, the API returns 422.
+        If `fields` is sent but is not an object (e.g. a bare string), the API returns 422.
+        On List, `id` is always selected for the paginator row key and stripped from the
+        response when not requested. On Read, `id` is selected only when requested or when
+        enrichment fields require it (then stripped if not requested).
+        Allowlisted SQL: id, name, vehicle_status, vin, odometer, disabled, deleted.
+        Allowlisted enrichment: shift_name, trip_status, trip_timestamp, post_id,
+        post_status, post_timestamp.
+        Enrichment is returned only when those names are requested (or fields omitted).
+        When fields are omitted: List returns all enrichment keys; Read returns only
+        shift_name, trip_status, and post_status (legacy shape).
+    fieldsPayors:
+      name: fields[payors]
+      in: query
+      required: false
+      schema:
+        oneOf:
+          - type: string
+          - type: array
+            items:
+              type: string
+      description: |
+        Optional allowlisted payor fields (JSON:API style). Supported shapes:
+        - comma-separated string: `fields[payors]=id,name,system_type`
+        - repeated array form: `fields[payors][]=id&fields[payors][]=name`
+        Field names are matched case-insensitively against the allowlist.
+        Omit for the full allowlisted response.
+        Unknown names are silently ignored.
+        If provided and none match the allowlist, the API returns 422.
+        If `fields` is sent but is not an object (e.g. a bare string), the API returns 422.
+        On List, `id` is always selected for the paginator row key and stripped from the
+        response when not requested. On Read, `id` is selected only when requested.
+        Allowlisted: id, quick_code, name, billing_desc, address1, address2, city, state,
+        zipcode, phone, fax, email, facility_id, category, system_type, default_source,
+        primary_schedule, secondary_schedule, fee_schedule.
+    includeInactive:
+      name: include_inactive
+      in: query
+      schema:
+        type: boolean
+        default: false
+    idPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+    rtype:
+      name: rtype
+      in: query
+      required: true
+      schema:
+        type: string
+  responses:
+    Unauthorized401:
+      description: Missing or invalid HMAC authentication.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: Unauthorized
+            errors:
+              auth: Missing or invalid HMAC headers
+    RateLimit429:
+      description: >
+        Rate limit exceeded when per-API-key limiting is enabled
+        (typically 100 reads/min or 50 writes/min). Clients should back off and retry.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Suggested seconds to wait before retrying (commonly 60).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: Rate limit exceeded
+            errors:
+              rate_limit: Too many requests. Retry after 60 seconds.
+    Error4xx:
+      description: Validation or business error (typically 400 or 422).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            validationError:
+              summary: Validation error (422)
+              value:
+                message: Facility ID required
+                errors: {}
+            badRequest:
+              summary: Bad request (400)
+              value:
+                message: "Parameter 'rows' must be sent and cannot be larger than 1000 rows."
+                errors: {}
+    Error5xx:
+      description: Unexpected server error. Details are logged server-side; the client message is generic.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: Failed to create vehicle
+            errors: {}
+    NotFound404:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: Facility not found
+            errors: {}
+  schemas:
+    AttachmentType:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+    AttachmentUploadFile:
+      type: object
+      required:
+      - file_data
+      - file_name
+      - mime_type
+      properties:
+        file_data:
+          type: string
+          description: Base64-encoded file contents.
+        file_name:
+          type: string
+          description: Filename (alphanumeric, underscore, dot, hyphen after sanitize).
+        mime_type:
+          type: string
+          example: image/jpeg
+        type_id:
+          type: integer
+          description: Attachment type. Resolve via GET /ThirdParty/Data/Attachments?rtype=GetTypes. Falls back to CAD auto_attachment_type when omitted.
+        cad_leg_id:
+          type: integer
+          description: CAD trip leg id. No partner List lookup; obtain from trip/leg responses (e.g. Trip GetTrips / GetByOrigin). One of cad_leg_id, epcr_run_id, cad_run_number, or epcr_run_number is required.
+        epcr_run_id:
+          type: integer
+          description: Internal ePCR run id (no partner Data/Lists lookup in this spec).
+        cad_run_number:
+          type: string
+          description: Format RUNNUMBER-YY (e.g. 123456-26).
+        epcr_run_number:
+          type: string
+    BillingSchedule:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+    CallType:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        shortname:
+          type: string
+        deleted:
+          type: string
+    CancelReason:
+      type: object
+      properties:
+        cancel_reason_id:
+          type: integer
+        name:
+          type: string
+        reason:
+          type: string
+        disabled:
+          type: string
+    CustomStatus:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+          description: Value from `vm_custom_status.status`
+        notify_group:
+          type: string
+          description: Domain key for this status (e.g. vehicles, equipment, vendors, work_orders).
+    Department:
+      type: object
+      properties:
+        dept_id:
+          type: integer
+        facility_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Facilities.
+        facility_type_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/FacilityTypes.
+        dept:
+          type: string
+        phone:
+          type: string
+        fax:
+          type: string
+        email:
+          type: string
+        note:
+          type: string
+        deleted:
+          type: string
+    EarningCode:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+          description: Display label (`sched_earning_codes.description`).
+        user_defined_code:
+          type: string
+        type:
+          type: string
+    Employee:
+      type: object
+      properties:
+        user_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/User/Employees or Lists/User/Employees.
+        employee_num:
+          type: string
+        first_name:
+          type: string
+        last_name:
+          type: string
+        middle_name:
+          type: string
+        mobile_phone:
+          type: string
+        home_phone:
+          type: string
+        office_phone:
+          type: string
+        email_address:
+          type: string
+        hire_date:
+          type: string
+        termination_date:
+          type: string
+          nullable: true
+          format: date
+        paycode:
+          type: string
+        division:
+          type: string
+        license_level:
+          type: string
+        level:
+          type: string
+        med_num:
+          type: string
+        manager_id:
+          type: integer
+          description: Supervisor user_id. Resolve via GET /ThirdParty/Lists/User/Supervisors or Lists/User/Employees.
+        manager_first_name:
+          type: string
+        manager_last_name:
+          type: string
+        manager_email:
+          type: string
+        deactivated:
+          type: string
+        status:
+          type: string
+        cost_center_name:
+          type: string
+        station:
+          type: string
+        driver_lic_num:
+          type: string
+        user_name:
+          type: string
+        date_disabled:
+          type: string
+          nullable: true
+          format: date
+        disabled:
+          type: boolean
+        medical_license:
+          type: array
+          items:
+            type: string
+          description: med_num plus EPCR submit cert numbers.
+    EmployeeLevel:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+    ErrorResponse:
+      type: object
+      properties:
+        message:
+          type: string
+        errors:
+          type: object
+          additionalProperties: true
+      required:
+      - message
+    Facility:
+      type: object
+      description: |
+        When `fields[facilities]` is omitted, all allowlisted properties below are returned.
+        When `fields[facilities]` is provided, only the requested allowlisted properties are
+        present (other properties are omitted from the response object).
+      properties:
+        facility_id:
+          type: integer
+        company_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Lists/Cad/Companies.
+        facility_type_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/FacilityTypes.
+        name:
+          type: string
+        dba:
+          type: string
+        abbv:
+          type: string
+        address1:
+          type: string
+        address2:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        zipcode:
+          type: string
+        county_code:
+          type: string
+        phone:
+          type: string
+        fax_number:
+          type: string
+        email:
+          type: string
+        lat:
+          type: number
+        lon:
+          type: number
+        default_zone_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Zones.
+        default_subzone_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Subzones.
+        default_dispatch_subzone_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Subzones.
+        external_code:
+          type: string
+        npi:
+          type: string
+        disabled:
+          type: string
+        deleted:
+          type: string
+    FacilityCreate:
+      type: object
+      required:
+      - name
+      properties:
+        name:
+          type: string
+        company_id:
+          type: integer
+          description: Optional. Resolve via GET /ThirdParty/Lists/Cad/Companies.
+        facility_type_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/FacilityTypes.
+        dba:
+          type: string
+        abbv:
+          type: string
+        address1:
+          type: string
+        address2:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        zipcode:
+          type: string
+        county_code:
+          type: string
+        country:
+          type: string
+        phone:
+          type: string
+        fax_number:
+          type: string
+        email:
+          type: string
+        lat:
+          type: number
+        lon:
+          type: number
+        default_zone_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Zones.
+        default_subzone_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Subzones.
+        default_dispatch_subzone_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Subzones.
+        external_code:
+          type: string
+          description: Maps to `ibd_facilities.zoll_code`.
+        npi:
+          type: string
+        disabled:
+          type: boolean
+        contract_payor:
+          type: string
+          description: >
+            Optional. If a FACILITY_CONTRACT CadPayors row with this name already
+            exists, attach it (set facility.payor_id only; primary_schedule_id not
+            required) unless that payor is already linked to another facility (422).
+            Otherwise create a new FACILITY_CONTRACT and require primary_schedule_id.
+        primary_schedule_id:
+          type: integer
+          description: >
+            Required when contract_payor creates a new payor (name not found as
+            FACILITY_CONTRACT). Must reference an existing billing schedule
+            (resolve via GET /ThirdParty/Data/Billing/Schedules); unknown ids
+            return 422. Not required when attaching an existing facility contract.
+    FacilityWrite:
+      type: object
+      properties:
+        name:
+          type: string
+        company_id:
+          type: integer
+          description: Optional. Resolve via GET /ThirdParty/Lists/Cad/Companies.
+        facility_type_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/FacilityTypes.
+        dba:
+          type: string
+        abbv:
+          type: string
+        address1:
+          type: string
+        address2:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        zipcode:
+          type: string
+        county_code:
+          type: string
+        country:
+          type: string
+        phone:
+          type: string
+        fax_number:
+          type: string
+        email:
+          type: string
+        lat:
+          type: number
+        lon:
+          type: number
+        default_zone_id:
+          type: integer
+        default_subzone_id:
+          type: integer
+        default_dispatch_subzone_id:
+          type: integer
+        external_code:
+          type: string
+        npi:
+          type: string
+        disabled:
+          type: boolean
+        contract_payor:
+          type: string
+          description: >
+            When linked payor already has facility_id set, sending contract_payor
+            to replace/rebind returns 422. Otherwise: attach existing FACILITY_CONTRACT
+            by name, or create a new one (requires primary_schedule_id). Facility-only
+            updates (without contract_payor) still sync an existing specific contract.
+            Existing facility-contract payors are never mutated on attach.
+        primary_schedule_id:
+          type: integer
+          description: >
+            Required when contract_payor creates a new payor. Not required when
+            attaching an existing FACILITY_CONTRACT by name. Must reference an
+            existing billing schedule; unknown ids return 422.
+    FacilityWriteResponse:
+      allOf:
+      - $ref: '#/components/schemas/Facility'
+      - type: object
+        description: |
+          Create/Update response matches List allowlisted columns plus `payor_id`.
+          `disabled` and `deleted` remain string enum values (`"0"` / `"1"`) as in List/Read.
+        properties:
+          payor_id:
+            type: integer
+            nullable: true
+            description: Linked CadPayors id when a facility contract payor exists.
+    FacilityType:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        modifier:
+          type: string
+        deleted:
+          type: string
+    FeeSchedule:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+    JqGridPaginatorResponse:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            type: object
+        page:
+          type: integer
+        total:
+          type: integer
+        records:
+          type: integer
+    LevelOfService:
+      type: object
+      properties:
+        id:
+          type: integer
+        call_type_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/CallTypes.
+        name:
+          type: string
+        abbr:
+          type: string
+        rank:
+          type: integer
+        deleted:
+          type: string
+        is_emergency:
+          type: string
+    ListItem:
+      type: object
+      properties:
+        id:
+          oneOf:
+          - type: integer
+          - type: string
+        name:
+          type: string
+      required:
+      - id
+      - name
+    ListsPaginatedResponse:
+      allOf:
+      - $ref: '#/components/schemas/PaginatorResponse'
+      - type: object
+        properties:
+          rows:
+            type: array
+            items:
+              $ref: '#/components/schemas/ListItem'
+    Nature:
+      type: object
+      properties:
+        nature_id:
+          type: integer
+        name:
+          type: string
+        los_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/LevelOfService.
+        calltype_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/CallTypes.
+        priority_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Priorities.
+        transport_priority_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Priorities.
+        deleted:
+          type: string
+    OrganizationGroup:
+      type: object
+      required:
+        - division_id
+        - division
+        - district_id
+        - district
+        - group_id
+        - group
+        - cost_center_ids
+      properties:
+        division_id:
+          type: integer
+          example: 1
+        division:
+          type: string
+          example: Division Name
+        district_id:
+          type: integer
+          example: 2
+        district:
+          type: string
+          example: District Name
+        group_id:
+          type: integer
+          example: 3
+        group:
+          type: string
+          example: Group Name
+        cost_center_ids:
+          type: array
+          items:
+            type: integer
+          example: [10, 11, 12]
+    PaginatorResponse:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            type: object
+        current_page:
+          type: integer
+        total_pages:
+          type: integer
+        total_records:
+          type: integer
+    Patient:
+      type: object
+      properties:
+        patient_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Patients.
+        last_name:
+          type: string
+        first_name:
+          type: string
+        middle_name:
+          type: string
+        suffix:
+          type: string
+        gender:
+          type: string
+        dob:
+          type: string
+        mrn:
+          type: string
+        facility_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Facilities.
+        address1:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        zipcode:
+          type: string
+        phone:
+          type: string
+        email:
+          type: string
+        comments:
+          type: string
+        dispatch_notes:
+          type: string
+    PayType:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+    Payor:
+      type: object
+      properties:
+        id:
+          type: integer
+        quick_code:
+          type: string
+        name:
+          type: string
+        billing_desc:
+          type: string
+        address1:
+          type: string
+        address2:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        zipcode:
+          type: string
+        phone:
+          type: string
+        fax:
+          type: string
+        email:
+          type: string
+        facility_id:
+          type: integer
+          nullable: true
+          description: Resolve via GET /ThirdParty/Data/Cad/Facilities or Lists/Cad/Facilities. May be null.
+        category:
+          type: string
+          nullable: true
+        system_type:
+          type: string
+        default_source:
+          type: string
+          nullable: true
+        primary_schedule:
+          type: string
+        secondary_schedule:
+          type: string
+          nullable: true
+        fee_schedule:
+          type: string
+          nullable: true
+    PayorCreate:
+      type: object
+      required:
+      - name
+      - system_type
+      - primary_schedule_id
+      - address1
+      - city
+      - state
+      - zipcode
+      properties:
+        name:
+          type: string
+        billing_desc:
+          type: string
+          description: Defaults to `name` when omitted.
+        quick_code:
+          type: string
+        system_type:
+          type: integer
+          description: |
+            CadPayorSystemTypes id. Allowed: 1 MEDICARE, 2 MEDICAID, 3 INSURANCE,
+            4 FACILITY_CONTRACT, 6 PRIVATE_PAY. BILL_PATIENT (5) is rejected (422).
+        primary_schedule_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Billing/Schedules.
+        secondary_schedule_id:
+          type: integer
+          description: Must exist when provided. Resolve via GET /ThirdParty/Data/Billing/Schedules.
+        fee_schedule_id:
+          type: integer
+          description: Must exist when provided. Resolve via GET /ThirdParty/Data/Billing/FeeSchedules.
+        category_id:
+          type: integer
+          description: Must exist when provided. Resolve via GET /ThirdParty/Data/Billing/PayorCategories.
+        default_source:
+          type: integer
+          description: Required when system_type is INSURANCE (3). Must exist when provided.
+        facility_id:
+          type: integer
+          description: |
+            Required when system_type is FACILITY_CONTRACT (4). Must exist.
+            Rejected (422) when the facility is already linked to a different payor.
+        payment_rate:
+          type: integer
+          minimum: 1
+          maximum: 100
+          description: Defaults to 100 when omitted.
+        address1:
+          type: string
+        address2:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        zipcode:
+          type: string
+        country:
+          type: string
+        phone:
+          type: string
+        fax:
+          type: string
+        email:
+          type: string
+        medicare_part:
+          type: string
+        require_zip_plus_four_pickup:
+          type: boolean
+          description: Dropoff flag is always set to the same value.
+    PayorWrite:
+      type: object
+      properties:
+        name:
+          type: string
+        billing_desc:
+          type: string
+        quick_code:
+          type: string
+        system_type:
+          type: integer
+        primary_schedule_id:
+          type: integer
+        secondary_schedule_id:
+          type: integer
+        fee_schedule_id:
+          type: integer
+        category_id:
+          type: integer
+        default_source:
+          type: integer
+        facility_id:
+          type: integer
+        payment_rate:
+          type: integer
+          minimum: 1
+          maximum: 100
+        address1:
+          type: string
+        address2:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        zipcode:
+          type: string
+        country:
+          type: string
+        phone:
+          type: string
+        fax:
+          type: string
+        email:
+          type: string
+        medicare_part:
+          type: string
+        require_zip_plus_four_pickup:
+          type: boolean
+        inactive:
+          type: boolean
+    PayorWriteResponse:
+      allOf:
+      - $ref: '#/components/schemas/Payor'
+      - type: object
+        description: |
+          Create/Update response matches List allowlisted columns plus writable IDs/flags.
+        properties:
+          system_type_id:
+            type: integer
+            nullable: true
+          primary_schedule_id:
+            type: integer
+            nullable: true
+          secondary_schedule_id:
+            type: integer
+            nullable: true
+          fee_schedule_id:
+            type: integer
+            nullable: true
+          category_id:
+            type: integer
+            nullable: true
+          default_source_id:
+            type: integer
+            nullable: true
+          payment_rate:
+            type: integer
+            nullable: true
+          require_zip_plus_four_pickup:
+            type: integer
+            nullable: true
+          require_zip_plus_four_dropoff:
+            type: integer
+            nullable: true
+          inactive:
+            type: integer
+            nullable: true
+    PayorCategory:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+    Priority:
+      type: object
+      properties:
+        priority_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Priorities.
+        name:
+          type: string
+        short_name:
+          type: string
+        deleted:
+          type: string
+    Shift:
+      type: object
+      properties:
+        id:
+          type: integer
+        user_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/User/Employees or Lists/User/Employees.
+        license_level:
+          type: string
+        division:
+          type: string
+        district:
+          type: string
+        shift_name:
+          type: string
+        vehicle_name:
+          type: string
+        start_time:
+          type: string
+        end_time:
+          type: string
+        deleted:
+          type: boolean
+        punches:
+          type: array
+          items:
+            $ref: '#/components/schemas/ShiftPunch'
+    ShiftPunch:
+      type: object
+      properties:
+        id:
+          type: integer
+        start_time:
+          type: string
+        end_time:
+          type: string
+          nullable: true
+        deleted:
+          type: boolean
+    SsnField:
+      type: string
+      writeOnly: true
+      description: "Write-only SSN \u2014 never returned on GET/list."
+    Subzone:
+      type: object
+      properties:
+        subzone_id:
+          type: integer
+        name:
+          type: string
+        zone_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Zones.
+        order:
+          type: integer
+        disabled:
+          type: string
+        deleted:
+          type: string
+    Timestamp:
+      type: object
+      properties:
+        timestamp_id:
+          type: integer
+        name:
+          type: string
+        type:
+          type: string
+        deleted:
+          type: string
+    TripByOrigin:
+      type: object
+      properties:
+        call_id:
+          type: integer
+        deleted:
+          type: string
+        converted_to_trip:
+          type: string
+        hold:
+          type: string
+        external_code:
+          type: string
+        company_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Lists/Cad/Companies.
+        trip_date:
+          type: string
+          format: date
+        pickup_time:
+          type: string
+        trip_id:
+          type: integer
+        trip_number:
+          type: string
+        created:
+          type: string
+        origin:
+          type: string
+        id:
+          type: integer
+          description: Trip leg id.
+        run_number:
+          type: string
+        pu_lat:
+          type: number
+        pu_lon:
+          type: number
+        do_lat:
+          type: number
+        do_lon:
+          type: number
+        rev:
+          type: integer
+        leg:
+          type: integer
+        trip_status:
+          type: integer
+        vehicle_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Fleet/Vehicles or Lists/Fleet/Vehicles.
+        comments:
+          type: string
+        last_status_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Timestamps.
+        assigned_time:
+          type: string
+        acknowledged_time:
+          type: string
+        enroute_time:
+          type: string
+        at_scene_time:
+          type: string
+        transporting_time:
+          type: string
+        at_destination_time:
+          type: string
+        clear_time:
+          type: string
+        canceled_time:
+          type: string
+        mileage:
+          type: number
+        odometer_enroute:
+          type: number
+        odometer_at_scene:
+          type: number
+        odometer_at_destination:
+          type: number
+        calltype_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/CallTypes.
+        priority_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Priorities.
+        canceled_reason:
+          type: string
+        pu_facility_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Facilities or Lists/Cad/Facilities.
+        pu_facility_name:
+          type: string
+        pu_department_id:
+          type: integer
+        pu_address1:
+          type: string
+        pu_address2:
+          type: string
+        pu_city:
+          type: string
+        pu_state:
+          type: string
+        pu_zipcode:
+          type: string
+        pu_is_residence:
+          type: string
+        do_facility_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Facilities or Lists/Cad/Facilities.
+        do_facility_name:
+          type: string
+        do_department_id:
+          type: integer
+        do_address1:
+          type: string
+        do_address2:
+          type: string
+        do_city:
+          type: string
+        do_state:
+          type: string
+        do_zipcode:
+          type: string
+        do_is_residence:
+          type: string
+        incident_number:
+          type: string
+        shift_name:
+          type: string
+        vehicle_name:
+          type: string
+        vehicle_lat:
+          type: number
+          nullable: true
+        vehicle_lon:
+          type: number
+          nullable: true
+    TripLateReason:
+      type: object
+      properties:
+        reason:
+          type: string
+        status:
+          type: string
+        status_timestamp:
+          type: string
+          nullable: true
+    TripLegSummary:
+      type: object
+      properties:
+        leg_id:
+          type: integer
+          description: CAD trip leg id.
+        run_number:
+          type: string
+        trip_status:
+          type: string
+        call_type:
+          type: string
+        los:
+          type: string
+        pickup_time:
+          type: string
+        appt_time:
+          type: string
+        eta_time:
+          type: string
+        pu_facility_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Facilities or Lists/Cad/Facilities.
+        pu_facility_name:
+          type: string
+        pu_address1:
+          type: string
+        pu_address2:
+          type: string
+        pu_city:
+          type: string
+        pu_state:
+          type: string
+        pu_zipcode:
+          type: string
+        do_facility_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Facilities or Lists/Cad/Facilities.
+        do_facility_name:
+          type: string
+        do_address1:
+          type: string
+        do_address2:
+          type: string
+        do_city:
+          type: string
+        do_state:
+          type: string
+        do_zipcode:
+          type: string
+        vehicle_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Fleet/Vehicles or Lists/Fleet/Vehicles.
+        zone:
+          type: string
+        response_subzone:
+          type: string
+        dispatch_subzone:
+          type: string
+        patient_mrn:
+          type: string
+        patient_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Patients.
+        patient_first_name:
+          type: string
+        patient_middle_name:
+          type: string
+        patient_last_name:
+          type: string
+        nature:
+          type: string
+        reason_for_transport:
+          type: string
+        response_priority:
+          type: string
+        transport_priority:
+          type: string
+        dispatch_notes:
+          type: string
+        pu_lat:
+          type: number
+        pu_lon:
+          type: number
+        do_lat:
+          type: number
+        do_lon:
+          type: number
+        pu_phone:
+          type: string
+        do_phone:
+          type: string
+        requested_pickup_time:
+          type: string
+        deleted:
+          type: string
+        external_reference:
+          type: string
+        incident_number:
+          type: string
+        trip_number:
+          type: string
+        company_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Lists/Cad/Companies.
+        rev:
+          type: integer
+        shift_name:
+          type: string
+        vehicle_name:
+          type: string
+        created:
+          type: string
+        origin:
+          type: string
+        timezone:
+          type: string
+        pickup_eta:
+          type: string
+          nullable: true
+        dropoff_eta:
+          type: string
+          nullable: true
+        vehicle_lat:
+          type: number
+          nullable: true
+        vehicle_lon:
+          type: number
+          nullable: true
+        timestamps:
+          type: array
+          items:
+            type: object
+            additionalProperties:
+              type: string
+          description: Ordered status/special-status name → ISO-8601 time maps.
+        late_reasons:
+          type: array
+          items:
+            $ref: '#/components/schemas/TripLateReason'
+    User:
+      type: object
+      description: |
+        User account. Never includes SSN.
+        When `fields[users]` is omitted, all allowlisted properties below are returned.
+        When `fields[users]` is provided, only the requested allowlisted properties are present
+        (other properties are omitted from the response object).
+      properties:
+        id:
+          type: integer
+        username:
+          type: string
+          nullable: true
+        first_name:
+          type: string
+          nullable: true
+        last_name:
+          type: string
+          nullable: true
+        email:
+          type: string
+          nullable: true
+        user_role:
+          $ref: '#/components/schemas/UserRole'
+        status:
+          type: string
+          nullable: true
+          enum:
+          - active
+          - LOA
+          - terminated
+          - applicant
+        division_id:
+          type: integer
+          nullable: true
+        district_id:
+          type: integer
+          nullable: true
+        group_id:
+          type: integer
+          nullable: true
+        employee_num:
+          type: string
+          nullable: true
+        hire_date:
+          type: string
+          format: date
+          nullable: true
+        paycode:
+          type: integer
+          nullable: true
+          description: sched_paycodes.id
+        license_id:
+          type: integer
+          nullable: true
+          description: users.employee_licensure / admin license_id
+        level_id:
+          type: integer
+          nullable: true
+          description: users.employee_level / admin level_id
+        primary_cost_center_id:
+          type: integer
+          nullable: true
+          description: Present on create/update when primary cost center was set in that request.
+    UserCreate:
+      type: object
+      required:
+      - first_name
+      - last_name
+      - user_role
+      - division_id
+      - district_id
+      - group_id
+      properties:
+        username:
+          type: string
+        first_name:
+          type: string
+        last_name:
+          type: string
+        email:
+          type: string
+          description: Optional. Must be unique when provided; duplicate → 422.
+        user_role:
+          $ref: '#/components/schemas/UserRole'
+        status:
+          type: string
+          enum:
+          - active
+          - LOA
+          - terminated
+          - applicant
+        division_id:
+          type: integer
+          description: >
+            Must exist and form a valid Division→District→Group hierarchy with
+            district_id and group_id.
+        district_id:
+          type: integer
+          description: >
+            Must exist and form a valid Division→District→Group hierarchy with
+            division_id and group_id.
+        group_id:
+          type: integer
+          description: >
+            Must exist and form a valid Division→District→Group hierarchy with
+            division_id and district_id.
+        ssn:
+          $ref: '#/components/schemas/SsnField'
+        termination_date:
+          type: string
+          format: date
+          description: >
+            yyyy-MM-dd on the wire. Stored as a Unix timestamp.
+            When set, also forces disabled=true and status=terminated.
+            Send an empty string to clear termination_date. When the user was
+            terminated that way (had a termination date and/or status=terminated),
+            also sets disabled=false and status=active. Does not re-enable users
+            who were only soft-deleted via DELETE.
+        primary_cost_center_id:
+          type: integer
+          description: >
+            Optional. Must exist in cost_centers (not deleted). Sets cost_centers_users
+            primary after create (PF-1251 Organization for IDs). Omit/empty → not applied.
+        employee_num:
+          type: string
+          maxLength: 45
+          description: Optional. Unique employee number. Omit/empty → not applied.
+        hire_date:
+          type: string
+          format: date
+          description: Optional. yyyy-MM-dd; stored on users.hire_date. Omit/empty → not applied.
+        paycode:
+          type: integer
+          description: >
+            Optional. Must exist in sched_paycodes (not deleted). No Paycodes list API in v1.
+            Omit/empty → not applied.
+        license_id:
+          type: integer
+          description: >
+            Optional. Must exist in menu_emp_licensure (admin intake `license_id`).
+            From Lists/User/LicenseLevels composite id `licenseId_levelId`, use the left half.
+            When both license_id and level_id are sent, the pair must exist in
+            menu_emp_licensurelevel. Omit/empty → not applied.
+        level_id:
+          type: integer
+          description: >
+            Optional. Must exist in menu_emp_level (admin intake `level_id`).
+            From Lists/User/LicenseLevels composite id `licenseId_levelId`, use the right half.
+            When both license_id and level_id are sent, the pair must exist in
+            menu_emp_licensurelevel. Omit/empty → not applied.
+        password:
+          type: string
+          writeOnly: true
+          maxLength: 128
+          description: Optional write-only. When omitted, a random unusable password is set.
+    UserRole:
+      type: string
+      enum:
+      - employee
+      - administrator
+      - user
+      - external
+    UserWrite:
+      type: object
+      properties:
+        username:
+          type: string
+        first_name:
+          type: string
+        last_name:
+          type: string
+        email:
+          type: string
+          description: Optional. Must be unique when provided; duplicate → 422.
+        user_role:
+          $ref: '#/components/schemas/UserRole'
+        status:
+          type: string
+          enum:
+          - active
+          - LOA
+          - terminated
+          - applicant
+        division_id:
+          type: integer
+          description: >
+            When any org ID is sent, the resulting triplet (merged with existing
+            values) must form a valid Division→District→Group hierarchy.
+        district_id:
+          type: integer
+          description: >
+            When any org ID is sent, the resulting triplet (merged with existing
+            values) must form a valid Division→District→Group hierarchy.
+        group_id:
+          type: integer
+          description: >
+            When any org ID is sent, the resulting triplet (merged with existing
+            values) must form a valid Division→District→Group hierarchy.
+        ssn:
+          $ref: '#/components/schemas/SsnField'
+        termination_date:
+          type: string
+          format: date
+          description: >
+            yyyy-MM-dd on the wire. Stored as a Unix timestamp.
+            When set, also forces disabled=true and status=terminated.
+            Send an empty string to clear termination_date. When the user was
+            terminated that way (had a termination date and/or status=terminated),
+            also sets disabled=false and status=active. Does not re-enable users
+            who were only soft-deleted via DELETE.
+        primary_cost_center_id:
+          type: integer
+          description: >
+            Optional. Must exist in cost_centers (not deleted). Omit/empty → leave existing.
+        employee_num:
+          type: string
+          maxLength: 45
+          description: Optional. Unique. Omit/empty → leave existing.
+        hire_date:
+          type: string
+          format: date
+          description: Optional. yyyy-MM-dd. Omit/empty → leave existing (does not clear).
+        paycode:
+          type: integer
+          description: >
+            Optional. Must exist in sched_paycodes (not deleted). Omit/empty → leave existing.
+        license_id:
+          type: integer
+          description: >
+            Optional. Must exist in menu_emp_licensure. When both license_id and level_id
+            are sent, pair must exist in menu_emp_licensurelevel. Omit/empty → leave existing.
+        level_id:
+          type: integer
+          description: >
+            Optional. Must exist in menu_emp_level. When both license_id and level_id
+            are sent, pair must exist in menu_emp_licensurelevel. Omit/empty → leave existing.
+        password:
+          type: string
+          writeOnly: true
+          maxLength: 128
+          description: Optional write-only. Omit to leave existing password unchanged.
+    Vehicle:
+      type: object
+      description: |
+        Vehicle row as returned by List (default) and Read.
+        List default shape includes SQL columns plus live-shift enrichment.
+        Read omits some enrichment keys unless requested via `fields[vehicles]`.
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        vehicle_status:
+          type: string
+        vin:
+          type: string
+        odometer:
+          type: number
+        shift_name:
+          type: string
+        trip_status:
+          type: string
+        trip_timestamp:
+          type: string
+          nullable: true
+        post_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Lists/Cad/Posts.
+          nullable: true
+        post_status:
+          type: string
+          nullable: true
+        post_timestamp:
+          type: string
+          nullable: true
+        disabled:
+          type: boolean
+        deleted:
+          type: boolean
+    VehicleCreate:
+      type: object
+      required:
+      - name
+      - division_id
+      - district_id
+      - group_id
+      properties:
+        name:
+          type: string
+        vin:
+          type: string
+          description: Must be unique when supplied.
+        odometer:
+          type: integer
+          minimum: 0
+        disabled:
+          type: boolean
+        status:
+          type: integer
+          description: Custom vehicle status id (`vm_custom_status.id`).
+        division_id:
+          type: integer
+        district_id:
+          type: integer
+        group_id:
+          type: integer
+        make:
+          type: string
+        model:
+          type: string
+        year:
+          type: integer
+        color:
+          type: string
+        plate:
+          type: string
+    VehicleWrite:
+      type: object
+      properties:
+        name:
+          type: string
+        vin:
+          type: string
+          description: Must be unique when supplied.
+        odometer:
+          type: integer
+          minimum: 0
+        disabled:
+          type: boolean
+        status:
+          type: integer
+          description: Custom vehicle status id (`vm_custom_status.id`).
+        division_id:
+          type: integer
+        district_id:
+          type: integer
+        group_id:
+          type: integer
+        make:
+          type: string
+        model:
+          type: string
+        year:
+          type: integer
+        color:
+          type: string
+        plate:
+          type: string
+    VehicleWriteResponse:
+      allOf:
+      - $ref: '#/components/schemas/Vehicle'
+      - type: object
+        description: |
+          Create/Update response — List fields plus writable payload fields.
+        properties:
+          status:
+            type: integer
+            nullable: true
+            description: Custom vehicle status id (`vm_custom_status.id`).
+          division_id:
+            type: integer
+            nullable: true
+          district_id:
+            type: integer
+            nullable: true
+          group_id:
+            type: integer
+            nullable: true
+          make:
+            type: string
+            nullable: true
+          model:
+            type: string
+            nullable: true
+          year:
+            type: integer
+            nullable: true
+          color:
+            type: string
+            nullable: true
+          plate:
+            type: string
+            nullable: true
+    Zone:
+      type: object
+      properties:
+        zone_id:
+          type: integer
+          description: Resolve via GET /ThirdParty/Data/Cad/Zones.
+        name:
+          type: string
+        order:
+          type: integer
+        disabled:
+          type: string
+        deleted:
+          type: string

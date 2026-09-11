@@ -23,6 +23,7 @@ os.environ.setdefault("PAYCOR_ACCESS_TOKEN", "test-access-token")
 os.environ.setdefault("PAYCOR_LEGAL_ENTITY_ID", "LE-1")
 
 import paycor_api
+import paycor_api as PA
 from paycor_api import PaycorClient, PaycorReadOnlyError, describe_write_contract
 
 import probe_punch_quality as PQ
@@ -227,39 +228,74 @@ check("a duplicate employee_num is caught", dupes["duplicate_employee_num"] == 1
 section("employee mapping")
 
 paycor_roster = [
-    {"employeeId": "px-1", "employeeNumber": "1001"},
-    {"employeeId": "px-2", "employeeNumber": "1002"},
-    {"employeeId": "px-3", "employeeNumber": "1002"},   # a collision
+    {"id": "px-1", "employeeNumber": "1001", "firstName": "A", "lastName": "One",
+     "department": {"id": "dept-1"}},
+    {"id": "px-2", "employeeNumber": "1002", "department": {"id": "dept-2"}},
+    {"id": "px-3", "employeeNumber": "1002", "department": {"id": "dept-3"}},
+    {"id": "px-4", "employeeNumber": "1004", "department": None},
 ]
 index = PUSH.paycor_employee_index(paycor_roster)
 
-got, how = PUSH.resolve_employee(employee(1, "1001"), {}, index)
-check("a unique employee_num resolves", got == "px-1" and how == "employee_num")
+entry, how = PUSH.resolve_employee(employee(1, "1001"), {}, index)
+check("a unique employee_num resolves to the Paycor guid",
+      entry and entry["id"] == "px-1" and how == "employee_num")
+check("and carries the department guid the write requires",
+      entry and entry["department_id"] == "dept-1")
 
-got, how = PUSH.resolve_employee(employee(2, "1002"), {}, index)
-check("an ambiguous employee_num is refused", got is None, f"got {got}")
+entry, how = PUSH.resolve_employee(employee(2, "1002"), {}, index)
+check("an ambiguous employee_num is refused", entry is None)
 check("and says how many it matched", "2 Paycor employees" in how, how)
 
-got, how = PUSH.resolve_employee(employee(9, "9999"), {}, index)
-check("an employee_num matching nothing is refused", got is None)
+entry, how = PUSH.resolve_employee(employee(9, "9999"), {}, index)
+check("an employee_num matching nothing is refused", entry is None)
 
-got, how = PUSH.resolve_employee(employee(3, ""), {}, index)
-check("no employee_num at all is refused", got is None)
+entry, how = PUSH.resolve_employee(employee(3, ""), {}, index)
+check("no employee_num at all is refused", entry is None)
 check("and says why", "no employee_num" in how, how)
 
-got, how = PUSH.resolve_employee(employee(2, "1002"), {"1002": "px-chosen"}, index)
-check("an override beats an ambiguous match", got == "px-chosen" and how == "override")
+entry, how = PUSH.resolve_employee(employee(2, "1002"), {"1002": "px-chosen"}, index)
+check("an override beats an ambiguous match",
+      entry and entry["id"] == "px-chosen" and how == "override")
 
-got, how = PUSH.resolve_employee(employee(3, ""), {"user_id:3": "px-byuser"}, index)
-check("an override can key on user_id", got == "px-byuser")
+entry, how = PUSH.resolve_employee(employee(3, ""), {"user_id:3": "px-byuser"}, index)
+check("an override can key on user_id", entry and entry["id"] == "px-byuser")
 
-got, how = PUSH.resolve_employee(employee(1, "1001"), {}, {})
-check("with no roster loaded the number is carried through", got == "1001")
-check("and the plan says it is unchecked", "unchecked" in how, how)
+entry, how = PUSH.resolve_employee(employee(1, "1001"), {}, {})
+check("with no roster the employee cannot be resolved", entry is None)
+check("and the plan says so rather than guessing", "no Paycor roster" in how, how)
+
+# badgeNumber and alternateEmployeeNumber are also indexed.
+alt = PUSH.paycor_employee_index([{"id": "px-9", "badgeNumber": "7788"}])
+entry, how = PUSH.resolve_employee(employee(9, "7788"), {}, alt)
+check("a badge number resolves too", entry and entry["id"] == "px-9")
 
 
 # =============================
-# 6. PUSH REFUSALS
+# 6. ACTIVITY TYPE
+# =============================
+section("activity type")
+
+types = [{"id": "act-work", "name": "Work"}, {"id": "act-break", "name": "Break"}]
+got, how = PUSH.resolve_activity_type(types)
+check("the default activity type resolves by name", got == "act-work", f"got {got}")
+
+got, how = PUSH.resolve_activity_type([])
+check("no activity types means no id", got is None)
+check("and says the list was empty", "no activity types" in how, how)
+
+got, how = PUSH.resolve_activity_type([{"id": "a", "name": "Break"}])
+check("a missing name is refused", got is None)
+check("and names what the tenant actually has", "Break" in how, how)
+
+got, how = PUSH.resolve_activity_type(
+    [{"id": "a", "name": "Work"}, {"id": "b", "name": "work"}]
+)
+check("two types with the same name are refused", got is None)
+check("and point at the id override", "PAYCOR_ACTIVITY_TYPE_ID" in how, how)
+
+
+# =============================
+# 7. PUSH REFUSALS
 # =============================
 section("push refusals")
 
@@ -273,11 +309,14 @@ push_shifts = [
     shift("A", 4, D.replace(hour=6), D.replace(hour=18),
           [punch(D.replace(hour=6), D + timedelta(days=3), pid=44)]),   # runaway
 ]
-emps4 = [employee(i, f"100{i}") for i in (1, 2, 3, 4)]
-idx4 = PUSH.paycor_employee_index(
-    [{"employeeId": f"px-{i}", "employeeNumber": f"100{i}"} for i in (1, 2, 3, 4)]
+emps4 = [employee(i, f"200{i}") for i in (1, 2, 3, 4)]
+idx4 = PUSH.paycor_employee_index([
+    {"id": f"px-{i}", "employeeNumber": f"200{i}", "department": {"id": f"dept-{i}"}}
+    for i in (1, 2, 3, 4)
+])
+sendable, refused = PUSH.build_plan(
+    push_shifts, emps4, ZERO, after, {}, idx4, "act-work"
 )
-sendable, refused = PUSH.build_plan(push_shifts, emps4, ZERO, after, {}, idx4)
 
 check("only the sound punch is sendable", len(sendable) == 1, f"got {len(sendable)}")
 check("the other three are refused", len(refused) == 3, f"got {len(refused)}")
@@ -285,152 +324,207 @@ reasons = " | ".join(r["refused"] for r in refused)
 check("an open punch is refused", "open" in reasons, reasons)
 check("a backwards punch is refused", "not after" in reasons, reasons)
 check("a runaway punch is refused", "ceiling" in reasons, reasons)
-check("refusals keep the person's name for the report",
-      all("employee_name" in r for r in refused))
-
-# Nothing sendable is ever open -- the rail that matters most.
 check("no sendable punch lacks a clock-out",
       all(r["punch_out"] is not None for r in sendable))
 
-# --date scopes the plan.
-other_day = shift("A", 1, D + timedelta(days=1), D + timedelta(days=1, hours=12),
-                  [punch(D + timedelta(days=1), D + timedelta(days=1, hours=12), pid=51)])
+# The rail that matters most: a punch with no department cannot be filed.
+no_dept_idx = PUSH.paycor_employee_index([
+    {"id": "px-x", "employeeNumber": "2001", "department": None}
+])
+nd_send, nd_ref = PUSH.build_plan(
+    push_shifts[:1], emps4, ZERO, after, {}, no_dept_idx, "act-work"
+)
+check("an employee with no Paycor department is refused", nd_send == [])
+check("and the reason names the required field",
+      nd_ref and "department" in nd_ref[0]["refused"], str(nd_ref[:1]))
+
+# No activity type -> nothing can be sent at all.
+na_send, na_ref = PUSH.build_plan(push_shifts[:1], emps4, ZERO, after, {}, idx4, None)
+check("no activity type means nothing is sendable", na_send == [])
+check("and the reason says CreatePunches requires one",
+      na_ref and "activity type" in na_ref[0]["refused"], str(na_ref[:1]))
+
 scoped, _ = PUSH.build_plan(
-    push_shifts + [other_day], emps4, ZERO, after, {}, idx4, target_date=D.date()
+    push_shifts + [shift("A", 1, D + timedelta(days=1),
+                         D + timedelta(days=1, hours=12),
+                         [punch(D + timedelta(days=1),
+                                D + timedelta(days=1, hours=12), pid=51)])],
+    emps4, ZERO, after, {}, idx4, "act-work", target_date=D.date(),
 )
 check("--date keeps only that day's punches",
       all(r["punch_in"].date() == D.date() for r in scoped))
 
 
 # =============================
-# 7. RECONCILIATION
+# 8. THE EVENT MODEL
+# =============================
+section("punch objects -- events, not intervals")
+
+row = sendable[0]
+objs = PUSH.punch_objects(row)
+check("one Traumasoft punch becomes two Paycor punches", len(objs) == 2,
+      f"got {len(objs)}")
+check("the first is an In", objs[0]["punchStatusType"] == "In")
+check("the second is an Out", objs[1]["punchStatusType"] == "Out")
+check("the In carries the clock-in time",
+      objs[0]["punchDateTime"] == "2026-09-09T06:00:00", objs[0]["punchDateTime"])
+check("the Out carries the clock-out time",
+      objs[1]["punchDateTime"] == "2026-09-09T18:00:00", objs[1]["punchDateTime"])
+
+for name in ("employeeId", "departmentId", "punchDateTime",
+             "punchStatusType", "activityTypeId", "isTransfer"):
+    check(f"every punch carries the required field {name}",
+          all(name in o for o in objs), str(objs[0]))
+check("isTransfer is false -- these are plain clock events",
+      all(o["isTransfer"] is False for o in objs))
+
+check("the two halves carry different correlation ids",
+      objs[0]["correlationId"] != objs[1]["correlationId"])
+check("a correlation id is stable across runs",
+      PA.correlation_id(41, "in") == PA.correlation_id(41, "in"))
+check("and differs per punch",
+      PA.correlation_id(41, "in") != PA.correlation_id(42, "in"))
+check("and differs per half",
+      PA.correlation_id(41, "in") != PA.correlation_id(41, "out"))
+
+raised = None
+try:
+    PaycorClient.build_punch("e", "d", "a", D, "Sideways")
+except ValueError as exc:
+    raised = exc
+check("an invalid punchStatusType is refused", raised is not None)
+
+long_note = PaycorClient.build_punch("e", "d", "a", D, "In", note="x" * 500)
+check("a note is clipped to Paycor's 300-character ceiling",
+      len(long_note["note"]) == 300, str(len(long_note["note"])))
+
+
+# =============================
+# 9. RECONCILIATION
 # =============================
 section("reconciliation")
 
 check("a Z-suffixed timestamp parses",
       PUSH.parse_paycor_time("2026-09-09T06:00:00Z") == D.replace(hour=6))
-check("a fractional timestamp parses",
+check("a fractional timestamp parses without microseconds",
       PUSH.parse_paycor_time("2026-09-09T06:00:00.123") == D.replace(hour=6))
 check("an offset timestamp parses to naive local",
       PUSH.parse_paycor_time("2026-09-09T06:00:00-04:00") == D.replace(hour=6))
 check("an empty timestamp is None", PUSH.parse_paycor_time("") is None)
 
-paycor_punches = [
-    {"employeeId": "px-1", "punchInTime": "2026-09-09T06:00:00",
-     "punchOutTime": "2026-09-09T18:00:00"},
-]
-pindex = PUSH.index_paycor_punches(paycor_punches)
-row = dict(sendable[0])
-row["paycor_employee_id"] = "px-1"
-present, existing = PUSH.already_present(row, pindex)
-check("an identical punch is recognised as present", present is True)
+timecards = [{"employeeId": "px-1", "punchIn": "2026-09-09T06:00:00",
+              "punchOut": "2026-09-09T18:00:00"}]
+tc_index = PUSH.index_timecards(timecards)
 
-# Inside the tolerance still counts as the same punch.
-near = PUSH.index_paycor_punches([
-    {"employeeId": "px-1", "punchInTime": "2026-09-09T06:01:00",
-     "punchOutTime": "2026-09-09T18:00:00"}
-])
-check("a punch one minute out is the same punch",
-      PUSH.already_present(row, near)[0] is True)
+# Our own punch, recognised by correlation id -- the exact path.
+recon = PUSH.report_reconciliation([dict(row)], {}, {row["correlation_in"].lower()})
+check("a punch we already sent is recognised by correlation id",
+      recon["already_present"] == 1 and recon["missing"] == 0)
 
-far = PUSH.index_paycor_punches([
-    {"employeeId": "px-1", "punchInTime": "2026-09-09T09:00:00",
-     "punchOutTime": "2026-09-09T18:00:00"}
-])
-check("a punch three hours out is a different punch",
-      PUSH.already_present(row, far)[0] is False)
-
-recon = PUSH.report_reconciliation([row], pindex)
-check("an agreeing punch reconciles as matched", recon["matched"] == 1)
+# Somebody else's equivalent punch, agreeing.
+recon = PUSH.report_reconciliation([dict(row)], tc_index, set())
+check("an equivalent Paycor punch counts as present",
+      recon["already_present"] == 1, str(recon))
 check("and is not reported missing", recon["missing"] == 0)
 
-drift = PUSH.index_paycor_punches([
-    {"employeeId": "px-1", "punchInTime": "2026-09-09T06:00:00",
-     "punchOutTime": "2026-09-09T17:00:00"}
-])
-recon_drift = PUSH.report_reconciliation([dict(row)], drift)
-check("a clock-out an hour out is reported as drifted", recon_drift["drifted"] == 1)
-check("and not silently counted as agreement", recon_drift["matched"] == 0)
+drift = PUSH.index_timecards([{"employeeId": "px-1",
+                               "punchIn": "2026-09-09T06:00:00",
+                               "punchOut": "2026-09-09T17:00:00"}])
+recon = PUSH.report_reconciliation([dict(row)], drift, set())
+check("a clock-out an hour out is reported as drifted", recon["drifted"] == 1)
+check("and not silently counted as agreement", recon["already_present"] == 0)
 
-recon_missing = PUSH.report_reconciliation([dict(row)], {})
-check("an empty Paycor window reports nothing matched",
-      recon_missing["matched"] == 0)
+recon = PUSH.report_reconciliation([dict(row)], {}, set())
+check("an empty Paycor window reports the punch missing", recon["missing"] == 1)
 
 
 # =============================
-# 8. CLIENT GUARDS
+# 10. CLIENT GUARDS
 # =============================
 section("paycor client guards")
 
 check("the client defaults to the sandbox",
       paycor_api.SANDBOX_BASE_URL in PaycorClient().base_url,
       PaycorClient().base_url)
-check("and is not in production mode by default",
-      paycor_api.IS_PRODUCTION is False)
+check("and is not in production mode by default", paycor_api.IS_PRODUCTION is False)
 
 client = PaycorClient()
 check("a default client is read-only", client.read_only is True)
 
 raised = None
 try:
-    client.create_punch("px-1", D.replace(hour=6), D.replace(hour=18))
+    client.create_punches([{"employeeId": "x"}])
 except PaycorReadOnlyError as exc:
     raised = exc
-check("a read-only client refuses to write a punch", raised is not None)
+check("a read-only client refuses to create punches", raised is not None)
 check("and names the constructor argument that would allow it",
       raised is not None and "read_only=False" in str(raised))
 
-# The guard is on `write`, not on the HTTP verb, so a POST-shaped read is not
-# silently blocked and a GET-shaped write is not silently allowed.
-raised_get = None
+raised = None
+try:
+    client.delete_punches("px-1", ["punch-1"])
+except PaycorReadOnlyError as exc:
+    raised = exc
+check("a read-only client refuses to delete punches", raised is not None)
+
+# The guard is on `write`, not the HTTP verb.
+raised = None
 try:
     client.request("GET", "v1/anything", write=True)
 except PaycorReadOnlyError as exc:
-    raised_get = exc
-check("write=True is refused even on a GET", raised_get is not None)
+    raised = exc
+check("write=True is refused even on a GET", raised is not None)
 
 contract = describe_write_contract()
 check("the write contract reports the sandbox", contract["environment"] == "sandbox")
-check("and admits it is unverified", contract["verified"] is False)
-check("and names every field it would send",
-      set(contract["body_fields"]) == {"employee", "punch_in", "punch_out"})
+check("and is marked verified against the spec", contract["verified"] is True)
+check("and names CreatePunches", "CreatePunches" in contract["request"])
+check("and says a 202 is not a result",
+      "punchErrorLog" in contract["accepted_response"], contract["accepted_response"])
 
-body = client.build_punch_body("px-9", D.replace(hour=6), D.replace(hour=18))
-check("the body names the employee", body["employeeId"] == "px-9")
-check("the body carries a formatted clock-in",
-      body["punchInTime"] == "2026-09-09T06:00:00", body.get("punchInTime"))
-check("the body carries a formatted clock-out",
-      body["punchOutTime"] == "2026-09-09T18:00:00")
-
-open_body = client.build_punch_body("px-9", D.replace(hour=6), None)
-check("an open punch body omits the clock-out entirely",
-      "punchOutTime" not in open_body)
-
-# A writable client is possible, and pagination handles both key spellings.
 writable = PaycorClient(read_only=False)
 check("a writable client can be constructed", writable.read_only is False)
 
+over = [{"employeeId": str(i)} for i in range(PA.MAX_PUNCH_BATCH + 1)]
+raised = None
+try:
+    writable.create_punches(over, legal_entity_id=1)
+except ValueError as exc:
+    raised = exc
+check("an oversized batch is refused before it is sent", raised is not None)
+check("an empty batch is a no-op",
+      writable.create_punches([], legal_entity_id=1) is None)
+
+# A 202 that carries no tracking id must not read as success.
+writable.request = lambda *a, **k: {"resourceUrl": {}}
+check("a 202 with no tracking id returns None",
+      writable.create_punches([{"employeeId": "x"}], legal_entity_id=1) is None)
+writable.request = lambda *a, **k: {"resourceUrl": {"id": "track-1"}}
+check("a 202 with a tracking id returns it",
+      writable.create_punches([{"employeeId": "x"}], legal_entity_id=1) == "track-1")
+
+# Pagination: the paged envelope, and the bare array employeePunches returns.
 pages = [
     {"records": [{"a": 1}], "continuationToken": "t1", "hasMoreResults": True},
-    {"results": [{"a": 2}], "hasMoreResults": False},
+    {"records": [{"a": 2}], "hasMoreResults": False},
 ]
 calls = []
-
-
 def fake_request(method, path, params=None, json_body=None, write=False):
     calls.append(dict(params or {}))
     return pages[len(calls) - 1]
-
-
 writable.request = fake_request
 walked = list(writable.paginate("v1/whatever"))
-check("pagination walks both 'records' and 'results'", len(walked) == 2, str(walked))
+check("pagination walks the records envelope", len(walked) == 2, str(walked))
 check("and passes the continuation token on the second call",
       calls[1].get("continuationToken") == "t1", str(calls))
 
+writable.request = lambda *a, **k: [{"punchId": "p1"}, {"punchId": "p2"}]
+bare = list(writable.paginate("v1/employees/x/employeePunches"))
+check("a bare-array response is handled too", len(bare) == 2, str(bare))
+
 
 # =============================
-# 9. OVERRIDES FILE
+# 11. OVERRIDES FILE
 # =============================
 section("overrides file")
 

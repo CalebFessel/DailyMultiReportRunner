@@ -6,20 +6,33 @@ closes a Traumasoft punch and every unit-hour figure in the report bundle rests
 on a record with no incentive behind it. Making Traumasoft the clock that pays
 fixes the data at its source. This is the mechanism.
 
-There are three modes and they are meant to be used in order.
+Built against Paycor's own OpenAPI spec (docs/paycor-public-api-v1.json), which
+settles three things a guess got wrong:
 
-  1. DRY RUN (default) -- build the plan and print it. Nothing leaves the
-     machine except reads. Shows exactly which punch would be sent for which
-     person, and everything that was refused and why.
+  * **Punches are events, not intervals.** One Traumasoft punch row, with a
+    start and an end, becomes TWO Paycor punches -- an In and an Out.
+  * **Three guids are required per punch** and Paycor defaults none of them:
+    employeeId, departmentId and activityTypeId. The first two come from the
+    employee roster, the third is a per-tenant choice (`PAYCOR_ACTIVITY_TYPE`,
+    default "Work").
+  * **A 202 is not success.** CreatePunches validates asynchronously and
+    returns a tracking id; whether the punches landed is only visible in the
+    punch error log for that id. Every publish here reads that log back.
 
+Idempotency is by correlation id, not by timestamp. Each punch carries a
+correlationId derived deterministically from the Traumasoft punch id, and
+Paycor returns it on read -- so "have I sent this already?" is an exact lookup
+that survives a re-run, a restart, and clocks that disagree by a minute.
+
+Three modes, meant to be used in order:
+
+  1. DRY RUN (default) -- build the plan and print it. Reads only. Shows the
+     exact JSON that would be sent and everything refused, with reasons.
   2. --reconcile -- read what Paycor already holds for the same window and
-     compare it punch by punch against Traumasoft. This is the test that
-     matters before any write: it proves the employee mapping resolves, the
-     clocks agree, and the two systems are describing the same shifts. Still
-     read-only on both sides.
-
-  3. --publish -- send them. Requires the Paycor client to be constructed
-     writable, and refuses production unless you have said so twice.
+     compare. This is the test that matters before any write: it proves the
+     employee mapping resolves, the clocks agree, and both systems describe the
+     same shifts. Still read-only on both sides.
+  3. --publish -- send them, then read the error log back.
 
 Safety rails, none of which are configurable away:
 
@@ -27,20 +40,20 @@ Safety rails, none of which are configurable away:
     record, and the shift-end fallback that makes it usable for reporting would
     here mean inventing the end of somebody's paid day.
   * An employee who cannot be mapped unambiguously is refused, not guessed.
-  * A punch Paycor already holds is skipped, so a re-run does not double-pay.
-    That check needs --reconcile data; without it a publish refuses outright
-    rather than risking duplicates.
-  * Production needs PAYCOR_ENVIRONMENT=production *and* --i-understand-this-is-payroll.
+  * A punch Paycor already holds, by correlation id, is skipped.
+  * The first failed batch stops the run.
+  * Production needs PAYCOR_ENVIRONMENT=production *and*
+    --i-understand-this-is-payroll.
 
-The shift feed only ever returns today-1..today+2, so this can only push a
-narrow window and must run daily to cover a pay period. A day missed is a day
-whose punches the API will not hand back.
+The shift feed only returns today-1..today+2, so this can only push a narrow
+window and must run daily to cover a pay period. A day missed is a day whose
+punches the API will not hand back.
 
 Usage:
     python push_paycor_timecards.py                          # dry run
-    python push_paycor_timecards.py --reconcile              # compare, write nothing
-    python push_paycor_timecards.py --date 2026-09-09 --json plan.json
-    python push_paycor_timecards.py --reconcile --publish    # for real
+    python push_paycor_timecards.py --reconcile              # compare only
+    python push_paycor_timecards.py --date 2026-09-10 --json plan.json
+    python push_paycor_timecards.py --reconcile --publish --limit 2
 """
 
 import os
@@ -59,7 +72,11 @@ from paycor_api import (
     PaycorAPIError,
     PaycorAuthError,
     PaycorReadOnlyError,
+    correlation_id,
     describe_write_contract,
+    PUNCH_STATUS_IN,
+    PUNCH_STATUS_OUT,
+    MAX_PUNCH_BATCH,
 )
 
 logging.basicConfig(
@@ -69,25 +86,32 @@ logging.basicConfig(
 )
 log = logging.getLogger("push-paycor")
 
-OVERRIDES_FILE = os.path.join(
-    os.getenv("TS_STATE_DIR", "state"), "paycor_employee_overrides.json"
-)
+STATE_DIR = os.getenv("TS_STATE_DIR", "state")
+OVERRIDES_FILE = os.path.join(STATE_DIR, "paycor_employee_overrides.json")
 
-# Two punches this far apart or closer are treated as the same punch when
-# reconciling. Clocks drift and the two systems round differently; without a
-# tolerance every punch looks like a mismatch.
-MATCH_TOLERANCE_MINUTES = float(os.getenv("PAYCOR_MATCH_TOLERANCE_MINUTES", "2"))
+# Which activity type a pushed punch is filed under. Required by Paycor, with
+# no default of its own; "Work" is the ordinary productive type on most
+# tenants, and the dry run prints what this tenant actually has.
+ACTIVITY_TYPE_NAME = os.getenv("PAYCOR_ACTIVITY_TYPE", "Work").strip()
+ACTIVITY_TYPE_ID = os.getenv("PAYCOR_ACTIVITY_TYPE_ID", "").strip()
 
-# A punch longer than this is refused as implausible rather than sent. A
-# runaway punch that reached payroll would pay a multi-day shift.
+# A department for people whose Paycor record names none. Left empty by
+# default so those punches are refused rather than filed somewhere arbitrary.
+DEFAULT_DEPARTMENT_ID = os.getenv("PAYCOR_DEFAULT_DEPARTMENT_ID", "").strip()
+
+# A punch longer than this is refused as implausible. A runaway punch reaching
+# payroll would pay a multi-day shift.
 MAX_PUNCH_HOURS = float(os.getenv("PAYCOR_MAX_PUNCH_HOURS", "24"))
+
+# Used only for the human-readable drift report; matching is by correlation id.
+DRIFT_TOLERANCE_MINUTES = float(os.getenv("PAYCOR_MATCH_TOLERANCE_MINUTES", "2"))
 
 
 # =============================
 # MAPPING
 # =============================
 def load_overrides():
-    """Traumasoft employee_num (or user_id) -> Paycor employee id."""
+    """Traumasoft employee_num (or user_id:N) -> Paycor employee guid."""
     data = R.load_state_file(OVERRIDES_FILE, "Paycor employee overrides") or {}
     raw = data.get("overrides", data) if isinstance(data, dict) else {}
     return {str(k).strip().lower(): str(v).strip() for k, v in raw.items() if v}
@@ -97,46 +121,73 @@ def paycor_employee_index(paycor_employees):
     """
     Index the Paycor roster by every identifier a Traumasoft record might name.
 
-    Paycor's employee payload spells its own fields several ways depending on
-    the endpoint, so candidates are gathered rather than assumed.
+    Returns number -> [ {id, department_id, label}, ... ]. A list rather than a
+    single entry because a number shared by two people has to be refused, and
+    that can only be seen by keeping both.
     """
-    by_number = defaultdict(list)
+    index = defaultdict(list)
     for emp in paycor_employees:
-        emp_id = (
-            emp.get("employeeId") or emp.get("id") or emp.get("employeeUuid")
-        )
-        if emp_id is None:
+        emp_id = emp.get("id")
+        if not emp_id:
             continue
-        for key in ("employeeNumber", "employee_number", "employeeNo", "badgeNumber"):
+        department = emp.get("department") or {}
+        entry = {
+            "id": str(emp_id),
+            "department_id": department.get("id"),
+            "label": " ".join(
+                p for p in (emp.get("firstName"), emp.get("lastName")) if p
+            ).strip(),
+        }
+        for key in ("employeeNumber", "alternateEmployeeNumber", "badgeNumber"):
             value = str(emp.get(key) or "").strip()
             if value:
-                by_number[value.lower()].append(str(emp_id))
-    return by_number
+                index[value.lower()].append(entry)
+    return index
+
+
+def resolve_activity_type(activity_types):
+    """
+    (activity_type_id, how) or (None, why not).
+
+    An explicit id wins. Otherwise match on name, since the guid differs per
+    tenant and a name is the only thing a human can reasonably put in .env.
+    """
+    if ACTIVITY_TYPE_ID:
+        return ACTIVITY_TYPE_ID, "PAYCOR_ACTIVITY_TYPE_ID"
+    if not activity_types:
+        return None, "no activity types could be read from Paycor"
+    wanted = ACTIVITY_TYPE_NAME.lower()
+    matches = [a for a in activity_types if str(a.get("name", "")).strip().lower() == wanted]
+    if len(matches) == 1:
+        return str(matches[0]["id"]), f"name {ACTIVITY_TYPE_NAME!r}"
+    available = ", ".join(sorted(str(a.get("name")) for a in activity_types))
+    if not matches:
+        return None, (f"no activity type named {ACTIVITY_TYPE_NAME!r}; "
+                      f"this tenant has: {available}")
+    return None, (f"{len(matches)} activity types named {ACTIVITY_TYPE_NAME!r}; "
+                  "set PAYCOR_ACTIVITY_TYPE_ID to choose one")
 
 
 def resolve_employee(ts_employee, overrides, paycor_index):
     """
-    (paycor_employee_id, how) or (None, why not).
+    (entry, how) or (None, why not), where entry carries the Paycor guid.
 
     An override always wins, being a decision rather than an observation. Then
     employee_num against the Paycor roster. An ambiguous number is refused --
-    two people sharing a payroll number is exactly the case where a guess
-    pays the wrong person.
+    two people sharing a payroll number is exactly where a guess pays the wrong
+    person.
     """
     user_id = str(ts_employee.get("user_id") or "").strip()
     number = str(ts_employee.get("employee_num") or "").strip()
 
-    for key in (number.lower(), f"user_id:{user_id}".lower(), user_id.lower()):
+    for key in (number.lower(), f"user_id:{user_id}".lower()):
         if key and key in overrides:
-            return overrides[key], "override"
+            return {"id": overrides[key], "department_id": None, "label": None}, "override"
 
     if not number:
         return None, "Traumasoft employee carries no employee_num"
-
     if not paycor_index:
-        # No roster to check against -- a dry run without Paycor credentials.
-        # Carry the number through so the plan is still legible, but say so.
-        return number, "employee_num (unchecked, no Paycor roster loaded)"
+        return None, "no Paycor roster loaded, so the employee cannot be resolved"
 
     matches = paycor_index.get(number.lower()) or []
     if len(matches) == 1:
@@ -151,7 +202,7 @@ def resolve_employee(ts_employee, overrides, paycor_index):
 # =============================
 def candidate_punches(shifts, offset, now, target_date=None):
     """
-    Every punch that could be pushed, with the reason if it cannot be.
+    Every Traumasoft punch that could be pushed, with the reason if it cannot.
 
     Nothing is filtered out silently: a refused punch stays in the plan with a
     `refused` reason, because the whole value of the dry run is seeing what
@@ -162,9 +213,7 @@ def candidate_punches(shifts, offset, now, target_date=None):
         if shift.get("deleted"):
             continue
         profile = R.profile_name(shift)
-        shift_start = R.parse_shift_ts(shift.get("start_time"), offset)
         shift_end = R.parse_shift_ts(shift.get("end_time"), offset)
-        user_id = shift.get("user_id")
 
         for punch in shift.get("punches") or []:
             if punch.get("deleted"):
@@ -193,11 +242,9 @@ def candidate_punches(shifts, offset, now, target_date=None):
 
             out.append({
                 "punch_id": punch.get("id"),
-                "user_id": user_id,
+                "user_id": shift.get("user_id"),
                 "profile": profile,
                 "vehicle_name": shift.get("vehicle_name"),
-                "shift_start": shift_start,
-                "shift_end": shift_end,
                 "punch_in": start,
                 "punch_out": end,
                 "refused": refused,
@@ -206,7 +253,7 @@ def candidate_punches(shifts, offset, now, target_date=None):
 
 
 def build_plan(shifts, ts_employees, offset, now, overrides, paycor_index,
-               target_date=None):
+               activity_type_id, target_date=None):
     by_user = {}
     for emp in ts_employees:
         uid = emp.get("user_id")
@@ -226,16 +273,58 @@ def build_plan(shifts, ts_employees, offset, now, overrides, paycor_index,
             refused.append(row)
             continue
 
-        paycor_id, how = resolve_employee(ts_emp, overrides, paycor_index)
-        row["paycor_employee_id"] = paycor_id
+        entry, how = resolve_employee(ts_emp, overrides, paycor_index)
         row["mapped_by"] = how
-        if paycor_id is None:
+        if entry is None:
             row["refused"] = how
             refused.append(row)
-        else:
-            sendable.append(row)
+            continue
+
+        row["paycor_employee_id"] = entry["id"]
+        department_id = entry.get("department_id") or DEFAULT_DEPARTMENT_ID
+        if not department_id:
+            row["refused"] = (
+                "Paycor employee names no department, and CreatePunches "
+                "requires one (set PAYCOR_DEFAULT_DEPARTMENT_ID to supply a fallback)"
+            )
+            refused.append(row)
+            continue
+        row["department_id"] = department_id
+
+        if not activity_type_id:
+            row["refused"] = "no activity type resolved; CreatePunches requires one"
+            refused.append(row)
+            continue
+        row["activity_type_id"] = activity_type_id
+
+        # The two halves, each with its own stable correlation id.
+        row["correlation_in"] = correlation_id(row["punch_id"], "in")
+        row["correlation_out"] = correlation_id(row["punch_id"], "out")
+        sendable.append(row)
 
     return sendable, refused
+
+
+def punch_objects(row):
+    """The two Paycor punch objects one Traumasoft punch becomes."""
+    note = f"TS {row['profile']}" if row.get("profile") else None
+    return [
+        PaycorClient.build_punch(
+            row["paycor_employee_id"], row["department_id"], row["activity_type_id"],
+            row["punch_in"], PUNCH_STATUS_IN,
+            note=note, correlation=row["correlation_in"],
+        ),
+        PaycorClient.build_punch(
+            row["paycor_employee_id"], row["department_id"], row["activity_type_id"],
+            row["punch_out"], PUNCH_STATUS_OUT,
+            note=note, correlation=row["correlation_out"],
+        ),
+    ]
+
+
+def chunked(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
 # =============================
@@ -247,8 +336,7 @@ def parse_paycor_time(value):
 
     Sub-second precision is dropped rather than carried. A punch is a clock
     event to the minute; keeping microseconds would put a precision on payroll
-    times that nothing behind them supports, and makes two records of the same
-    punch compare unequal for a reason no one could act on.
+    times that nothing behind them supports.
     """
     if not value:
         return None
@@ -262,112 +350,145 @@ def parse_paycor_time(value):
     return None
 
 
-def index_paycor_punches(paycor_punches):
-    """paycor_employee_id -> [(in, out), ...] for the reconciliation window."""
+def index_timecards(timecards):
+    """paycor employee guid -> [(punch_in, punch_out), ...] from the paired read."""
     index = defaultdict(list)
-    for row in paycor_punches:
-        emp_id = str(
-            row.get("employeeId") or row.get("employee_id") or row.get("id") or ""
-        ).strip()
+    for row in timecards:
+        emp_id = str(row.get("employeeId") or "").strip()
         if not emp_id:
             continue
-        punch_in = parse_paycor_time(
-            row.get("punchInTime") or row.get("inTime") or row.get("startTime")
-        )
-        punch_out = parse_paycor_time(
-            row.get("punchOutTime") or row.get("outTime") or row.get("endTime")
-        )
+        punch_in = parse_paycor_time(row.get("punchIn"))
+        punch_out = parse_paycor_time(row.get("punchOut"))
         if punch_in:
             index[emp_id].append((punch_in, punch_out))
     return index
 
 
-def already_present(row, paycor_index):
-    """Is this punch already in Paycor, within the clock tolerance?"""
-    tolerance = timedelta(minutes=MATCH_TOLERANCE_MINUTES)
-    for existing_in, existing_out in paycor_index.get(str(row["paycor_employee_id"]), []):
-        if abs(existing_in - row["punch_in"]) <= tolerance:
-            return True, (existing_in, existing_out)
-    return False, None
+def collect_correlations(paycor, sendable, window_start, window_end):
+    """
+    Every correlation id Paycor already holds for the crew we are about to push.
+
+    Read per employee because only the employeePunches endpoint returns
+    correlationId; the legal-entity read gives pairs without it. Employees are
+    visited once each, not once per punch.
+    """
+    seen = set()
+    employees = sorted({row["paycor_employee_id"] for row in sendable})
+    for employee_id in employees:
+        try:
+            events = paycor.get_employee_punches(
+                employee_id, window_start.isoformat(), window_end.isoformat()
+            )
+        except PaycorAPIError as exc:
+            # A 404 here means this employee has no punches in the window,
+            # which is information rather than a failure.
+            if exc.status_code == 404:
+                continue
+            raise
+        for event in events:
+            marker = event.get("correlationId")
+            if marker:
+                seen.add(str(marker).lower())
+    return seen
 
 
-def report_reconciliation(sendable, paycor_index):
+def report_reconciliation(sendable, timecard_index, known_correlations):
     print("\n" + "=" * 78)
     print("RECONCILIATION -- Traumasoft against what Paycor already holds")
     print("=" * 78)
 
-    if not paycor_index:
-        print("  Paycor returned no punches for this window.")
-        print("  Either the window is genuinely empty, the legal entity id is")
-        print("  wrong, or this key cannot read timecards. Resolve that before")
-        print("  reading anything below as agreement.")
-        return {"matched": 0, "missing": 0, "drifted": 0}
-
-    matched, missing, drifted = [], [], []
+    already, missing, drifted = [], [], []
     for row in sendable:
-        present, existing = already_present(row, paycor_index)
-        if not present:
+        if str(row["correlation_in"]).lower() in known_correlations:
+            already.append(row)
+            continue
+        # Not ours -- but Paycor may still hold an equivalent punch entered by
+        # hand or by the crew themselves. That is the interesting case: the
+        # same work recorded twice, by two clocks that may disagree.
+        match = None
+        for existing_in, existing_out in timecard_index.get(row["paycor_employee_id"], []):
+            if abs((existing_in - row["punch_in"]).total_seconds()) <= 3600:
+                match = (existing_in, existing_out)
+                break
+        if match is None:
             missing.append(row)
             continue
-        row["paycor_existing"] = existing
-        # Same clock-in, but does the clock-out agree?
-        if row["punch_out"] and existing[1]:
-            gap = abs((row["punch_out"] - existing[1]).total_seconds()) / 60.0
-            if gap > MATCH_TOLERANCE_MINUTES:
-                row["drift_minutes"] = round(gap, 1)
-                drifted.append(row)
-                continue
-        matched.append(row)
+        row["paycor_existing"] = match
+        gap_in = abs((match[0] - row["punch_in"]).total_seconds()) / 60.0
+        gap_out = (
+            abs((match[1] - row["punch_out"]).total_seconds()) / 60.0
+            if match[1] and row["punch_out"] else None
+        )
+        row["drift_in_minutes"] = round(gap_in, 1)
+        row["drift_out_minutes"] = round(gap_out, 1) if gap_out is not None else None
+        worst = max([g for g in (gap_in, gap_out) if g is not None] or [0])
+        if worst > DRIFT_TOLERANCE_MINUTES:
+            drifted.append(row)
+        else:
+            already.append(row)
 
     total = len(sendable)
-    print(f"  Traumasoft punches in window : {total}")
-    print(f"  Already in Paycor, agreeing   : {len(matched)}")
-    print(f"  Already in Paycor, differing  : {len(drifted)}")
-    print(f"  Not in Paycor                 : {len(missing)}")
+    print(f"  Traumasoft punches in window   : {total}")
+    print(f"  Already in Paycor (ours)       : "
+          f"{sum(1 for r in already if str(r['correlation_in']).lower() in known_correlations)}")
+    print(f"  Matched an existing Paycor punch: "
+          f"{sum(1 for r in already if 'paycor_existing' in r)}")
+    print(f"  Same shift, clocks disagree    : {len(drifted)}")
+    print(f"  Not in Paycor at all           : {len(missing)}")
 
     if drifted:
-        print("\n  Punches both systems hold with clock-outs that disagree. These")
-        print("  are the ones to understand before trusting either clock:")
-        for row in sorted(drifted, key=lambda r: -r["drift_minutes"])[:15]:
-            print(f"    {row['drift_minutes']:>7.1f} min  "
-                  f"{(row['employee_name'] or row['user_id']):<26} "
-                  f"TS {row['punch_in']:%m-%d %H:%M}-{row['punch_out']:%H:%M}  "
-                  f"Paycor -{row['paycor_existing'][1]:%H:%M}")
+        print("\n  Both systems hold these, with times that differ. Understand")
+        print("  these before trusting either clock:")
+        for row in sorted(drifted, key=lambda r: -(r["drift_in_minutes"] or 0))[:15]:
+            out_gap = row["drift_out_minutes"]
+            print(f"    in {row['drift_in_minutes']:>6.1f}m  "
+                  f"out {('%6.1fm' % out_gap) if out_gap is not None else '     -'}  "
+                  f"{(row['employee_name'] or row['user_id'])!s:<24} "
+                  f"TS {row['punch_in']:%m-%d %H:%M}-"
+                  f"{row['punch_out']:%H:%M}")
 
     if missing:
         print(f"\n  Punches Traumasoft has and Paycor does not ({len(missing)}).")
-        print("  On a shadow run these are what a publish would add:")
+        print("  These are what a publish would add:")
         for row in missing[:15]:
-            print(f"    {(row['employee_name'] or row['user_id']):<26} "
-                  f"{row['punch_in']:%m-%d %H:%M} - "
-                  f"{row['punch_out']:%H:%M}  {row['profile']}")
+            print(f"    {(row['employee_name'] or row['user_id'])!s:<24} "
+                  f"{row['punch_in']:%m-%d %H:%M} - {row['punch_out']:%H:%M}  "
+                  f"{row['profile']}")
         if len(missing) > 15:
             print(f"    ... and {len(missing) - 15} more")
 
-    if total and len(matched) == total:
+    if total and not missing and not drifted:
         print("\n  Every Traumasoft punch is already in Paycor and the clocks agree.")
         print("  That is the result you want before cutting over: the two systems")
         print("  describe the same work, so making Traumasoft authoritative")
         print("  changes who is trusted, not what anyone is paid.")
 
-    return {"matched": len(matched), "missing": len(missing), "drifted": len(drifted)}
+    return {
+        "already_present": len(already),
+        "missing": len(missing),
+        "drifted": len(drifted),
+        "missing_rows": missing,
+    }
 
 
 # =============================
 # OUTPUT
 # =============================
-def report_plan(sendable, refused, target_date):
-    print("\n" + "=" * 78
-          + f"\nPLAN{f' for {target_date}' if target_date else ''}\n" + "=" * 78)
-    print(f"  Punches that would be sent : {len(sendable)}")
-    print(f"  Refused                    : {len(refused)}")
+def report_plan(sendable, refused, target_date, activity_note):
+    print("\n" + "=" * 78)
+    print(f"PLAN{f' for {target_date}' if target_date else ''}")
+    print("=" * 78)
+    print(f"  Traumasoft punches ready : {len(sendable)}")
+    print(f"  Paycor punch objects     : {len(sendable) * 2}  (an In and an Out each)")
+    print(f"  Refused                  : {len(refused)}")
+    print(f"  Activity type            : {activity_note}")
 
     if sendable:
         payable = sum(
             (r["punch_out"] - r["punch_in"]).total_seconds() / 3600.0 for r in sendable
         )
         crew = len({r["user_id"] for r in sendable})
-        print(f"  Payable hours represented  : {payable:.2f} across {crew} crew")
+        print(f"  Payable hours represented: {payable:.2f} across {crew} crew")
 
     if refused:
         buckets = defaultdict(int)
@@ -376,35 +497,32 @@ def report_plan(sendable, refused, target_date):
         print("\n  Why punches were refused:")
         for reason, count in sorted(buckets.items(), key=lambda b: -b[1]):
             print(f"    {count:>5}  {reason}")
-        open_missed = buckets.get("punch is open (missed punch-out)", 0)
-        if open_missed:
-            print(f"\n  {open_missed} of those are missed punch-outs -- work that")
-            print("  happened and cannot be paid from this feed. That is the")
-            print("  problem the cutover is meant to solve, quantified.")
+        missed = buckets.get("punch is open (missed punch-out)", 0)
+        if missed:
+            print(f"\n  {missed} of those are missed punch-outs -- work that happened")
+            print("  and cannot be paid from this feed. That is the problem the")
+            print("  cutover is meant to solve, quantified.")
 
     if sendable:
-        print("\n  First few, as they would be sent:")
-        for row in sendable[:8]:
-            print(f"    {(row['employee_name'] or row['user_id']):<24} "
-                  f"paycor={row['paycor_employee_id']:<12} "
-                  f"{row['punch_in']:%m-%d %H:%M} - {row['punch_out']:%H:%M}"
-                  f"  ({row['mapped_by']})")
+        print("\n  First punch, exactly as it would be sent:")
+        for obj in punch_objects(sendable[0]):
+            print("    " + json.dumps(obj))
 
 
-def report_contract():
+def report_contract(activity_note):
     contract = describe_write_contract()
     print("\n" + "=" * 78)
-    print("WRITE CONTRACT -- unverified")
+    print("WRITE CONTRACT")
     print("=" * 78)
     print(f"  environment : {contract['environment']}")
     print(f"  base url    : {contract['base_url']}")
-    print(f"  request     : {contract['method']} {contract['path']}")
-    print(f"  body fields : {contract['body_fields']}")
-    print(f"  time format : {contract['time_format']}")
-    print("\n  developers.paycor.com was unreachable when this was written, so the")
-    print("  above is a best reading of secondary sources. Check it against")
-    print("  Paycor's own reference before publishing; every part of it is an")
-    print("  environment variable, so a correction costs an .env edit.")
+    print(f"  request     : {contract['request']}")
+    print(f"  body        : {contract['body']}")
+    print(f"  required    : {', '.join(contract['required_fields'])}")
+    print(f"  punch model : {contract['punch_model']}")
+    print(f"  on accept   : {contract['accepted_response']}")
+    print(f"  activity    : {activity_note}")
+    print(f"  source      : {contract['source']}")
 
 
 def jsonable(row):
@@ -413,11 +531,86 @@ def jsonable(row):
         if isinstance(value, datetime):
             out[key] = value.isoformat(timespec="minutes")
         elif isinstance(value, tuple):
-            out[key] = [v.isoformat(timespec="minutes") if isinstance(v, datetime)
-                        else v for v in value]
+            out[key] = [v.isoformat(timespec="minutes") if isinstance(v, datetime) else v
+                        for v in value]
         else:
             out[key] = value
     return out
+
+
+# =============================
+# PUBLISH
+# =============================
+def publish(paycor, queue, legal_entity_id=None):
+    """
+    Send the queue in batches, then read the error log for each batch.
+
+    A 202 only says Paycor accepted the batch for processing. The error log is
+    the only place a rejected punch appears, so a batch is not reported as sent
+    until its log has been read.
+    """
+    sent, failed, unverified = [], [], []
+    objects = []
+    for row in queue:
+        for obj in punch_objects(row):
+            objects.append((row, obj))
+
+    for batch in chunked(objects, MAX_PUNCH_BATCH):
+        payload = [obj for _row, obj in batch]
+        rows = []
+        for row, _obj in batch:
+            if row not in rows:
+                rows.append(row)
+        try:
+            tracking_id = paycor.create_punches(payload, legal_entity_id)
+        except PaycorReadOnlyError:
+            raise
+        except (PaycorAPIError, PaycorAuthError) as exc:
+            for row in rows:
+                row["error"] = str(exc)
+            failed.extend(rows)
+            log.error("Batch of %s punch objects rejected outright: %s", len(payload), exc)
+            log.error("Stopping. Nothing further sent.")
+            break
+
+        log.info("Batch of %s punch objects accepted, tracking id %s",
+                 len(payload), tracking_id)
+
+        if not tracking_id:
+            for row in rows:
+                row["error"] = "accepted but no tracking id returned; cannot verify"
+            unverified.extend(rows)
+            continue
+
+        try:
+            errors = paycor.punch_errors(tracking_id, legal_entity_id)
+        except (PaycorAPIError, PaycorAuthError) as exc:
+            for row in rows:
+                row["error"] = f"accepted, but the error log could not be read: {exc}"
+            unverified.extend(rows)
+            log.error("Could not read the punch error log for %s: %s", tracking_id, exc)
+            continue
+
+        if errors:
+            for row in rows:
+                row["error"] = "; ".join(
+                    str(e.get("errorDetail") or e.get("punchDetail") or e)[:160]
+                    for e in errors[:3]
+                )
+            failed.extend(rows)
+            log.error("Paycor rejected punches in tracking id %s:", tracking_id)
+            for entry in errors[:10]:
+                log.error("  %s | %s", entry.get("errorDetail"), entry.get("punchDetail"))
+            log.error("Stopping. Nothing further sent.")
+            break
+
+        for row in rows:
+            row["tracking_id"] = tracking_id
+        sent.extend(rows)
+        log.info("Tracking id %s reports no errors: %s punch(es) landed.",
+                 tracking_id, len(rows))
+
+    return sent, failed, unverified
 
 
 # =============================
@@ -427,15 +620,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--date", help="only punches starting on this date (YYYY-MM-DD)")
     parser.add_argument("--reconcile", action="store_true",
-                        help="read Paycor's punches and compare; still writes nothing")
-    parser.add_argument("--publish", action="store_true",
-                        help="actually send the punches")
+                        help="read Paycor's punches and compare; writes nothing")
+    parser.add_argument("--publish", action="store_true", help="actually send the punches")
     parser.add_argument("--i-understand-this-is-payroll", action="store_true",
                         dest="payroll_ack",
                         help="required alongside --publish against production")
     parser.add_argument("--json", help="write the plan here")
     parser.add_argument("--limit", type=int,
-                        help="send at most this many punches (for a first live test)")
+                        help="send at most this many Traumasoft punches "
+                             "(for a first live test)")
     args = parser.parse_args()
 
     target_date = None
@@ -446,9 +639,9 @@ def main():
             log.error("--date must be YYYY-MM-DD, got %r", args.date)
             return 2
 
+    mode = "PUBLISH" if args.publish else ("RECONCILE" if args.reconcile else "DRY RUN")
     print("=" * 78)
     print("TRAUMASOFT -> PAYCOR TIMECARD PUSH")
-    mode = "PUBLISH" if args.publish else ("RECONCILE" if args.reconcile else "DRY RUN")
     print(f"mode: {mode}    run {datetime.now():%Y-%m-%d %H:%M:%S}")
     print("=" * 78)
 
@@ -478,10 +671,9 @@ def main():
     if overrides:
         log.info("Loaded %s Paycor employee override(s).", len(overrides))
 
-    # ---- Paycor side (optional in a dry run) ----
+    # ---- Paycor side ----
     paycor = None
-    paycor_roster = []
-    paycor_punch_index = {}
+    paycor_roster, activity_types = [], []
     need_paycor = args.reconcile or args.publish
     try:
         paycor = PaycorClient(read_only=not args.publish)
@@ -489,47 +681,57 @@ def main():
         if need_paycor:
             log.error("Paycor credentials are required for this mode: %s", exc)
             return 1
-        log.warning("No Paycor credentials, so the plan is unchecked: %s", exc)
+        log.warning("No Paycor credentials, so the plan cannot be resolved: %s", exc)
 
     if paycor is not None:
         try:
             paycor_roster = paycor.list_employees()
-            log.info("Paycor roster: %s employees.", len(paycor_roster))
+            activity_types = paycor.list_activity_types()
+            log.info("Paycor roster: %s employees, %s activity types.",
+                     len(paycor_roster), len(activity_types))
         except (PaycorAPIError, PaycorAuthError) as exc:
-            log.error("Could not read the Paycor roster: %s", exc)
+            log.error("Could not read from Paycor: %s", exc)
             if need_paycor:
                 return 1
 
+    activity_type_id, activity_note = resolve_activity_type(activity_types)
+    if activity_type_id:
+        activity_note = f"{activity_type_id} (by {activity_note})"
+
     paycor_index = paycor_employee_index(paycor_roster)
     sendable, refused = build_plan(
-        shifts, ts_employees, offset, now, overrides, paycor_index, target_date
+        shifts, ts_employees, offset, now, overrides, paycor_index,
+        activity_type_id, target_date,
     )
-    report_plan(sendable, refused, target_date)
+    report_plan(sendable, refused, target_date, activity_note)
 
     recon = None
+    known_correlations = set()
     if paycor is not None and need_paycor and sendable:
         window_start = min(r["punch_in"] for r in sendable).date()
         window_end = max(r["punch_in"] for r in sendable).date() + timedelta(days=1)
         try:
-            existing = paycor.get_timecard_punches(
+            timecards = paycor.get_timecard_punches(
                 window_start.isoformat(), window_end.isoformat()
             )
-            paycor_punch_index = index_paycor_punches(existing)
-            log.info("Paycor holds %s punch record(s) in %s..%s.",
-                     len(existing), window_start, window_end)
+            known_correlations = collect_correlations(
+                paycor, sendable, window_start, window_end
+            )
+            log.info("Paycor holds %s timecard record(s) and %s correlated punch(es) "
+                     "in %s..%s.", len(timecards), len(known_correlations),
+                     window_start, window_end)
         except (PaycorAPIError, PaycorAuthError) as exc:
             log.error("Could not read Paycor punches: %s", exc)
             return 1
-        recon = report_reconciliation(sendable, paycor_punch_index)
+        recon = report_reconciliation(
+            sendable, index_timecards(timecards), known_correlations
+        )
 
-    report_contract()
+    report_contract(activity_note)
 
     # ---- Publish ----
-    sent, failed, skipped = [], [], []
+    sent, failed, unverified, skipped = [], [], [], []
     if args.publish:
-        # The guard is that the reconciliation read happened, not that it found
-        # anything. A window Paycor genuinely holds nothing for is the normal
-        # first push; a window we never asked about is the one that duplicates.
         if sendable and recon is None:
             log.error(
                 "Refusing to publish without a reconciliation read. Without "
@@ -538,9 +740,13 @@ def main():
             )
             return 2
 
-        queue, skipped = [], []
+        queue = []
         for row in sendable:
-            (skipped if already_present(row, paycor_punch_index)[0] else queue).append(row)
+            if str(row["correlation_in"]).lower() in known_correlations:
+                skipped.append(row)
+            else:
+                queue.append(row)
+
         if args.limit:
             held = queue[args.limit:]
             queue = queue[:args.limit]
@@ -549,33 +755,16 @@ def main():
                          args.limit, len(queue), len(held))
 
         print("\n" + "=" * 78)
-        print(f"PUBLISHING {len(queue)} punch(es) to "
-              f"{'PRODUCTION' if paycor_api.IS_PRODUCTION else 'the sandbox'}")
+        print(f"PUBLISHING {len(queue)} punch(es) -> {len(queue) * 2} Paycor objects "
+              f"to {'PRODUCTION' if paycor_api.IS_PRODUCTION else 'the sandbox'}")
         print("=" * 78)
-        for row in queue:
-            try:
-                paycor.create_punch(
-                    row["paycor_employee_id"], row["punch_in"], row["punch_out"]
-                )
-                sent.append(row)
-                log.info("sent %s %s-%s",
-                         row["employee_name"] or row["user_id"],
-                         f"{row['punch_in']:%m-%d %H:%M}",
-                         f"{row['punch_out']:%H:%M}")
-            except PaycorReadOnlyError as exc:
-                log.error("%s", exc)
-                return 1
-            except (PaycorAPIError, PaycorAuthError) as exc:
-                row["error"] = str(exc)
-                failed.append(row)
-                log.error("FAILED %s: %s", row["punch_id"], exc)
-                # Stop on the first failure rather than hammering payroll with
-                # a systematically wrong body. One bad punch is a fix; two
-                # hundred is an incident.
-                log.error("Stopping after the first failure. Nothing further sent.")
-                break
-        print(f"\n  sent {len(sent)}   failed {len(failed)}   "
-              f"already present {len(skipped)}")
+        sent, failed, unverified = publish(paycor, queue)
+        print(f"\n  landed {len(sent)}   rejected {len(failed)}   "
+              f"unverified {len(unverified)}   already present {len(skipped)}")
+        if unverified:
+            print("  'unverified' means Paycor accepted the batch but the error log")
+            print("  could not be read. Those punches may or may not be in payroll;")
+            print("  check before re-running, or a re-run could double them.")
     elif sendable:
         print(f"\n  Dry run: nothing was sent. {len(sendable)} punch(es) are ready.")
         if not args.reconcile:
@@ -587,17 +776,20 @@ def main():
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "target_date": target_date.isoformat() if target_date else None,
             "write_contract": describe_write_contract(),
-            "reconciliation": recon,
+            "activity_type": activity_note,
+            "reconciliation": {k: v for k, v in (recon or {}).items()
+                               if k != "missing_rows"},
             "sendable": [jsonable(r) for r in sendable],
             "refused": [jsonable(r) for r in refused],
             "sent": [jsonable(r) for r in sent],
             "failed": [jsonable(r) for r in failed],
+            "unverified": [jsonable(r) for r in unverified],
         }
         with open(args.json, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, default=str)
         print(f"\nPlan written to {args.json}")
 
-    if failed:
+    if failed or unverified:
         return 1
     return 0
 

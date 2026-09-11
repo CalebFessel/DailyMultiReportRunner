@@ -1,35 +1,34 @@
 """
-Paycor Public API client, scoped to what a timecard push needs.
+Paycor Public API v1 client, scoped to what a timecard push needs.
 
-Two things make this client different from the other two in this repo, and
-both are deliberate.
+Built against Paycor's own OpenAPI 3.0 spec, kept at
+docs/paycor-public-api-v1.json. Endpoint paths, required fields and response
+shapes below are taken from it verbatim rather than inferred -- including its
+inconsistent casing, which is reproduced exactly because URL paths are
+case-sensitive: the punch *read* is `/v1/legalEntities/...` with a capital E
+while every other endpoint here is `/v1/legalentities/...`.
+
+Two things make this client different from the Samsara one, and both are
+deliberate.
 
 **It defaults to the sandbox.** `PAYCOR_ENVIRONMENT` must say `production` in
-so many words before a single call leaves for the real tenant. Samsara's client
-defaults to the real API because a bad route wastes a driver's morning; a bad
-punch changes what somebody is paid, and wage-hour errors belong to the
-employer, not the vendor.
+so many words before a call leaves for the real tenant. A bad route wastes a
+driver's morning; a bad punch changes what somebody is paid.
 
-**Its write shape is unverified.** developers.paycor.com is unreachable from
-the environment this was written in, so the read endpoints below are
-corroborated only from secondary sources and the write endpoint is a best
-reading of them. Every part of the write that could differ -- the path, the
-HTTP method, the field names, the timestamp format -- is an environment
-variable rather than a literal, so correcting it against the real docs is a
-config change and not a rewrite. `describe_write_contract()` prints exactly
-what this client believes, which is the first thing to check against Paycor's
-own reference once you have portal access.
+**A 202 is not success.** `CreatePunches` is asynchronous: it accepts the
+batch and returns a tracking id, and whether the punches actually landed is
+only visible by reading the punch error log for that id afterwards. Treating
+the 202 as "sent" would report success for punches Paycor rejected, so
+`create_punches` returns the tracking id and `punch_errors` is the other half
+of the operation. Never call one without the other.
 
-Auth is OAuth 2.0 plus an APIm subscription key; both are required on every
-call. Paycor's flow is an authorization-code grant against secure.paycor.com,
-which needs a human in a browser once. The refresh token that falls out of it
-is what belongs in .env -- this client exchanges it for a short-lived access
-token and re-exchanges when that expires.
+Auth is two headers, both required on every call:
+    Authorization: Bearer <access token>
+    Ocp-Apim-Subscription-Key: <APIm subscription key>
 
-Sources, all secondary:
-  https://developers.paycor.com/explore
-  https://www.merge.dev/blog/paycor-api
-  https://rollout.com/integration-guides/paycor/
+The bearer comes from Paycor's authorization-code grant, which needs a human
+in a browser once; the refresh token that falls out of it is what belongs in
+.env. See the Paycor section of README.md.
 """
 
 import json
@@ -39,14 +38,17 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 log = logging.getLogger(__name__)
 
+# The spec lists only the production host. The sandbox host is Paycor's
+# documented counterpart to it and is what this client points at by default.
 PRODUCTION_BASE_URL = "https://apis.paycor.com"
 SANDBOX_BASE_URL = "https://apis-sandbox.paycor.com"
 
-# The environment gate. Anything other than the exact string "production"
-# resolves to the sandbox, so a typo fails safe rather than going live.
+# The environment gate. Anything but the exact string "production" resolves to
+# the sandbox, so a typo fails safe rather than going live.
 ENVIRONMENT = os.getenv("PAYCOR_ENVIRONMENT", "sandbox").strip().lower()
 IS_PRODUCTION = ENVIRONMENT == "production"
 
@@ -60,23 +62,28 @@ MAX_RETRIES = 4
 # on the one call that straddles the boundary.
 TOKEN_EXPIRY_MARGIN_SECONDS = 60
 
-# ---------------------------------------------------------------------------
-# The unverified write contract. Every one of these is a guess until checked
-# against Paycor's own reference; all are overridable so that checking them
-# costs an .env edit rather than a code change.
-# ---------------------------------------------------------------------------
-PUNCH_WRITE_PATH = os.getenv(
-    "PAYCOR_PUNCH_WRITE_PATH", "v1/legalentities/{legal_entity_id}/timecardpunches"
-)
-PUNCH_WRITE_METHOD = os.getenv("PAYCOR_PUNCH_WRITE_METHOD", "POST").upper()
-PUNCH_FIELD_EMPLOYEE = os.getenv("PAYCOR_PUNCH_FIELD_EMPLOYEE", "employeeId")
-PUNCH_FIELD_IN = os.getenv("PAYCOR_PUNCH_FIELD_IN", "punchInTime")
-PUNCH_FIELD_OUT = os.getenv("PAYCOR_PUNCH_FIELD_OUT", "punchOutTime")
-# Paycor's timecard times are wall-clock in the employee's own zone in the UI.
-# Whether the API wants a naive local string or an offset-bearing one is
-# exactly the kind of thing that silently shifts every punch by hours, so it
-# is a setting with a loud default rather than an assumption.
-PUNCH_TIME_FORMAT = os.getenv("PAYCOR_PUNCH_TIME_FORMAT", "%Y-%m-%dT%H:%M:%S")
+# Paycor documents punchDateTime as "local time of the associated employee",
+# formatted YYYY-MM-DDTHH:MM:SS. Traumasoft punches are already tenant-local
+# once parse_shift_ts has applied the offset, so they go out unconverted -- but
+# only because both are the same wall clock, which is worth stating.
+PUNCH_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+
+# CreatePunches takes an array. Paycor documents no explicit ceiling, so this
+# is a self-imposed one: a failed batch has to be diagnosed through a single
+# error log, and a smaller batch makes that log readable.
+MAX_PUNCH_BATCH = int(os.getenv("PAYCOR_MAX_PUNCH_BATCH", "100"))
+
+# employeePunches caps its window at 31 days per the spec.
+MAX_EMPLOYEE_PUNCH_DAYS = 31
+
+# A fixed namespace, so the correlation id derived from a Traumasoft punch is
+# the same every run. That is what makes a re-run recognise its own writes
+# instead of duplicating them.
+CORRELATION_NAMESPACE = uuid.UUID("6f1a4d2e-0c27-4c5a-9b3e-7d0f2a8c15b4")
+
+PUNCH_STATUS_IN = "In"
+PUNCH_STATUS_OUT = "Out"
+PUNCH_STATUS_TYPES = ("Auto", "In", "Out", "Transfer")
 
 
 class PaycorAPIError(RuntimeError):
@@ -97,20 +104,36 @@ class PaycorAuthError(RuntimeError):
     """Raised when no usable credential could be assembled."""
 
 
+def correlation_id(traumasoft_punch_id, half):
+    """
+    A deterministic correlation id for one half of a Traumasoft punch.
+
+    Paycor stores `correlationId` on the punch and returns it when the punch is
+    read back, which turns "have I already sent this?" into an exact lookup
+    rather than a timestamp comparison with a tolerance. Deriving it from the
+    Traumasoft punch id means the answer survives a re-run, a restart, and a
+    clock that disagrees by a minute.
+    """
+    return str(uuid.uuid5(CORRELATION_NAMESPACE, f"ts-punch:{traumasoft_punch_id}:{half}"))
+
+
 def describe_write_contract():
-    """What this client currently believes a punch write looks like."""
+    """What this client sends, and where each part of it comes from."""
     return {
         "environment": "production" if IS_PRODUCTION else "sandbox",
         "base_url": PRODUCTION_BASE_URL if IS_PRODUCTION else SANDBOX_BASE_URL,
-        "method": PUNCH_WRITE_METHOD,
-        "path": PUNCH_WRITE_PATH,
-        "body_fields": {
-            "employee": PUNCH_FIELD_EMPLOYEE,
-            "punch_in": PUNCH_FIELD_IN,
-            "punch_out": PUNCH_FIELD_OUT,
-        },
+        "request": "POST /v1/legalentities/{legalEntityId}/CreatePunches",
+        "body": "array of EmployeePunch",
+        "required_fields": [
+            "employeeId", "departmentId", "punchDateTime",
+            "punchStatusType", "activityTypeId", "isTransfer",
+        ],
+        "punch_model": "one object per clock EVENT (In / Out), not per interval",
         "time_format": PUNCH_TIME_FORMAT,
-        "verified": False,
+        "accepted_response": "202 + resourceUrl.id (tracking id); errors only "
+                             "visible via GET punchErrorLog/{trackingId}",
+        "source": "docs/paycor-public-api-v1.json (Paycor Public API v1, OpenAPI 3.0)",
+        "verified": True,
     }
 
 
@@ -149,8 +172,8 @@ class PaycorClient:
 
         if not self.subscription_key:
             raise PaycorAuthError(
-                "PAYCOR_SUBSCRIPTION_KEY is not set. Every Paycor call needs it "
-                "alongside the bearer token -- see .env.example."
+                "PAYCOR_SUBSCRIPTION_KEY is not set. Paycor wants it on every "
+                "call alongside the bearer token -- see .env.example."
             )
         if not self._access_token and not self.refresh_token:
             raise PaycorAuthError(
@@ -181,19 +204,15 @@ class PaycorClient:
             f"{self.base_url}/sts/v1/common/token"
             f"?subscription-key={urllib.parse.quote(self.subscription_key)}"
         )
-        form = {
-            "grant_type": "refresh_token",
-            "refresh_token": self.refresh_token,
-        }
+        form = {"grant_type": "refresh_token", "refresh_token": self.refresh_token}
         if self.client_id:
             form["client_id"] = self.client_id
         if self.client_secret:
             form["client_secret"] = self.client_secret
 
-        body = urllib.parse.urlencode(form).encode("utf-8")
         req = urllib.request.Request(
             url,
-            data=body,
+            data=urllib.parse.urlencode(form).encode("utf-8"),
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
@@ -216,8 +235,8 @@ class PaycorClient:
                 f"Token response carried no access_token: {list(payload)}"
             )
         # Paycor rotates the refresh token on use in some configurations. Keep
-        # whichever one came back so a long run does not authenticate once and
-        # then fail on a stale credential.
+        # whichever came back, so a long run does not authenticate once and then
+        # fail on a stale credential.
         if payload.get("refresh_token"):
             self.refresh_token = payload["refresh_token"]
         self._access_token = token
@@ -282,7 +301,7 @@ class PaycorClient:
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
                 # A 401 mid-run usually means the token aged out under us.
-                # Refresh once and try again before treating it as fatal.
+                # Refresh once and retry before treating it as fatal.
                 if exc.code == 401 and attempt == 0 and self.refresh_token:
                     log.info("Paycor 401 on %s, refreshing the token and retrying.", path)
                     self._access_token = None
@@ -310,23 +329,22 @@ class PaycorClient:
         """
         Walk Paycor's continuation-token pagination.
 
-        Responses carry {"records": [...], "hasMoreResults": bool,
-        "continuationToken": "..."}. Key names vary a little across their
-        endpoints, so several spellings are accepted rather than assuming one.
+        Paged endpoints answer with
+        {"records": [...], "hasMoreResults": bool, "continuationToken": "..."}.
+        A few endpoints (employeePunches among them) return a bare array with
+        no envelope at all, so that shape is handled rather than assumed away.
         """
         params = dict(params or {})
         pages = 0
         while pages < max_pages:
             payload = self.request("GET", path, params=params)
-            rows = (
-                payload.get("records")
-                or payload.get("results")
-                or payload.get("data")
-                or []
-            )
-            for row in rows:
+            if isinstance(payload, list):
+                for row in payload:
+                    yield row
+                return
+            for row in payload.get("records") or []:
                 yield row
-            token = payload.get("continuationToken") or payload.get("continuation_token")
+            token = payload.get("continuationToken")
             more = payload.get("hasMoreResults")
             if more is None:
                 more = bool(token)
@@ -347,61 +365,157 @@ class PaycorClient:
             )
         return entity
 
-    def list_employees(self, legal_entity_id=None, include_terminated=False):
-        """GET /v1/legalentities/{id}/employees -- the Paycor-side roster."""
+    def list_employees(self, legal_entity_id=None):
+        """
+        GET /v1/legalentities/{id}/employees
+
+        Each record carries `id` (the employee guid every punch is addressed
+        to), `employeeNumber` (the string that joins to Traumasoft's
+        employee_num), `badgeNumber`, and `department` as a ResourceReference
+        whose id is the department guid CreatePunches requires.
+        """
         entity = self._entity(legal_entity_id)
-        return list(self.paginate(
-            f"v1/legalentities/{entity}/employees",
-            params={"includeTerminated": "true" if include_terminated else None},
-        ))
+        return list(self.paginate(f"v1/legalentities/{entity}/employees"))
+
+    def list_departments(self, legal_entity_id=None):
+        """GET /v1/legalentities/{id}/departments -- id, code, description."""
+        entity = self._entity(legal_entity_id)
+        return list(self.paginate(f"v1/legalentities/{entity}/departments"))
+
+    def list_activity_types(self, legal_entity_id=None):
+        """
+        GET /v1/legalentities/{id}/activitytypes -- id, name, type.
+
+        CreatePunches requires an activityTypeId and Paycor supplies no
+        default, so one of these has to be chosen before anything can be sent.
+        """
+        entity = self._entity(legal_entity_id)
+        return list(self.paginate(f"v1/legalentities/{entity}/activitytypes"))
 
     def get_timecard_punches(self, start_date, end_date, legal_entity_id=None):
         """
-        GET /v1/legalentities/{id}/timecardpunches over a date window.
+        GET /v1/legalEntities/{id}/punches -- note the capital E, per the spec.
 
-        This is the reconciliation read: what Paycor already holds, to compare
-        against what Traumasoft says before anything is written.
+        Returns TimeCardV3 records, which are punch *pairs*: punchIn, punchOut,
+        hourAmount, employeeId, employeeNumber, departmentCode. Both dates are
+        required. This is the shape that matches Traumasoft's own intervals,
+        so it is what the reconciliation reads.
         """
         entity = self._entity(legal_entity_id)
         return list(self.paginate(
-            f"v1/legalentities/{entity}/timecardpunches",
+            f"v1/legalEntities/{entity}/punches",
             params={"startDate": start_date, "endDate": end_date},
         ))
 
-    def get_employee_punches(self, employee_id, start_date=None, end_date=None):
-        """GET /v1/employees/{id}/timecardpunches -- one person's punches."""
-        return list(self.paginate(
-            f"v1/employees/{employee_id}/timecardpunches",
-            params={"startDate": start_date, "endDate": end_date},
-        ))
-
-    # =============================
-    # WRITE
-    # =============================
-    def build_punch_body(self, employee_id, punch_in, punch_out):
+    def get_employee_punches(self, employee_id, start_date, end_date):
         """
-        The request body, assembled from the configurable field names.
+        GET /v1/employees/{id}/employeePunches -- individual punch events.
 
-        Separate from `create_punch` so a dry run can show precisely what would
+        Unlike the legal-entity read above this returns one record per clock
+        event, carrying `punchId` and, crucially, `correlationId` -- which is
+        what lets a re-run recognise punches it sent itself. The window is
+        capped at 31 days by the spec.
+        """
+        return list(self.paginate(
+            f"v1/employees/{employee_id}/employeePunches",
+            params={"startDate": start_date, "endDate": end_date},
+        ))
+
+    def punch_errors(self, tracking_id, legal_entity_id=None):
+        """
+        GET /v1/legalentities/{id}/punchErrorLog/{trackingId}
+
+        The other half of create_punches. An empty list here is the only
+        evidence that an accepted batch actually landed.
+        """
+        entity = self._entity(legal_entity_id)
+        return list(self.paginate(
+            f"v1/legalentities/{entity}/punchErrorLog/{tracking_id}"
+        ))
+
+    # =============================
+    # WRITES
+    # =============================
+    @staticmethod
+    def build_punch(employee_id, department_id, activity_type_id, punch_datetime,
+                    status, note=None, work_location_id=None, correlation=None):
+        """
+        One EmployeePunch object -- a single clock event, not an interval.
+
+        This is the shape mistake worth naming: Paycor's punch model is
+        event-based, so a shift that Traumasoft stores as one row with a start
+        and an end becomes two objects here, an In and an Out.
+
+        Separate from `create_punches` so a dry run can show exactly what would
         be sent without a client that is able to send it.
         """
+        if status not in PUNCH_STATUS_TYPES:
+            raise ValueError(
+                f"punchStatusType must be one of {PUNCH_STATUS_TYPES}, got {status!r}"
+            )
         body = {
-            PUNCH_FIELD_EMPLOYEE: employee_id,
-            PUNCH_FIELD_IN: punch_in.strftime(PUNCH_TIME_FORMAT),
+            "employeeId": employee_id,
+            "departmentId": department_id,
+            "punchDateTime": punch_datetime.strftime(PUNCH_TIME_FORMAT),
+            "punchStatusType": status,
+            "activityTypeId": activity_type_id,
+            # Every punch here is a plain clock event on one department. A
+            # transfer punch means moving between departments or activities
+            # mid-shift, which nothing in the Traumasoft feed describes.
+            "isTransfer": False,
         }
-        if punch_out is not None:
-            body[PUNCH_FIELD_OUT] = punch_out.strftime(PUNCH_TIME_FORMAT)
+        if note:
+            # Paycor rejects a note outside 1..300 characters.
+            body["note"] = str(note)[:300]
+        if work_location_id:
+            body["workLocationId"] = work_location_id
+        if correlation:
+            body["correlationId"] = correlation
         return body
 
-    def create_punch(self, employee_id, punch_in, punch_out, legal_entity_id=None):
+    def create_punches(self, punches, legal_entity_id=None):
         """
-        Write one punch. Requires read_only=False.
+        POST /v1/legalentities/{id}/CreatePunches. Requires read_only=False.
 
-        UNVERIFIED against Paycor's own documentation -- see the module
-        docstring. Check `describe_write_contract()` against their reference
-        before pointing this at production.
+        Returns the tracking id from the 202 response. **That is an
+        acknowledgement, not a result** -- Paycor validates asynchronously, so
+        call `punch_errors(tracking_id)` afterwards to find out what actually
+        landed. A caller that treats this return value as success will report
+        punches as sent that Paycor threw away.
         """
         entity = self._entity(legal_entity_id)
-        path = PUNCH_WRITE_PATH.format(legal_entity_id=entity)
-        body = self.build_punch_body(employee_id, punch_in, punch_out)
-        return self.request(PUNCH_WRITE_METHOD, path, json_body=body, write=True)
+        if not punches:
+            return None
+        if len(punches) > MAX_PUNCH_BATCH:
+            raise ValueError(
+                f"{len(punches)} punches exceeds the {MAX_PUNCH_BATCH} batch "
+                "ceiling; send them in chunks so one error log stays readable."
+            )
+        payload = self.request(
+            "POST", f"v1/legalentities/{entity}/CreatePunches",
+            json_body=punches, write=True,
+        )
+        resource = (payload or {}).get("resourceUrl") or {}
+        tracking_id = resource.get("id")
+        if not tracking_id:
+            log.warning(
+                "CreatePunches returned no tracking id (%s); errors for this "
+                "batch cannot be checked.", json.dumps(payload)[:200]
+            )
+        return tracking_id
+
+    def delete_punches(self, employee_id, punch_ids):
+        """
+        DELETE /v1/employees/{id}/DeletePunches. Requires read_only=False.
+
+        Takes the punch guids returned by `get_employee_punches`. This is what
+        makes a sandbox test reversible -- a test you cannot undo is not a test
+        you should run against payroll.
+        """
+        body = [{"punchId": pid} for pid in punch_ids]
+        if not body:
+            return None
+        return self.request(
+            "DELETE", f"v1/employees/{employee_id}/DeletePunches",
+            json_body=body, write=True,
+        )

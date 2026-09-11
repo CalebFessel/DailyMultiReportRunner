@@ -452,15 +452,35 @@ Rails that cannot be configured away:
 
 `--limit N` sends only the first N punches, for a first live test.
 
-### The write shape is unverified
+### What the write actually looks like
 
-`developers.paycor.com` was unreachable from the environment this was built in,
-so the read endpoints are corroborated only from secondary sources and the write
-endpoint is a best reading of them. Every part of the write that could differ —
-path, method, field names, timestamp format — is an environment variable rather
-than a literal, so correcting it against Paycor's real reference costs an `.env`
-edit and not a code change. Every run prints the contract in effect; check that
-output against their docs before publishing anything.
+Built against Paycor's own OpenAPI spec, committed at
+`docs/paycor-public-api-v1.json`. Three things in it are worth knowing before
+you read the plan, because each one contradicts a reasonable assumption:
+
+- **Punches are events, not intervals.** `POST /v1/legalentities/{id}/CreatePunches`
+  takes an array where each object is a *single clock event* with one
+  `punchDateTime` and a `punchStatusType` of In/Out/Auto/Transfer. So one
+  Traumasoft punch row becomes **two** Paycor punches. The plan prints both.
+- **Three guids are required and Paycor defaults none of them.** `employeeId`
+  and `departmentId` come from the Paycor employee record; `activityTypeId` is
+  a per-tenant choice (`PAYCOR_ACTIVITY_TYPE`, default `Work`). A punch missing
+  any of them is refused rather than sent with a placeholder.
+- **A 202 is not success.** CreatePunches validates asynchronously: it returns a
+  tracking id, and whether the punches landed is only visible by reading
+  `GET /v1/legalentities/{id}/punchErrorLog/{trackingId}` afterwards. Every
+  publish here reads that log back before reporting anything as sent, and a
+  batch whose log cannot be read is reported as **unverified** rather than
+  counted either way.
+
+Idempotency is by correlation id, not timestamps. Each punch carries a
+`correlationId` derived deterministically from the Traumasoft punch id, and
+Paycor returns it on read — so "have I sent this already?" is an exact lookup
+that survives a re-run, a restart, and clocks that disagree by a minute.
+
+A sandbox test is also reversible: `GET /v1/employees/{id}/employeePunches`
+returns each punch's `punchId`, and `DELETE /v1/employees/{id}/DeletePunches`
+takes those ids. A test you cannot undo is not a test to run against payroll.
 
 ### Credentials
 

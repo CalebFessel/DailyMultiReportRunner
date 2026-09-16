@@ -209,6 +209,44 @@ stamp can date; only the second table says what the report would say. If the rec
 `TS_PICKUP_TIME_KEYS`. If they are emergency call types, leave it alone: a
 field that "recovers" them is inventing a deadline nobody gave the crew.
 
+### Rebuilding OTP for days already past
+
+Trips backfill roughly 90 days, so OTP — unlike UHU and staffing — can be
+restated for a window that has already gone by.
+
+```powershell
+python rebuild_otp_history.py 2026-08-01                  # to yesterday
+python rebuild_otp_history.py 2026-08-01 2026-09-15       # explicit end date
+```
+
+This matters because of what the arrival stamp used to default to. Until
+2026-09-16 the chain was led by `at_scene: At Patient Bedside`, which meant legs
+carrying it were scored at the patient and the rest at the scene — one column,
+two definitions — and the published figure ran roughly fourteen points below the
+pre-changeover series. A rebuild restates the window on one stamp.
+
+It writes `CompanyWide_OTP_Rebuild_<start>_to_<end>.xlsx`: Summary, Daily,
+By Cost Center, By Call Type, and Daily by Cost Center.
+
+Three things the Summary sheet says that are worth knowing before you send the
+workbook to anyone:
+
+- **The window percentage is summed, not averaged.** `(early + on time) /
+  scored` across every day. Averaging the daily percentages would weight a quiet
+  Sunday like a full Monday.
+- **A day that returned no legs is blank, not zero.** A 0% day and a day with no
+  data are different claims and the sheet keeps them apart.
+- **Cost centers come from today's map.** Cost center is not on a trip; it is
+  resolved through `shift_name → crew → employee`, which the API answers only
+  for the current shift window. A profile that changed cost centers during the
+  window carries its current one across the whole rebuild.
+
+**It does not write to the append workbooks.** Those are the daily runner's
+record of what it published on the day, and a second writer backfilling them
+would make the file's contents depend on which process ran last. If the rebuilt
+series is the one you want to keep, it belongs beside the appends, not inside
+them.
+
 ### Can the ePCR time be reached at all?
 
 `probe_epcr_huly.py` asks that properly. The spec puts `Data/Epcr/Huly` out of

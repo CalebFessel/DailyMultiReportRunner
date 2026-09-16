@@ -9,9 +9,12 @@ that decide whether the migrated report can be trusted.
 
   1. Which timestamp replaces ePCR field 549?
      The current OTP scores against an ePCR field this API does not expose.
-     `at_scene` and `at_scene: At Patient Bedside` are both candidates. Rather
-     than picking one and hoping, this recomputes OTP under each and reports
-     which reproduces the historical numbers most closely.
+     `at_scene` is the CAD stamp that replaces it. (The bedside variant was a
+     candidate until the tenant confirmed it is not captured here; a stamp
+     nobody records cannot reproduce anything, so it is no longer scored.)
+     This recomputes OTP under each remaining candidate and reports which
+     reproduces the historical numbers most closely. Add candidates by editing
+     ARRIVAL_CANDIDATES below.
 
   2. Does the API see the same population the SQL did?
      Only 233 of 374 completed legs on the probe day carried a scheduled
@@ -54,9 +57,7 @@ COST_CENTER_SHEET = "OTP by Cost Center"
 
 # Candidate arrival stamps, each tried on its own.
 ARRIVAL_CANDIDATES = [
-    ["at_scene: At Patient Bedside"],
     ["at_scene"],
-    ["at_scene: At Patient Bedside", "at_scene"],
 ]
 
 # GetTrips accepts an inclusive range capped at 31 days.
@@ -95,7 +96,7 @@ def fetch_legs_by_date(api, start_date, end_date):
             log.error("  failed: %s", exc)
             legs = []
         for leg in legs:
-            pickup = R.parse_ts(leg.get("pickup_time"))
+            pickup = R.scheduled_pickup_time(leg)
             if pickup:
                 by_date[pickup.date()].append(leg)
         log.info("  %s legs", len(legs))

@@ -48,12 +48,41 @@ OOS_HISTORY_FILE = os.path.join(STATE_DIR, "vehicle_oos_history.json")
 REGIONS_FILE = os.path.join(STATE_DIR, "regions.json")
 
 # Trip timestamp names this tenant emits, in preference order, for the moment a
-# unit reached the patient. The current SQL scores against ePCR field 549,
-# which this API does not expose; `at_scene` is the closest CAD equivalent and
-# the bedside variant is closer still where it is recorded.
+# unit reached the patient. The old SQL scored against ePCR field 549, which
+# this API does not expose; `at_scene` is the closest CAD equivalent.
+#
+# "At Patient Bedside" was in this chain until the tenant confirmed it is not a
+# timestamp they track. A stamp nobody records can only ever be absent, so
+# keeping it first meant every lookup paid for a miss before falling through to
+# the stamp that actually holds the value. Add it back through the environment
+# variable if bedside capture is ever turned on.
 ARRIVAL_TIMESTAMP_KEYS = [
     k.strip() for k in os.getenv(
-        "TS_ARRIVAL_TIMESTAMP_KEYS", "at_scene: At Patient Bedside,at_scene"
+        "TS_ARRIVAL_TIMESTAMP_KEYS", "at_scene"
+    ).split(",") if k.strip()
+]
+
+# Trip fields that can carry the scheduled pickup, in preference order. This is
+# the OTP denominator's other half: a leg with no scheduled time cannot be
+# judged late no matter how good its arrival stamp is.
+#
+# `pickup_time` is the CAD grid's scheduled pickup and is what the old SQL
+# compared against, so it stays the default and the only default. The other
+# candidates are deliberately NOT chained in behind it:
+#
+#   appt_time             the appointment the trip has to make, which is a
+#                         different promise from the pickup the crew was given
+#   requested_pickup_time what the caller asked for, before dispatch scheduled
+#                         it -- scoring against this measures the call taker
+#   eta_time              a projection, not a commitment
+#
+# Falling back to any of them would raise the scored count while quietly
+# changing what "on time" means per row. Run probe_otp_coverage.py first: it
+# reports how many of the unscored legs each field would recover and what kind
+# of call they are. Set TS_PICKUP_TIME_KEYS only once that output justifies it.
+PICKUP_TIME_KEYS = [
+    k.strip() for k in os.getenv(
+        "TS_PICKUP_TIME_KEYS", "pickup_time"
     ).split(",") if k.strip()
 ]
 
@@ -248,6 +277,22 @@ def arrival_time(leg, keys=None):
     for key in (keys or ARRIVAL_TIMESTAMP_KEYS):
         if stamps.get(key):
             parsed = parse_ts(stamps[key])
+            if parsed:
+                return parsed
+    return None
+
+
+def scheduled_pickup_time(leg, keys=None):
+    """
+    The first configured scheduled-pickup field present on this leg.
+
+    Reads top-level leg fields, not the timestamps map: the scheduled time is
+    something dispatch set, while the timestamps map is what the crew did.
+    """
+    for key in (keys or PICKUP_TIME_KEYS):
+        value = leg.get(key)
+        if value:
+            parsed = parse_ts(value)
             if parsed:
                 return parsed
     return None
@@ -813,19 +858,24 @@ def build_dependency_notes(region=None, window=None, uhu_days=None, staffing_day
     # ---- OTP
     add("OTP", "on-time percentage", "Complete, but not comparable to history",
         f"the CAD '{ARRIVAL_TIMESTAMP_KEYS[0]}' stamp against the scheduled "
-        f"pickup_time, +/-{OTP_ON_TIME_WINDOW_MINUTES} minutes counting as on time",
+        f"'{PICKUP_TIME_KEYS[0]}', +/-{OTP_ON_TIME_WINDOW_MINUTES} minutes "
+        "counting as on time",
         covers,
         "The old report took arrival from ePCR field 549, which this API cannot "
         "reach -- Data/Epcr/Huly answers 501 to a read. This is the nearest CAD "
         "equivalent, so the series is sound going forward but will not tie to "
         "OTP numbers produced before the changeover.")
     add("OTP", "which legs are scored", "Known exclusion",
-        "legs carrying both a scheduled pickup and an arrival stamp",
+        f"legs carrying both a scheduled '{PICKUP_TIME_KEYS[0]}' and an "
+        f"'{ARRIVAL_TIMESTAMP_KEYS[0]}' stamp",
         covers,
         "On a sampled day only 233 of 374 completed legs had a scheduled "
         "pickup_time, so roughly a third of finished runs cannot be scored for "
         "lateness at all. The old SQL filtered the same way, so this is not new, "
-        "but the denominator is smaller than 'runs completed'.")
+        "but the denominator is smaller than 'runs completed'. A leg with no "
+        "scheduled time was never promised one -- probe_otp_coverage.py breaks "
+        "the unscored legs down by call type and shows what each alternative "
+        "pickup field would recover before you change TS_PICKUP_TIME_KEYS.")
 
     # ---- Run volume
     add("Run Volume", "transport counts", "Complete",
@@ -1141,14 +1191,15 @@ class OutOfServiceHistory:
 # =============================
 # ON-TIME PERFORMANCE
 # =============================
-def score_leg(leg, arrival_keys=None, window=OTP_ON_TIME_WINDOW_MINUTES):
+def score_leg(leg, arrival_keys=None, window=OTP_ON_TIME_WINDOW_MINUTES,
+              pickup_keys=None):
     """
     Classify one leg as Early / On Time / Late / Missing Data.
 
     Mirrors the SQL's CASE: the delta is arrival minus scheduled pickup, and
     anything inside +/- `window` minutes is on time.
     """
-    pickup = parse_ts(leg.get("pickup_time"))
+    pickup = scheduled_pickup_time(leg, pickup_keys)
     arrived = arrival_time(leg, arrival_keys)
     if not pickup or not arrived:
         return "Missing Data", None
@@ -1160,7 +1211,7 @@ def score_leg(leg, arrival_keys=None, window=OTP_ON_TIME_WINDOW_MINUTES):
     return "Late", delta
 
 
-def scored_legs(legs, cost_center_map, arrival_keys=None):
+def scored_legs(legs, cost_center_map, arrival_keys=None, pickup_keys=None):
     """
     Score every leg that OTP can actually judge.
 
@@ -1173,7 +1224,7 @@ def scored_legs(legs, cost_center_map, arrival_keys=None):
     """
     rows = []
     for leg in legs:
-        status, delta = score_leg(leg, arrival_keys)
+        status, delta = score_leg(leg, arrival_keys, pickup_keys=pickup_keys)
         if status == "Missing Data":
             continue
         shift_name = profile_name(leg)
@@ -1577,7 +1628,7 @@ def _merge_spans(spans):
 def leg_anchor(leg, start_key):
     """When a leg committed its unit -- the span's own start, or the pickup."""
     stamps = timestamp_map(leg)
-    return parse_ts(stamps.get(start_key)) or parse_ts(leg.get("pickup_time"))
+    return parse_ts(stamps.get(start_key)) or scheduled_pickup_time(leg)
 
 
 def assign_leg(leg, spans, start_key, end_key):
@@ -2128,7 +2179,7 @@ def fetch_fleet_activity(api, metrics_date, lookback_days=None):
 
     by_day = defaultdict(list)
     for leg in legs:
-        pickup = parse_ts(leg.get("pickup_time"))
+        pickup = scheduled_pickup_time(leg)
         if pickup:
             by_day[pickup.date()].append(leg)
     return vehicle_last_seen(by_day)

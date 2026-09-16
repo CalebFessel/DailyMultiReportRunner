@@ -193,6 +193,7 @@ class TraumasoftAPI:
         timeout=DEFAULT_TIMEOUT,
         min_interval=DEFAULT_MIN_INTERVAL,
         session=None,
+        max_retries=None,
     ):
         base_url = base_url or os.getenv("TS_API_BASE_URL", "")
         self.base_url = base_url.rstrip("/")
@@ -201,6 +202,9 @@ class TraumasoftAPI:
         self.min_interval = min_interval
         self.session = session or requests.Session()
         self._last_request_at = 0.0
+        # Probes that expect a wall of 5xx (the ePCR surface answers 501) set
+        # this to 0 so an expected refusal costs one request instead of five.
+        self.max_retries = MAX_RETRIES if max_retries is None else int(max_retries)
 
         # The spec's HMAC formulas take a secret paired with the key, but the
         # key-creation screen may only issue a single value. When no secret is
@@ -316,7 +320,7 @@ class TraumasoftAPI:
         body_str = json.dumps(json_body, separators=(",", ":")) if json_body is not None else ""
 
         last_error = None
-        for attempt in range(MAX_RETRIES + 1):
+        for attempt in range(self.max_retries + 1):
             self._throttle()
 
             headers = self._auth_headers(body_str, legacy_hmac=legacy_hmac)
@@ -334,7 +338,7 @@ class TraumasoftAPI:
                 )
             except requests.RequestException as exc:
                 last_error = exc
-                if attempt >= MAX_RETRIES:
+                if attempt >= self.max_retries:
                     raise TraumasoftAPIError(None, f"{method} {path} failed: {exc}", path=path)
                 wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
                 log.warning("%s %s network error (%s); retrying in %ss", method, path, exc, wait)
@@ -342,7 +346,7 @@ class TraumasoftAPI:
                 continue
 
             if resp.status_code == 429:
-                if attempt >= MAX_RETRIES:
+                if attempt >= self.max_retries:
                     raise TraumasoftAPIError(429, f"{method} {path} rate limited", path=path)
                 wait = min(int(resp.headers.get("Retry-After", "60") or 60), MAX_RETRY_AFTER)
                 log.warning("%s %s rate limited; waiting %ss", method, path, wait)
@@ -351,7 +355,7 @@ class TraumasoftAPI:
 
             if resp.status_code >= 500:
                 last_error = resp.text[:500]
-                if attempt >= MAX_RETRIES:
+                if attempt >= self.max_retries:
                     raise TraumasoftAPIError(
                         resp.status_code, f"{method} {path} server error", path=path, body=last_error
                     )

@@ -137,6 +137,72 @@ For each report category, an append workbook in `APPEND_DIR` accumulates snapsho
 
 ---
 
+## Where OTP Gets Its Two Timestamps
+
+On-time performance is one subtraction: an arrival stamp minus a scheduled
+pickup. Both halves are configurable, because both were lost when direct
+database access went away.
+
+| Half | Env var | Default | Source |
+|---|---|---|---|
+| Arrived | `TS_ARRIVAL_TIMESTAMP_KEYS` | `at_scene` | the leg's CAD `timestamps` map |
+| Scheduled | `TS_PICKUP_TIME_KEYS` | `pickup_time` | the CAD grid's scheduled pickup |
+
+Both accept a comma-separated preference chain; the first value present on a
+leg wins. A leg missing either half is not scored.
+
+**Arrival.** The old SQL scored against ePCR field 549, which the ThirdParty
+API does not expose. `at_scene` is the closest CAD equivalent, so OTP is sound
+going forward but **will not tie to numbers produced before the changeover**.
+`at_scene: At Patient Bedside` was in the chain until this tenant confirmed it
+is not captured here — a stamp nobody records can only ever be a miss.
+
+**Scheduled.** `pickup_time` is what the old SQL compared against. Roughly a
+third of completed legs carry none, and there are two very different reasons
+that could be true:
+
+- the report is reading the wrong field — `appt_time` or
+  `requested_pickup_time` might be populated where `pickup_time` is not; or
+- those legs were never scheduled. An emergency call has no promised pickup,
+  so there is nothing to be late against, and dropping it is correct.
+
+Do not guess between them:
+
+```powershell
+python probe_otp_coverage.py 2026-09-15        # one busy weekday
+python probe_otp_coverage.py 2026-09-01 --days 14
+```
+
+It reports, per candidate field, how many legs carry it, how many legs *only*
+it can date, and what call types those legs are — then the same for arrival
+stamps, and the bottom line: how many completed legs the current configuration
+can actually score. If the recovered legs are scheduled transfer work, change
+`TS_PICKUP_TIME_KEYS`. If they are emergency call types, leave it alone: a
+field that "recovers" them is inventing a deadline nobody gave the crew.
+
+### Can the ePCR time be reached at all?
+
+`probe_epcr_huly.py` asks that properly. The spec puts `Data/Epcr/Huly` out of
+scope and a bare GET answered 501 — but these endpoints dispatch on `rtype`,
+and `Cad/Trip` already behaves differently with and without one, so a single
+unparameterised refusal proves little.
+
+```powershell
+python probe_epcr_huly.py 2026-09-15
+```
+
+It sweeps read-shaped actions (`GetRuns`, `GetTimestamps`, `GetFieldValues`, …)
+and neighbouring paths, records what each answers, and flags any payload
+containing something that looks like a scene arrival. It is **GET-only**; the
+write-shaped `HulyUpdateTrip` is excluded, and `test_otp_sources.py` enforces
+that by walking the probe's syntax tree rather than trusting a comment.
+
+If everything refuses, the findings file in `api_probe/` is the evidence to
+send Traumasoft support: it lists exactly what was tried and what came back.
+Getting a read path opened is what would make OTP comparable to history again.
+
+---
+
 ## How the Window Works
 
 The script runs over a midnight-to-midnight reporting window. [file:1]

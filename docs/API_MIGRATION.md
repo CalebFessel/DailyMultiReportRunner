@@ -70,8 +70,32 @@ minutes out (the timestamp is valid for 300 seconds — check `w32tm /query
 |---|---|
 | `cad_trip_legs` + `cad_trip_legs_rev` | `GET /ThirdParty/Data/Cad/Trip?rtype=GetTrips&trip_date=&range_days=` |
 | `sched_unit_types` (call type join) | `call_type` string, already resolved on `TripLegSummary` |
-| `rev.pickup_time` | `pickup_time` |
+| `rev.pickup_time` | `pickup_time` (configurable: `TS_PICKUP_TIME_KEYS`) |
 | `epcr_v2_values.field_value` (field 549) | **not available** — see below |
+
+`TripLegSummary` carries four fields that could plausibly date a pickup, and
+only one of them is the promise the crew was given:
+
+| Field | What it is | Used? |
+|---|---|---|
+| `pickup_time` | the CAD grid's scheduled pickup | **yes** — the default, and what the old SQL compared against |
+| `appt_time` | the appointment the trip has to make | no — a different promise |
+| `requested_pickup_time` | what the caller asked for, before dispatch scheduled it | no — scoring against it measures the call taker |
+| `eta_time` | a projection | no |
+
+Roughly a third of completed legs carry no `pickup_time` and so cannot be
+scored. Two explanations fit that number and they call for opposite responses:
+the report is reading the wrong field, or those legs were never scheduled
+(an emergency call has no promised pickup, so nothing can be late). Run
+`probe_otp_coverage.py` to tell them apart — it reports, per candidate field,
+how many unscored legs it would recover and what call types they are. Change
+`TS_PICKUP_TIME_KEYS` only once that output justifies it; a field that
+"recovers" emergency legs is inventing a deadline nobody gave the crew.
+
+The arrival side is `TS_ARRIVAL_TIMESTAMP_KEYS`, defaulting to `at_scene`.
+`at_scene: At Patient Bedside` was in that chain until this tenant confirmed it
+is not a timestamp they capture; a stamp nobody records can only ever be a miss,
+so it was removed.
 
 `range_days` is inclusive and capped at 31, so backfill works up to a month per call.
 
@@ -83,7 +107,18 @@ cannot reach it and no schema for it is published here.
 
 That makes the ask a specific one rather than a feature request: **credentials
 and documentation for the `Epcr/Huly` surface**, and confirmation of whether it
-reads or only writes. `Data/Attachments` accepts `epcr_run_id` and
+reads or only writes.
+
+`probe_epcr_huly.py` is the evidence for that ask. A single unparameterised GET
+answering 501 is weak: these endpoints dispatch on an `rtype`, and `Cad/Trip`
+already demonstrates a surface that behaves differently with and without one.
+The probe sweeps read-shaped `rtype` values (`GetRuns`, `GetTimestamps`,
+`GetFieldValues`, …) plus neighbouring paths, records the status each returns,
+and flags any payload containing something that looks like a scene arrival —
+field `549`, `on_scene`, `at_scene`, `patient_contact`. It is GET-only, and the
+write-shaped `HulyUpdateTrip` is excluded by a test that walks its AST rather
+than trusting a comment. If everything refuses, the findings file lists exactly
+what was tried and what each attempt answered, which is what support needs. `Data/Attachments` accepts `epcr_run_id` and
 `epcr_run_number` alongside `cad_leg_id`, so ePCR runs and CAD legs are
 correlatable internally — a join would be possible if a read path were opened.
 Whether Huly exposes per-run timestamps is unknown until those docs exist.

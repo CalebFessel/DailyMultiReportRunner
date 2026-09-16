@@ -154,12 +154,23 @@ leg wins. A leg missing either half is not scored.
 **Arrival.** The old SQL scored against ePCR field 549, which the ThirdParty
 API does not expose. `at_scene` is the closest CAD equivalent, so OTP is sound
 going forward but **will not tie to numbers produced before the changeover**.
-`at_scene: At Patient Bedside` was in the chain until this tenant confirmed it
-is not captured here — a stamp nobody records can only ever be a miss.
+`at_scene: At Patient Bedside` led that chain until 2026-09-16. It was removed
+on the belief that it is not captured here; the probe then found it on 229 of
+385 completed legs, so that belief was wrong. It stays out for a better reason:
+bedside lands *after* `at_scene` — you arrive, then you reach the patient — so a
+chain that falls through scores some legs at the scene and others at the
+patient and publishes both under one heading.
 
-**Scheduled.** `pickup_time` is what the old SQL compared against. Roughly a
-third of completed legs carry none, and there are two very different reasons
-that could be true:
+Pick one stamp and apply it to every leg. `at_scene` is on 95% of completed
+legs against bedside's 60%, so it judges nearly every run that happened.
+Bedside alone is defensible — it is closer to what ePCR field 549 measured —
+but it scores three legs in five, and it must not be chained.
+
+**Scheduled.** `pickup_time` is what the old SQL compared against, and on
+2026-09-15 it was present on **100%** of completed legs — nothing to recover,
+and no alternative field recovers anything. An August probe day showed only
+233 of 374 carrying it, which is what the check below was built to explain; if
+that gap ever returns, there are two very different reasons it could be true:
 
 - the report is reading the wrong field — `appt_time` or
   `requested_pickup_time` might be populated where `pickup_time` is not; or
@@ -174,9 +185,10 @@ python probe_otp_coverage.py 2026-09-01 --days 14
 ```
 
 It reports, per candidate field, how many legs carry it, how many legs *only*
-it can date, and what call types those legs are — then the same for arrival
-stamps, and the bottom line: how many completed legs the current configuration
-can actually score. If the recovered legs are scheduled transfer work, change
+it can date, and what call types those legs are — then, for the arrival stamps,
+**the on-time percentage each choice would actually publish**, and how far apart
+`at_scene` and bedside land on the legs carrying both. Coverage says what a
+stamp can date; only the second table says what the report would say. If the recovered legs are scheduled transfer work, change
 `TS_PICKUP_TIME_KEYS`. If they are emergency call types, leave it alone: a
 field that "recovers" them is inventing a deadline nobody gave the crew.
 

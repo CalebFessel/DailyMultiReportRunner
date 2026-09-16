@@ -85,9 +85,19 @@ def parse_args(argv):
 
 
 def completed(leg):
-    """Legs the OTP report would consider at all: cancellations are dropped."""
+    """
+    Legs the OTP report would consider at all: cancellations are dropped.
+
+    `trip_status` is the filter, but it is not the whole story -- a leg
+    cancelled after a unit was assigned can keep a status that says nothing
+    about the cancellation and carry a `canceled` timestamp instead. Those legs
+    have no arrival stamp and never will, so counting them as unscored makes
+    the scorable rate read worse than it is.
+    """
     status = (leg.get("trip_status") or "").strip().lower()
-    return bool(status) and "cancel" not in status and "disregard" not in status
+    if not status or "cancel" in status or "disregard" in status:
+        return False
+    return not any("cancel" in name.lower() for name in R.timestamp_map(leg))
 
 
 def field_coverage(legs, field):
@@ -106,6 +116,60 @@ def only_this_field(legs, field, baseline="pickup_time"):
 def call_type_breakdown(legs, limit=12):
     counts = Counter((leg.get("call_type") or "Unknown Call Type") for leg in legs)
     return counts.most_common(limit)
+
+
+def otp_under(legs, arrival_keys):
+    """
+    Recompute the day's OTP with one arrival chain, using the real scorer.
+
+    Coverage says how many legs a stamp can date; it does not say what the
+    report would publish. Two stamps can both be present on a leg and disagree
+    by ten minutes, which is the difference between On Time and Late.
+    """
+    counts = Counter()
+    deltas = []
+    for leg in legs:
+        status, delta = R.score_leg(leg, arrival_keys=arrival_keys)
+        counts[status] += 1
+        if delta is not None:
+            deltas.append(delta)
+    scored = counts["Early"] + counts["On Time"] + counts["Late"]
+    # Early counts as on time, matching the report's own aggregation.
+    on_time = counts["Early"] + counts["On Time"]
+    deltas.sort()
+    return {
+        "arrival_keys": arrival_keys,
+        "scored": scored,
+        "on_time": on_time,
+        "late": counts["Late"],
+        "unscored": counts["Missing Data"],
+        "on_time_pct": round(100.0 * on_time / scored, 1) if scored else None,
+        "median_delta_minutes": round(deltas[len(deltas) // 2], 1) if deltas else None,
+    }
+
+
+def stamp_gap(legs, earlier, later):
+    """
+    Minutes between two stamps on the legs carrying both.
+
+    If one stamp is systematically later than another, chaining them means the
+    column mixes two definitions of "arrived" -- and this is the size of the
+    disagreement.
+    """
+    gaps = []
+    for leg in legs:
+        stamps = R.timestamp_map(leg)
+        a, b = R.parse_ts(stamps.get(earlier)), R.parse_ts(stamps.get(later))
+        if a and b:
+            gaps.append((b - a).total_seconds() / 60.0)
+    if not gaps:
+        return None
+    gaps.sort()
+    return {
+        "legs_with_both": len(gaps),
+        "median_minutes": round(gaps[len(gaps) // 2], 1),
+        "mean_minutes": round(sum(gaps) / len(gaps), 1),
+    }
 
 
 def arrival_coverage(legs):
@@ -190,6 +254,32 @@ def main():
     for name in R.ARRIVAL_TIMESTAMP_KEYS:
         if name not in stamps:
             log.warning("  OTP is configured to read '%s', which no leg carries today.", name)
+
+    # Coverage is only half the question. Two stamps can both be present and
+    # disagree, so score the day under each and show what the report would
+    # publish -- that is the number anyone will argue about.
+    BEDSIDE = "at_scene: At Patient Bedside"
+    candidates = [["at_scene"], [BEDSIDE], [BEDSIDE, "at_scene"]]
+    findings["otp_by_arrival_stamp"] = [otp_under(done, keys) for keys in candidates]
+
+    log.info("")
+    log.info("--- What OTP would publish under each arrival stamp ---")
+    log.info("  %-34s %7s %8s %9s", "arrival chain", "scored", "on time", "median")
+    for row in findings["otp_by_arrival_stamp"]:
+        log.info("  %-34s %7s %7s%% %8s min",
+                 " -> ".join(row["arrival_keys"]), row["scored"],
+                 row["on_time_pct"] if row["on_time_pct"] is not None else "n/a",
+                 row["median_delta_minutes"] if row["median_delta_minutes"] is not None else "n/a")
+
+    gap = stamp_gap(done, "at_scene", BEDSIDE)
+    findings["scene_to_bedside_gap"] = gap
+    if gap:
+        log.info("")
+        log.info("--- How far apart the two stamps are ---")
+        log.info("  %s leg(s) carry both; bedside lands a median of %s min after at_scene",
+                 gap["legs_with_both"], gap["median_minutes"])
+        log.info("  A chain that falls through therefore scores some legs at the")
+        log.info("  scene and others at the patient, in one column. Pick one.")
 
     # The number that actually matters: how many legs the report can judge.
     scorable = sum(

@@ -51,11 +51,21 @@ REGIONS_FILE = os.path.join(STATE_DIR, "regions.json")
 # unit reached the patient. The old SQL scored against ePCR field 549, which
 # this API does not expose; `at_scene` is the closest CAD equivalent.
 #
-# "At Patient Bedside" was in this chain until the tenant confirmed it is not a
-# timestamp they track. A stamp nobody records can only ever be absent, so
-# keeping it first meant every lookup paid for a miss before falling through to
-# the stamp that actually holds the value. Add it back through the environment
-# variable if bedside capture is ever turned on.
+# `at_scene: At Patient Bedside` led this chain until 2026-09-16. It was removed
+# on the belief that the tenant does not capture it; probe_otp_coverage.py then
+# measured 229 of 385 completed legs carrying it, so that belief was wrong and
+# the correction below is the real reason it stays out.
+#
+# Bedside lands after at_scene -- you arrive, then you reach the patient. A
+# chain that falls through therefore scores some legs at the scene and others
+# at the patient and publishes both in one column, which is worse than either
+# choice made consistently. One stamp, applied to every leg.
+#
+# at_scene is that stamp: it is on 95% of completed legs against bedside's 60%,
+# so it judges nearly every run that happened rather than the subset where a
+# crew recorded a second status. Setting TS_ARRIVAL_TIMESTAMP_KEYS to bedside
+# alone is a defensible alternative -- it is closer to what the ePCR measured
+# -- but it scores three legs in five and must not be chained.
 ARRIVAL_TIMESTAMP_KEYS = [
     k.strip() for k in os.getenv(
         "TS_ARRIVAL_TIMESTAMP_KEYS", "at_scene"

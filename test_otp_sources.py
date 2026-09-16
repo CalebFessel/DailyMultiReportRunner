@@ -66,10 +66,11 @@ def test_default_keys():
         f"got {R.ARRIVAL_TIMESTAMP_KEYS}",
     )
     check(
-        "the bedside stamp is not in the default chain",
-        not any("bedside" in key.lower() for key in R.ARRIVAL_TIMESTAMP_KEYS),
-        "this tenant does not capture At Patient Bedside; a stamp nobody "
-        "records can only ever be a miss",
+        "exactly one arrival stamp is configured",
+        len(R.ARRIVAL_TIMESTAMP_KEYS) == 1,
+        "bedside lands after at_scene, so a chain that falls through scores "
+        "some legs at the scene and others at the patient in one column; "
+        f"got {R.ARRIVAL_TIMESTAMP_KEYS}",
     )
     check(
         "pickup defaults to pickup_time alone",
@@ -149,6 +150,17 @@ def test_arrival_reads_the_configured_stamp():
         R.arrival_time(bedside) is None,
         "the default chain is at_scene; bedside returns only when asked for",
     )
+
+    both = leg(timestamps=stamps(**{
+        "at_scene": "2026-08-19T09:05:00-04:00",
+    }) + [{"at_scene: At Patient Bedside": "2026-08-19T09:20:00-04:00"}])
+    found = R.arrival_time(both)
+    check(
+        "a leg carrying both is read at the scene, not at the patient",
+        found is not None and (found.hour, found.minute) == (9, 5),
+        "60% of legs carry both; whichever stamp is first decides the number "
+        f"for all of them. got {found}",
+    )
     found = R.arrival_time(bedside, keys=["at_scene: At Patient Bedside", "at_scene"])
     check(
         "...but it still resolves when the chain names it",
@@ -219,6 +231,98 @@ def test_scored_legs_passes_the_chain_through():
                             pickup_keys=["pickup_time", "requested_pickup_time"])
     check("both are scored when the chain is widened", len(widened) == 2,
           f"got {len(widened)} rows")
+
+
+# =============================
+# Comparing the two arrival stamps
+# =============================
+
+def test_otp_under_each_stamp():
+    """
+    The probe must publish the number, not just the coverage.
+
+    Coverage said bedside was on 60% of legs, which reads like a minor
+    fallback. It is not: when a leg carries both stamps the one listed first
+    decides that leg's verdict, and the two disagree by minutes. These legs are
+    built so the choice flips every verdict, which is the case that makes the
+    difference impossible to miss in the output.
+    """
+    print("\ntest_otp_under_each_stamp")
+
+    import probe_otp_coverage as P
+    bedside = "at_scene: At Patient Bedside"
+
+    def both(pickup, scene, bed):
+        return leg(pickup_time=pickup,
+                   timestamps=[{"at_scene": scene}, {bedside: bed}])
+
+    # On scene within the window, at the patient well outside it.
+    legs = [
+        both("2026-09-15T09:00:00-04:00", "2026-09-15T09:05:00-04:00", "2026-09-15T09:25:00-04:00"),
+        both("2026-09-15T10:00:00-04:00", "2026-09-15T10:03:00-04:00", "2026-09-15T10:30:00-04:00"),
+    ]
+
+    scene = P.otp_under(legs, ["at_scene"])
+    patient = P.otp_under(legs, [bedside])
+    check("at_scene scores every leg on time", scene["on_time_pct"] == 100.0,
+          f"got {scene}")
+    check("bedside scores the same legs late", patient["on_time_pct"] == 0.0,
+          f"got {patient}")
+    check("the same legs are scorable either way",
+          scene["scored"] == patient["scored"] == 2)
+
+    chained = P.otp_under(legs, [bedside, "at_scene"])
+    check(
+        "a chain follows whichever stamp is listed first",
+        chained["on_time_pct"] == patient["on_time_pct"],
+        "which is why the chain is not a safe middle ground: it silently "
+        f"publishes the bedside verdict for every leg carrying both. got {chained}",
+    )
+
+    # A leg with only at_scene: the chain reaches it, bedside alone does not.
+    legs.append(leg(pickup_time="2026-09-15T11:00:00-04:00",
+                    timestamps=[{"at_scene": "2026-09-15T11:02:00-04:00"}]))
+    check("bedside alone cannot score a scene-only leg",
+          P.otp_under(legs, [bedside])["unscored"] == 1)
+    check("the chain scores it",
+          P.otp_under(legs, [bedside, "at_scene"])["unscored"] == 0)
+
+    gap = P.stamp_gap(legs, "at_scene", bedside)
+    check("the gap is measured only on legs carrying both",
+          gap["legs_with_both"] == 2, f"got {gap}")
+    check("bedside is reported as landing after at_scene",
+          gap["median_minutes"] > 0, f"got {gap}")
+
+
+def test_cancelled_legs_do_not_count_as_unscored():
+    """
+    A leg cancelled after assignment has no arrival stamp and never will.
+
+    Counting it as a leg the report failed to score makes the scorable rate
+    read worse than it is -- the 19 legs that showed up this way on 2026-09-15
+    were cancellations wearing a status that did not say so.
+    """
+    print("\ntest_cancelled_legs_do_not_count_as_unscored")
+
+    import probe_otp_coverage as P
+
+    ran = leg(pickup_time="2026-09-15T09:00:00-04:00",
+              timestamps=[{"at_scene": "2026-09-15T09:05:00-04:00"}])
+    check("a leg that ran counts", P.completed(ran))
+
+    by_status = leg(trip_status="Cancelled", pickup_time="2026-09-15T09:00:00-04:00")
+    check("a cancelled status is dropped", not P.completed(by_status))
+
+    by_stamp = leg(trip_status="Completed", pickup_time="2026-09-15T09:00:00-04:00",
+                   timestamps=[{"canceled": "2026-09-15T09:00:00-04:00"}])
+    check(
+        "a canceled stamp is dropped even under a clean status",
+        not P.completed(by_stamp),
+        "otherwise it is counted as a run the report could not judge",
+    )
+
+    blank = leg(trip_status="", pickup_time="2026-09-15T09:00:00-04:00")
+    check("a statusless leg is still dropped", not P.completed(blank))
 
 
 # =============================
@@ -297,6 +401,8 @@ def main():
         test_arrival_reads_the_configured_stamp,
         test_scoring_needs_both_halves,
         test_scored_legs_passes_the_chain_through,
+        test_otp_under_each_stamp,
+        test_cancelled_legs_do_not_count_as_unscored,
         test_epcr_probe_is_read_only,
     ]
     for test in tests:

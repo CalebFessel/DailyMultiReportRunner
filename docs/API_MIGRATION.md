@@ -83,8 +83,10 @@ only one of them is the promise the crew was given:
 | `requested_pickup_time` | what the caller asked for, before dispatch scheduled it | no — scoring against it measures the call taker |
 | `eta_time` | a projection | no |
 
-Roughly a third of completed legs carry no `pickup_time` and so cannot be
-scored. Two explanations fit that number and they call for opposite responses:
+An August probe day carried `pickup_time` on only 233 of 374 completed legs. On
+2026-09-15 it was on **100%** of them, and no alternative field recovered a
+single leg, so there is currently no gap to close. Should it return, two
+explanations fit and they call for opposite responses:
 the report is reading the wrong field, or those legs were never scheduled
 (an emergency call has no promised pickup, so nothing can be late). Run
 `probe_otp_coverage.py` to tell them apart — it reports, per candidate field,
@@ -93,9 +95,24 @@ how many unscored legs it would recover and what call types they are. Change
 "recovers" emergency legs is inventing a deadline nobody gave the crew.
 
 The arrival side is `TS_ARRIVAL_TIMESTAMP_KEYS`, defaulting to `at_scene`.
-`at_scene: At Patient Bedside` was in that chain until this tenant confirmed it
-is not a timestamp they capture; a stamp nobody records can only ever be a miss,
-so it was removed.
+
+`at_scene: At Patient Bedside` led that chain until 2026-09-16, when it was
+removed on the stated belief that the tenant does not capture it. Measurement
+contradicted that: 229 of 385 completed legs on 2026-09-15 carry it. It stays
+out on different grounds. Bedside lands after `at_scene` by construction — a
+crew arrives, then reaches the patient — so a chain that falls through scores
+some legs at the scene and others at the patient and publishes both in one
+column. That is worse than either stamp applied consistently.
+
+| Stamp | Coverage (2026-09-15) | Reading |
+|---|---|---|
+| `at_scene` | 366 of 385 (95%) | arrival at the location |
+| `at_scene: At Patient Bedside` | 229 of 385 (60%) | arrival at the patient — closer to ePCR field 549 |
+
+`at_scene` is the default because it judges nearly every run that happened.
+Bedside alone is a defensible alternative on semantics; it is not defensible
+chained. `probe_otp_coverage.py` prints the on-time percentage each choice
+would publish, plus the median gap between the two stamps.
 
 `range_days` is inclusive and capped at 31, so backfill works up to a month per call.
 

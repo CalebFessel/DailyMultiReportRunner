@@ -104,15 +104,26 @@ crew arrives, then reaches the patient — so a chain that falls through scores
 some legs at the scene and others at the patient and publishes both in one
 column. That is worse than either stamp applied consistently.
 
-| Stamp | Coverage (2026-09-15) | Reading |
-|---|---|---|
-| `at_scene` | 366 of 385 (95%) | arrival at the location |
-| `at_scene: At Patient Bedside` | 229 of 385 (60%) | arrival at the patient — closer to ePCR field 549 |
+| Stamp | Scored (2026-09-15) | On time | Median delta |
+|---|---|---|---|
+| `at_scene` | 363 of 363 | **78.2%** | −3.7 min |
+| `at_scene: At Patient Bedside` | 228 of 363 | 58.3% | +5.8 min |
+| chained | 363 | 64.5% | +2.0 min |
 
-`at_scene` is the default because it judges nearly every run that happened.
-Bedside alone is a defensible alternative on semantics; it is not defensible
-chained. `probe_otp_coverage.py` prints the on-time percentage each choice
-would publish, plus the median gap between the two stamps.
+`at_scene` is the default on two independent grounds. It scores every completed
+leg, where bedside scores the 63% whose crew recorded a second status — not a
+random subset, since a crew that skips it is plausibly on a busier call. And it
+reproduces the historical range: the pre-changeover series ran in the high 70s
+and low 80s, which `at_scene` matches and the other two do not.
+
+**That resolves what field 549 was.** It was recording arrival at the scene, not
+at the patient. The caveat this document carried — that OTP would not tie to
+history — is therefore narrower than it looked: the definition carries over, and
+only row-level reconciliation is impossible, because the old numbers did not
+survive. Bedside lands a median 7.8 minutes later, which is scene-to-patient
+time and a useful figure in its own right, but it is not the OTP clock.
+
+`probe_otp_coverage.py` prints this table for any day.
 
 `range_days` is inclusive and capped at 31, so backfill works up to a month per call.
 

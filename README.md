@@ -152,8 +152,12 @@ Both accept a comma-separated preference chain; the first value present on a
 leg wins. A leg missing either half is not scored.
 
 **Arrival.** The old SQL scored against ePCR field 549, which the ThirdParty
-API does not expose. `at_scene` is the closest CAD equivalent, so OTP is sound
-going forward but **will not tie to numbers produced before the changeover**.
+API does not expose. `at_scene` stands in for it, and on the evidence it stands
+in well: it published **78.2%** on 2026-09-15 against a historical series that
+ran in the high 70s and low 80s. That match says field 549 was recording
+arrival *at the scene*, which is what `at_scene` is. It is corroboration rather
+than a tie-out — the old numbers did not survive the changeover, so there is
+nothing to reconcile row by row — but the series does not step.
 `at_scene: At Patient Bedside` led that chain until 2026-09-16. It was removed
 on the belief that it is not captured here; the probe then found it on 229 of
 385 completed legs, so that belief was wrong. It stays out for a better reason:
@@ -161,10 +165,23 @@ bedside lands *after* `at_scene` — you arrive, then you reach the patient — 
 chain that falls through scores some legs at the scene and others at the
 patient and publishes both under one heading.
 
-Pick one stamp and apply it to every leg. `at_scene` is on 95% of completed
-legs against bedside's 60%, so it judges nearly every run that happened.
-Bedside alone is defensible — it is closer to what ePCR field 549 measured —
-but it scores three legs in five, and it must not be chained.
+Pick one stamp and apply it to every leg. Measured on 2026-09-15:
+
+| Arrival stamp | Scored | On time | Median delta |
+|---|---|---|---|
+| `at_scene` | 363 of 363 | **78.2%** | −3.7 min (early) |
+| bedside | 228 of 363 | 58.3% | +5.8 min |
+| bedside → `at_scene` (old chain) | 363 | 64.5% | +2.0 min |
+
+Twenty points of OTP ride on that choice. `at_scene` wins on two counts. It
+matches the historical range, and it scores every leg — bedside's 58.3% is
+computed on the 63% of legs where a crew recorded a second status, and a crew
+that skips it is plausibly on a busier call, so those legs are not a random
+sample to drop. Scoring on bedside would make OTP partly a measure of
+documentation discipline.
+
+The 7.8-minute median gap between the two stamps is worth knowing on its own:
+that is scene-to-patient time on the calls where it is recorded.
 
 **Scheduled.** `pickup_time` is what the old SQL compared against, and on
 2026-09-15 it was present on **100%** of completed legs — nothing to recover,

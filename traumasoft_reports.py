@@ -866,26 +866,44 @@ def build_dependency_notes(region=None, window=None, uhu_days=None, staffing_day
         })
 
     # ---- OTP
-    add("OTP", "on-time percentage", "Complete, but not comparable to history",
+    otp_on_scene = ARRIVAL_TIMESTAMP_KEYS[0] == "at_scene"
+    add("OTP", "on-time percentage",
+        "Complete; consistent with the historical range" if otp_on_scene
+        else "Complete, but not comparable to history",
         f"the CAD '{ARRIVAL_TIMESTAMP_KEYS[0]}' stamp against the scheduled "
         f"'{PICKUP_TIME_KEYS[0]}', +/-{OTP_ON_TIME_WINDOW_MINUTES} minutes "
         "counting as on time",
         covers,
-        "The old report took arrival from ePCR field 549, which this API cannot "
-        "reach -- Data/Epcr/Huly answers 501 to a read. This is the nearest CAD "
-        "equivalent, so the series is sound going forward but will not tie to "
-        "OTP numbers produced before the changeover.")
-    add("OTP", "which legs are scored", "Known exclusion",
+        ("The old report took arrival from ePCR field 549, which this API "
+         "cannot reach -- Data/Epcr/Huly refuses every read. 'at_scene' is the "
+         "CAD stamp standing in for it, and it lands in the same range the old "
+         "report did: 78.2% on 2026-09-15 against a remembered high-70s/low-80s "
+         "series, which says field 549 was recording arrival at the scene. "
+         "Corroboration, not a tie-out -- the old numbers themselves did not "
+         "survive the changeover, so no row-level reconciliation is possible."
+         ) if otp_on_scene else
+        ("The old report took arrival from ePCR field 549, which this API "
+         f"cannot reach. '{ARRIVAL_TIMESTAMP_KEYS[0]}' is not the stamp that "
+         "reproduces the historical range -- 'at_scene' is, at 78.2% on "
+         "2026-09-15 against a remembered high-70s/low-80s series. Expect this "
+         "figure to sit below the old one and not to tie to it."))
+    add("OTP", "which legs are scored",
+        "Complete" if otp_on_scene else "Known exclusion",
         f"legs carrying both a scheduled '{PICKUP_TIME_KEYS[0]}' and an "
         f"'{ARRIVAL_TIMESTAMP_KEYS[0]}' stamp",
         covers,
-        "On a sampled day only 233 of 374 completed legs had a scheduled "
-        "pickup_time, so roughly a third of finished runs cannot be scored for "
-        "lateness at all. The old SQL filtered the same way, so this is not new, "
-        "but the denominator is smaller than 'runs completed'. A leg with no "
-        "scheduled time was never promised one -- probe_otp_coverage.py breaks "
-        "the unscored legs down by call type and shows what each alternative "
-        "pickup field would recover before you change TS_PICKUP_TIME_KEYS.")
+        ("Every completed leg is scored: on 2026-09-15 all 363 carried both a "
+         "pickup_time and an at_scene stamp, once legs cancelled after "
+         "assignment are set aside. An August sample showed only 233 of 374 "
+         "carrying a pickup_time; that gap has not recurred. "
+         "probe_otp_coverage.py re-measures it."
+         ) if otp_on_scene else
+        (f"'{ARRIVAL_TIMESTAMP_KEYS[0]}' is on a subset of legs, so the "
+         "denominator is not every run that happened. The bedside stamp in "
+         "particular covered 228 of 363 legs on 2026-09-15 -- and a crew that "
+         "skips it is plausibly on a busier call, so the legs it drops are not "
+         "a random sample. probe_otp_coverage.py reports the coverage and the "
+         "on-time percentage each choice publishes."))
 
     # ---- Run volume
     add("Run Volume", "transport counts", "Complete",

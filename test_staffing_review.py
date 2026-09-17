@@ -42,14 +42,21 @@ def check(name, condition, detail=""):
     raise AssertionError(message)
 
 
-def staffing_row(snapshot, profile, crew, cost_center="Cincinnati"):
-    """One Active Now row as the daily runner writes it."""
+def staffing_row(snapshot, profile, crew, cost_center="Cincinnati", starts=None):
+    """
+    One staffing row as the daily runner writes it.
+
+    `starts` is the day the shift actually began, which for a Tomorrow row is
+    the day AFTER the snapshot. Defaults to the snapshot date, matching an
+    Active Now row.
+    """
+    starts = starts or snapshot
     return {
         "snapshot_date": snapshot,
         "shift_profile": profile,
         "cost_center": cost_center,
-        "start_time": f"{snapshot} 07:00:00",
-        "end_time": f"{snapshot} 19:00:00",
+        "start_time": f"{starts} 07:00:00",
+        "end_time": f"{starts} 19:00:00",
         "crew_count": len(crew),
         "crew_needed": 2,
         "staffing_status": "OK" if len(crew) >= 2 else f"SHORT {2 - len(crew)}",
@@ -57,10 +64,10 @@ def staffing_row(snapshot, profile, crew, cost_center="Cincinnati"):
     }
 
 
-def write_append(tmpdir, rows):
-    append_dir = os.path.join(tmpdir, "Append")
+def write_append(tmpdir, rows, sheet=None, name="Append"):
+    append_dir = os.path.join(tmpdir, name)
     OUT._append_to_workbook_xlsx(
-        os.path.join(append_dir, S.STAFFING_APPEND), S.ACTIVE_SHEET,
+        os.path.join(append_dir, S.STAFFING_APPEND), sheet or S.ACTIVE_SHEET,
         pd.DataFrame(rows),
         dedupe_keys=["snapshot_date", "cost_center", "shift_profile",
                      "start_time", "end_time"],
@@ -111,6 +118,61 @@ def test_assignments_round_trip(tmpdir):
     empty, days = S.assignments_in_window(append_dir, date(2026, 8, 1), date(2026, 8, 31))
     check("a window before anything was recorded is empty, not missing",
           empty == {} and days == [], f"got {empty}, {days}")
+
+
+def test_rows_are_filed_by_shift_start_not_run_date(tmpdir):
+    """
+    A Tomorrow row is written on one day and describes the next.
+
+    Filing it under snapshot_date would shift every one of those rows back a
+    day, putting a Monday shift under Sunday -- and would make last_seen and
+    days_since_last_seen wrong for everyone the Tomorrow sheet covers.
+    """
+    print("\ntest_rows_are_filed_by_shift_start_not_run_date")
+
+    append_dir = write_append(tmpdir, [
+        staffing_row("2026-09-15", "OH-A-CIN-07-19", [(1, "One")],
+                     starts="2026-09-16"),
+    ], sheet=S.TOMORROW_SHEET, name="ByStart")
+
+    seen, days = S.assignments_in_window(append_dir, date(2026, 9, 1), date(2026, 9, 30))
+    check("the row is filed under the day the shift started",
+          days == [date(2026, 9, 16)], f"got {days}")
+    check("and the crew member is credited with that day",
+          list(seen["1"]) == [date(2026, 9, 16)], f"got {dict(seen['1'])}")
+
+
+def test_both_sheets_are_read(tmpdir):
+    """
+    Active Now alone is a biased sample and must not be the only source.
+
+    It holds units on shift at the instant the runner fired, so a crew whose
+    shift did not span that moment never appears -- a morning run would put
+    every night crew in the never-crewed list. Tomorrow carries the whole day.
+    """
+    print("\ntest_both_sheets_are_read")
+
+    append_dir = os.path.join(tmpdir, "BothSheets", "Append")
+    os.makedirs(append_dir, exist_ok=True)
+    path = os.path.join(append_dir, S.STAFFING_APPEND)
+
+    OUT._append_to_workbook_xlsx(
+        path, S.TOMORROW_SHEET,
+        pd.DataFrame([staffing_row("2026-09-15", "OH-A-CIN-19-07", [(2, "Night")],
+                                   starts="2026-09-16")]),
+        dedupe_keys=["snapshot_date", "shift_profile", "start_time"],
+    )
+    OUT._append_to_workbook_xlsx(
+        path, S.ACTIVE_SHEET,
+        pd.DataFrame([staffing_row("2026-09-16", "OH-A-CIN-07-19", [(1, "Day")])]),
+        dedupe_keys=["snapshot_date", "shift_profile", "start_time"],
+    )
+
+    seen, days = S.assignments_in_window(append_dir, date(2026, 9, 1), date(2026, 9, 30))
+    check("the day crew from Active Now is found", "1" in seen, f"got {sorted(seen)}")
+    check("the night crew from Tomorrow is found too", "2" in seen,
+          "reading only Active Now would report them as never crewed")
+    check("both land on the same work date", days == [date(2026, 9, 16)], f"got {days}")
 
 
 def test_missing_append_is_distinguished_from_empty(tmpdir):
@@ -220,12 +282,17 @@ def test_summary_reports_gaps(tmpdir):
     notes = dict(zip(sheet["item"], sheet["note"]))
 
     check("days recorded is stated", items["Days actually recorded"] == 2)
-    check("the gap is named", "58 day(s) have no snapshot" in notes["Days actually recorded"],
+    check("the gap is named", "58 day(s) have no record" in notes["Days actually recorded"],
           f"got {notes['Days actually recorded']}")
     check("never-crewed is surfaced as a headline", items["Never crewed in the window"] == 1)
-    check("the snapshot caveat is stated",
+    check("the days-are-not-hours caveat is stated",
           "not hours" in notes["What a 'day crewed' means"],
           "a manager reading days as hours is the likely misreading")
+    check("the sheets read are named, with the sampling caveat",
+          "point-in-time" in notes["Read from"], f"got {notes.get('Read from')}")
+    check("the gap note warns it can create false never-crewed entries",
+          "never crewed" in notes["Days actually recorded"],
+          "someone who worked only on missing days looks like they never worked")
 
     full = S.summary_sheet(args, roster_df, days_present, date(2026, 9, 15),
                            date(2026, 9, 16), {}, [], {})
@@ -262,6 +329,8 @@ def main():
     tests = [
         (test_crew_ids_parse, ()),
         (test_assignments_round_trip, (tmpdir,)),
+        (test_rows_are_filed_by_shift_start_not_run_date, (tmpdir,)),
+        (test_both_sheets_are_read, (tmpdir,)),
         (test_missing_append_is_distinguished_from_empty, (tmpdir,)),
         (test_never_crewed_employees_are_reported, (tmpdir,)),
         (test_days_since_last_seen_flags_the_stale, (tmpdir,)),

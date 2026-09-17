@@ -62,7 +62,25 @@ logging.basicConfig(
 log = logging.getLogger("staffing-review")
 
 STAFFING_APPEND = "Staffing_Report_APPEND.xlsx"
+
+# Both sheets the daily run records, and they are NOT equivalent.
+#
+#   Tomorrow   -- every unit whose shift STARTS on the day described. A whole
+#                 day's schedule, independent of when the runner happened to
+#                 fire. This is the one that answers "was this person put on a
+#                 truck", and it is read first.
+#
+#   Active Now -- units on shift at the INSTANT the runner ran (start <= now <=
+#                 end). It is a point-in-time sample, and a biased one: a crew
+#                 whose shift did not span the run time never appears, so a
+#                 morning run makes night crews look like they never worked.
+#                 Read only to fill gaps, never on its own.
+#
+# Reading Active Now alone would put every off-cycle crew in the never-crewed
+# list, which is the exact opposite of what this report is for.
+SHEETS = ("Tomorrow", "Active Now")
 ACTIVE_SHEET = "Active Now"
+TOMORROW_SHEET = "Tomorrow"
 
 # crew_members is built as "First Last (ID 1234)", newline separated. The id is
 # what matters -- names are not unique and change with marriages and typos.
@@ -116,32 +134,63 @@ def crew_ids(cell):
     return CREW_ID.findall(str(cell or ""))
 
 
+def work_dates(df):
+    """
+    The day each row's shift actually started.
+
+    Not snapshot_date. The Tomorrow sheet is written on one day and describes
+    the next, so filing its rows under the run date would shift every one of
+    them by a day -- and would put a Sunday-night shift under Saturday. The
+    shift's own start_time is the day the crew worked; snapshot_date only says
+    when the report looked.
+    """
+    if "start_time" in df.columns:
+        started = pd.to_datetime(df["start_time"], errors="coerce").dt.date
+        if started.notna().any():
+            return started
+    return pd.to_datetime(df.get("snapshot_date"), errors="coerce").dt.date
+
+
 def assignments_in_window(append_dir, start, end):
     """
-    (user_id, date) -> the units they were seen on, from the daily snapshots.
+    (user_id, date) -> the units they were crewed on, from the daily records.
 
-    Returns None when nothing has been recorded, which is the state before the
-    daily runner has accumulated anything -- the caller says so rather than
-    reporting a fleet nobody crewed.
+    Both sheets are read and unioned. Tomorrow carries a whole day's schedule;
+    Active Now is a point-in-time sample that misses any shift not spanning the
+    run. Together they cover more days than either alone, and a person counts
+    for a date if either sheet put them on a unit that started it.
+
+    Returns (None, None) when the workbook holds neither sheet -- the state
+    before the daily runner has ever run. That is a different answer from an
+    empty window, and the caller reports it differently: one is a setup problem
+    with a remedy, the other means nobody was crewed.
     """
-    df = OUT.read_append_sheet(os.path.join(append_dir, STAFFING_APPEND), ACTIVE_SHEET)
-    if df is None or df.empty or "snapshot_date" not in df.columns:
+    path = os.path.join(append_dir, STAFFING_APPEND)
+    frames = []
+    for sheet in SHEETS:
+        df = OUT.read_append_sheet(path, sheet)
+        if df is not None and not df.empty:
+            df = df.copy()
+            df["_sheet"] = sheet
+            frames.append(df)
+    if not frames:
         return None, None
 
-    dates = pd.to_datetime(df["snapshot_date"], errors="coerce").dt.date
-    keep = (dates >= start) & (dates <= end)
-    window = df[keep].copy()
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    dates = work_dates(combined)
+    keep = dates.notna() & (dates >= start) & (dates <= end)
+    window = combined[keep].copy()
     if window.empty:
         return {}, []
-    window["snapshot_date"] = dates[keep]
+    window["work_date"] = dates[keep]
 
     seen = defaultdict(lambda: defaultdict(set))
     for _, row in window.iterrows():
-        day = row["snapshot_date"]
+        day = row["work_date"]
         unit = row.get("shift_profile")
         for user_id in crew_ids(row.get("crew_members")):
             seen[str(user_id)][day].add(unit)
-    return seen, sorted(set(window["snapshot_date"]))
+    return seen, sorted(set(window["work_date"]))
 
 
 def review(roster_df, seen, hours_by_user, start, end):
@@ -219,17 +268,23 @@ def summary_sheet(args, roster_df, days_present, start, end, seen, never, hours_
         row("Window asked for", f"{start} to {end}", f"{asked} day(s)"),
         row("Days actually recorded", len(days_present),
             ("THE WINDOW IS COMPLETE." if missing == 0 else
-             f"{missing} day(s) have no snapshot. Assignments come from the "
-             "daily run's Staffing_Report_APPEND.xlsx, so a day exists only "
-             "because the runner went that day. Retention is 730 days, so the "
-             "history is as long as the runner has been going -- but a day it "
-             "missed cannot be recovered.")),
-        row("What a 'day crewed' means", "one look at the board",
-            "The Active Now sheet is a single snapshot per run, not a "
-            "timesheet. Someone crewed at 07:45 and gone by 09:00 counts the "
-            "same as someone who worked the whole shift. This measures how "
-            "often a person was seen on a unit, which is the staffing "
-            "question -- it is not hours."),
+             f"{missing} day(s) have no record at all. Assignments come from "
+             "the daily run's Staffing_Report_APPEND.xlsx, so a day exists "
+             "only because the runner went that day. Retention is 730 days, so "
+             "the history is as long as the runner has been going -- but a day "
+             "it missed cannot be recovered, and someone who worked only on "
+             "missing days will appear here as never crewed.")),
+        row("Read from", " + ".join(SHEETS),
+            "Tomorrow carries a whole day's schedule, so it is read first. "
+            "Active Now is a point-in-time sample -- units on shift at the "
+            "instant the runner fired -- which on its own would make every "
+            "crew whose shift missed that moment look like they never worked. "
+            "Rows are filed under the day their shift STARTED, not the day the "
+            "report ran."),
+        row("What a 'day crewed' means", "assigned to a unit that day",
+            "It counts days a person was on a unit's crew, not hours. Someone "
+            "rostered and sent home early counts the same as someone who "
+            "worked the full shift."),
         row("Hours column", "populated" if hours_by_user else "empty",
             "Hours come from employee_hours_report.py's append and cover only "
             "the days that report has run. Supplementary; the review does not "
@@ -280,8 +335,9 @@ def main():
     seen, days_present = assignments_in_window(args["append_dir"], start, end)
     if seen is None:
         log.error("")
-        log.error("No staffing history found at %s.",
-                  os.path.join(args["append_dir"], STAFFING_APPEND))
+        log.error("No staffing history found at %s (neither %s sheet).",
+                  os.path.join(args["append_dir"], STAFFING_APPEND),
+                  " nor ".join(SHEETS))
         log.error("That file is written by daily_report_runner_api.py. Until it "
                   "has run at least once there is nothing to review -- and no "
                   "query can produce it after the fact, because /Schedule/Shifts "
@@ -311,9 +367,10 @@ def main():
 
     if len(days_present) < args["days"]:
         log.warning("")
-        log.warning("  %s of %s days have no snapshot. A person absent from the",
+        log.warning("  %s of %s days have no record. A person listed as never",
                     args["days"] - len(days_present), args["days"])
-        log.warning("  report may simply have worked a day the runner did not cover.")
+        log.warning("  crewed may simply have worked only on days the runner")
+        log.warning("  did not cover -- read the never-crewed list with that in mind.")
 
     sheets = {
         "Summary": summary_sheet(args, roster_df, days_present, start, end,

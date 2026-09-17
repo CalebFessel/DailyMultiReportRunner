@@ -297,15 +297,27 @@ punch-outs are unreliable by construction and hours built on them vary with who
 remembered. Whether someone was *put on a unit* comes from the schedule, not
 from crew discipline.
 
+It reads **both** sheets the daily run records, and they are not equivalent:
+
+| Sheet | What it holds | Why it matters |
+|---|---|---|
+| **Tomorrow** | every unit whose shift *starts* that day | A whole day's schedule, independent of when the runner fired. Read first. |
+| **Active Now** | units on shift at the *instant* the runner ran | A point-in-time sample. On its own it would put every crew whose shift missed that moment into the never-crewed list — a morning run would bury the night shift. |
+
+Rows are filed under the day their **shift started**, not the day the report
+ran. The Tomorrow sheet is written on one day and describes the next, so using
+the run date would shift every one of those rows back a day.
+
 Two things the Summary sheet states, both easy to misread:
 
-- **A "day crewed" is one look at the board, not a timesheet.** Active Now is a
-  single snapshot per run, so someone crewed at 07:45 and gone by 09:00 counts
-  the same as someone who worked the whole shift.
-- **Days with no snapshot are named.** A person missing from the report may
-  simply have worked a day the runner didn't cover. A missing append file and
-  an empty one are reported differently — the first is a setup problem, the
-  second means nobody was crewed.
+- **A "day crewed" is a day assigned to a unit, not hours.** Someone rostered
+  and sent home early counts the same as someone who worked the full shift.
+- **Days with no record are counted and named — and they can manufacture false
+  "never crewed" entries.** Someone who worked only on days the runner didn't
+  cover looks identical to someone who didn't work. Check the covered-days
+  figure before acting on that list. A missing append file and an empty one are
+  reported differently: the first is a setup problem, the second means nobody
+  was crewed.
 
 The `hours_recorded` column fills in from `employee_hours_report.py`'s append
 where it exists, and stays blank otherwise — blank meaning "not recorded",

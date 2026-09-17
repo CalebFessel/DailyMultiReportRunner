@@ -43,7 +43,7 @@ def check(name, condition, detail=""):
     raise AssertionError(message)
 
 
-def employee(user_id, last, level="EMT - Driver", cost_center="Cincinnati",
+def employee(user_id, last, level="OH EMT - Driver", cost_center="Cincinnati",
              **extra):
     row = {
         "user_id": user_id, "last_name": last, "first_name": "A",
@@ -70,23 +70,102 @@ def shift(user_id, start, end, punches):
 # Matching
 # =============================
 
+# The tenant's real level vocabulary, copied from --list-levels output as
+# (level, license_level). Levels are state-prefixed -- OH, WV, IN and MD each
+# have their own EMT and NEMT entries -- and license_level carries a category
+# prefix on top of the same name. The defaults were wrong once for exactly this
+# reason -- the unprefixed "EMT - Driver" matches nobody here -- and an empty
+# roster reads like "nobody works in Cincinnati" rather than "the filter is
+# misconfigured", so the real vocabulary is pinned here.
+TENANT_LEVELS = [
+    ("OH EMT - Driver", "EMT - OH EMT - Driver"),
+    ("OH EMT - Non Driver", "EMT - OH EMT - Non Driver"),
+    ("OH NEMT", "EMT - OH NEMT"),
+    ("WV EMT", "EMT - WV EMT"),
+    ("WV EMVO", "Driver - WV EMVO"),
+    ("IN EMT Driver", "EMT - IN EMT Driver"),
+    ("IN NEMT", "EMT - IN NEMT"),
+    ("IN SC DRIVER", "Driver - IN SC DRIVER"),
+    ("IN WC DRIVER", "Driver - IN WC DRIVER"),
+    ("MD EMT Driver", "EMT - MD EMT Driver"),
+    ("MD EMT-Non Driver", "EMT - MD EMT-Non Driver"),
+    ("MD NEMT", "EMT - MD NEMT"),
+    ("MD SC DRIVER", "Driver - MD SC DRIVER"),
+    ("OH WC Driver", "Driver - OH WC Driver"),
+    ("OH SC DRIVER", "Driver - OH SC DRIVER"),
+    ("OH - Advanced EMT", "OH - Advanced EMT - OH - Adv EMT"),
+    ("Paramedic - Level I", "Paramedic - Level I"),
+    ("Paramedic - Level II", "Paramedic - Level II"),
+    ("Paramedic - Intro", "Paramedic - Intro"),
+    ("Dispatcher", "Dispatcher - Level I"),
+    ("Dispatch Supervisor", "Dispatcher - Level II"),
+    ("Office - Level I", "Office - Level I"),
+    ("Office - Level II", "Office - Level II - Level II"),
+    ("Call Taker - Level I", "Call Taker - Level I"),
+    ("PRN", "PRN - PRN"),
+]
+
+
+def test_defaults_match_the_tenants_real_levels():
+    """
+    The shipped defaults must select exactly the three Ohio field positions.
+
+    Selecting none is the failure that hides: the roster comes back empty and
+    reads as a staffing finding instead of a filter that matches nothing.
+    """
+    print("\ntest_defaults_match_the_tenants_real_levels")
+
+    selected = [
+        level for level, license_level in TENANT_LEVELS
+        if E.matches_levels({"level": level, "license_level": license_level},
+                            E.DEFAULT_LEVELS)
+    ]
+    check(
+        "the defaults select exactly the three Ohio field positions",
+        selected == ["OH EMT - Driver", "OH EMT - Non Driver", "OH NEMT"],
+        f"got {selected}",
+    )
+    check("and they select something at all", selected,
+          "a default matching nothing produces an empty roster that reads as "
+          "a finding rather than a misconfiguration")
+
+    check(
+        "the unprefixed spelling matches nobody here",
+        not any(
+            E.matches_levels({"level": level, "license_level": license_level},
+                             ["EMT - Driver", "EMT - Non Driver", "NEMT"])
+            for level, license_level in TENANT_LEVELS
+        ),
+        "which is why the defaults are the state-prefixed names",
+    )
+
+    for other in ("WV EMT", "IN NEMT", "MD NEMT", "OH WC Driver", "OH SC DRIVER"):
+        check(f"'{other}' is not swept in",
+              not E.matches_levels({"level": other}, E.DEFAULT_LEVELS))
+
+
 def test_level_matching_survives_spacing():
     print("\ntest_level_matching_survives_spacing")
 
-    wanted = ["EMT - Driver", "EMT - Non Driver", "NEMT"]
-    for spelling in ("EMT - Driver", "EMT-Driver", "emt -  driver", "EMT -Driver"):
-        check(f"'{spelling}' matches EMT - Driver",
+    wanted = list(E.DEFAULT_LEVELS)
+    for spelling in ("OH EMT - Driver", "OH EMT-Driver", "oh emt -  driver",
+                     "OH EMT -Driver"):
+        check(f"'{spelling}' matches OH EMT - Driver",
               E.matches_levels({"level": spelling}, wanted))
 
-    check("NEMT matches", E.matches_levels({"level": "NEMT"}, wanted))
+    check("OH NEMT matches", E.matches_levels({"level": "OH NEMT"}, wanted))
     check("Paramedic does not match",
-          not E.matches_levels({"level": "Paramedic"}, wanted))
-    check("EMT - Driver Trainee does not match",
-          not E.matches_levels({"level": "EMT - Driver Trainee"}, wanted),
+          not E.matches_levels({"level": "Paramedic - Level I"}, wanted))
+    check("OH EMT - Driver Trainee does not match",
+          not E.matches_levels({"level": "OH EMT - Driver Trainee"}, wanted),
           "substring matching would wrongly include it")
 
     check("license_level is checked when level is blank",
-          E.matches_levels({"level": "", "license_level": "NEMT"}, wanted))
+          E.matches_levels({"level": "", "license_level": "OH NEMT"}, wanted))
+
+    check("levels=None takes everyone, for --all-levels",
+          all(E.matches_levels({"level": level}, None)
+              for level, _ in TENANT_LEVELS))
 
 
 def test_cost_center_matching():
@@ -107,13 +186,13 @@ def test_roster_includes_and_excludes():
 
     people = [
         employee(1, "Keeps"),
-        employee(2, "AlsoKeeps", level="NEMT"),
-        employee(3, "WrongLevel", level="Paramedic"),
+        employee(2, "AlsoKeeps", level="OH NEMT"),
+        employee(3, "WrongLevel", level="Paramedic - Level I"),
         employee(4, "WrongCostCenter", cost_center="Columbus"),
         employee(5, "Terminated", termination_date="2026-08-01"),
         employee(6, "Disabled", disabled=True),
     ]
-    levels = ["EMT - Driver", "EMT - Non Driver", "NEMT"]
+    levels = list(E.DEFAULT_LEVELS)
 
     df = E.roster(people, "Cincinnati", levels, include_inactive=False)
     check("only matching active employees are listed",
@@ -225,7 +304,7 @@ def test_zero_hour_employees_are_listed():
 
     roster_df = E.roster(
         [employee(1, "Worked"), employee(2, "NeverWorked"), employee(3, "AlsoNever")],
-        "Cincinnati", ["EMT - Driver"], include_inactive=False,
+        "Cincinnati", ["OH EMT - Driver"], include_inactive=False,
     )
     recorded = pd.DataFrame([
         {"work_date": date(2026, 9, 15), "user_id": 1, "hours_worked": 8.0},
@@ -258,7 +337,7 @@ def test_no_recorded_days_still_lists_everyone():
     print("\ntest_no_recorded_days_still_lists_everyone")
 
     roster_df = E.roster([employee(1, "Someone"), employee(2, "Another")],
-                         "Cincinnati", ["EMT - Driver"], include_inactive=False)
+                         "Cincinnati", ["OH EMT - Driver"], include_inactive=False)
     summary, zero = E.summarize(roster_df, None, date(2026, 7, 19), date(2026, 9, 16))
 
     check("both employees appear", len(summary) == 2)
@@ -273,10 +352,10 @@ def test_no_recorded_days_still_lists_everyone():
 def test_summary_states_the_real_coverage():
     print("\ntest_summary_states_the_real_coverage")
 
-    args = {"cost_center": "Cincinnati", "levels": ["EMT - Driver"], "days": 60,
+    args = {"cost_center": "Cincinnati", "levels": ["OH EMT - Driver"], "days": 60,
             "append_dir": "Reports/Append", "no_append": False}
     roster_df = E.roster([employee(1, "Someone")], "Cincinnati",
-                         ["EMT - Driver"], include_inactive=False)
+                         ["OH EMT - Driver"], include_inactive=False)
     recorded = pd.DataFrame([
         {"work_date": date(2026, 9, 15), "user_id": 1, "hours_worked": 8.0},
         {"work_date": date(2026, 9, 16), "user_id": 1, "hours_worked": 8.0},
@@ -310,10 +389,10 @@ def test_summary_states_the_real_coverage():
 def test_no_append_is_flagged_as_lossy():
     print("\ntest_no_append_is_flagged_as_lossy")
 
-    args = {"cost_center": "Cincinnati", "levels": ["EMT - Driver"], "days": 60,
+    args = {"cost_center": "Cincinnati", "levels": ["OH EMT - Driver"], "days": 60,
             "append_dir": "Reports/Append", "no_append": True}
     roster_df = E.roster([employee(1, "Someone")], "Cincinnati",
-                         ["EMT - Driver"], include_inactive=False)
+                         ["OH EMT - Driver"], include_inactive=False)
     sheet = E.summary_sheet(args, roster_df, None, date(2026, 9, 1),
                             date(2026, 9, 16), [], pd.DataFrame())
     note = dict(zip(sheet["item"], sheet["note"]))["Append workbook"]
@@ -338,7 +417,7 @@ def test_append_round_trip(tmpdir):
     append_dir = os.path.join(tmpdir, "Append")
     rows = pd.DataFrame([
         {"work_date": "2026-09-15", "user_id": 1, "employee_num": "E1",
-         "last_name": "Someone", "first_name": "A", "level": "EMT - Driver",
+         "last_name": "Someone", "first_name": "A", "level": "OH EMT - Driver",
          "cost_center_name": "Cincinnati", "hours_worked": 8.0,
          "open_punches": 0, "still_on_shift": 0},
     ])
@@ -378,7 +457,7 @@ def test_cli_defaults():
     check("defaults to Cincinnati", args["cost_center"] == "Cincinnati")
     check("defaults to 60 days", args["days"] == 60)
     check("defaults to the three requested levels",
-          args["levels"] == ["EMT - Driver", "EMT - Non Driver", "NEMT"],
+          args["levels"] == ["OH EMT - Driver", "OH EMT - Non Driver", "OH NEMT"],
           f"got {args['levels']}")
 
     args = E.parse_args(["--cost-center", "Toledo", "--days", "30",
@@ -398,6 +477,7 @@ def main():
     """The standalone runner, for a machine with no pytest."""
     tmpdir = tempfile.mkdtemp(prefix="emp_hours_tests_")
     tests = [
+        (test_defaults_match_the_tenants_real_levels, ()),
         (test_level_matching_survives_spacing, ()),
         (test_cost_center_matching, ()),
         (test_roster_includes_and_excludes, ()),

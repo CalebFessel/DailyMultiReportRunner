@@ -58,9 +58,21 @@ APPEND_FILE = "Employee_Hours_APPEND.xlsx"
 DAILY_SHEET = "Employee Hours"
 
 # Position levels to include, matched case-insensitively against the employee's
-# `level` and `license_level`, ignoring spacing around a hyphen so "EMT - Driver",
-# "EMT-Driver" and "EMT -  Driver" are one thing. Override with --levels.
-DEFAULT_LEVELS = ["EMT - Driver", "EMT - Non Driver", "NEMT"]
+# `level` and `license_level`, ignoring spacing around a hyphen so
+# "OH EMT - Driver", "OH EMT-Driver" and "OH EMT -  Driver" are one thing.
+# Override with --levels.
+#
+# These are this tenant's actual names, taken from --list-levels rather than
+# assumed. Levels are state-prefixed here -- OH, WV, IN, MD each have their own
+# EMT and NEMT entries -- so the unprefixed "EMT - Driver" matches nobody, and
+# a default that matched nothing would look like an empty roster rather than a
+# configuration error.
+#
+# `level` holds the plain name and `license_level` carries a category prefix
+# ("EMT - OH EMT - Driver"). Matching is on the whole value of either field, so
+# the plain name in `level` is what lands, and "OH EMT - Driver" cannot sweep
+# in a longer name that merely starts the same way.
+DEFAULT_LEVELS = ["OH EMT - Driver", "OH EMT - Non Driver", "OH NEMT"]
 
 DEFAULT_COST_CENTER = "Cincinnati"
 DEFAULT_DAYS = 60

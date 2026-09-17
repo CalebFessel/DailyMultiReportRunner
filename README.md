@@ -320,9 +320,12 @@ python employee_hours_report.py --list-levels         # what levels this tenant 
 python employee_hours_report.py --list-cost-centers   # what cost centers exist
 ```
 
-Defaults to cost center **Cincinnati** and levels **EMT - Driver**, **EMT - Non
-Driver**, **NEMT**, matched case-insensitively against both `level` and
-`license_level` and tolerant of spacing around the hyphen. Every matching
+Defaults to cost center **Cincinnati** and levels **OH EMT - Driver**,
+**OH EMT - Non Driver**, **OH NEMT** — this tenant's real names, taken from
+`--list-levels`. Levels are state-prefixed here (OH, WV, IN and MD each have
+their own EMT and NEMT entries), so the unprefixed spellings match nobody.
+Matching is case-insensitive against both `level` and `license_level` and
+tolerant of spacing around the hyphen. Every matching
 employee is listed **including those with no hours at all** — a zero is the
 finding, and it sorts to the top of the sheet. Run `--list-levels` first if the
 roster comes back empty; the names have to match what the tenant actually uses.

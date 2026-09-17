@@ -145,7 +145,7 @@ def test_never_crewed_employees_are_reported(tmpdir):
 
     roster_df = H.roster(
         [employee(1, "Works"), employee(2, "Never"), employee(3, "AlsoNever")],
-        "Cincinnati", ["EMT - Driver"], include_inactive=False,
+        "Cincinnati", list(H.DEFAULT_LEVELS), include_inactive=False,
     )
     seen = {"1": {date(2026, 9, 15): {"OH-A-CIN-07-19"},
                   date(2026, 9, 16): {"OH-A-CIN-07-19"}}}
@@ -177,7 +177,7 @@ def test_days_since_last_seen_flags_the_stale(tmpdir):
     print("\ntest_days_since_last_seen_flags_the_stale")
 
     roster_df = H.roster([employee(1, "Stale")], "Cincinnati",
-                         ["EMT - Driver"], include_inactive=False)
+                         list(H.DEFAULT_LEVELS), include_inactive=False)
     seen = {"1": {date(2026, 8, 1): {"OH-A-CIN-07-19"}}}
     result, never = S.review(roster_df, seen, {}, date(2026, 7, 19), date(2026, 9, 16))
 
@@ -191,7 +191,7 @@ def test_hours_column_is_supplementary(tmpdir):
     print("\ntest_hours_column_is_supplementary")
 
     roster_df = H.roster([employee(1, "Someone")], "Cincinnati",
-                         ["EMT - Driver"], include_inactive=False)
+                         list(H.DEFAULT_LEVELS), include_inactive=False)
     seen = {"1": {date(2026, 9, 16): {"OH-A-CIN-07-19"}}}
 
     result, _ = S.review(roster_df, seen, {}, date(2026, 9, 1), date(2026, 9, 16))
@@ -208,10 +208,10 @@ def test_hours_column_is_supplementary(tmpdir):
 def test_summary_reports_gaps(tmpdir):
     print("\ntest_summary_reports_gaps")
 
-    args = {"cost_center": "Cincinnati", "levels": ["EMT - Driver"],
+    args = {"cost_center": "Cincinnati", "levels": list(H.DEFAULT_LEVELS),
             "all_levels": False, "days": 60}
     roster_df = H.roster([employee(1, "Someone")], "Cincinnati",
-                         ["EMT - Driver"], include_inactive=False)
+                         list(H.DEFAULT_LEVELS), include_inactive=False)
     days_present = [date(2026, 9, 15), date(2026, 9, 16)]
 
     sheet = S.summary_sheet(args, roster_df, days_present, date(2026, 7, 19),
@@ -240,7 +240,8 @@ def test_cli():
     check("defaults to Cincinnati", args["cost_center"] == "Cincinnati")
     check("defaults to 60 days", args["days"] == 60)
     check("defaults to the three levels",
-          args["levels"] == ["EMT - Driver", "EMT - Non Driver", "NEMT"])
+          args["levels"] == ["OH EMT - Driver", "OH EMT - Non Driver", "OH NEMT"],
+          f"got {args['levels']}")
     check("levels are not all by default", not args["all_levels"])
 
     args = S.parse_args(["--all-levels", "--days", "14", "--cost-center", "Toledo"])

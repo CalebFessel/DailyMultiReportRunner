@@ -270,6 +270,47 @@ Getting a read path opened is what would make OTP comparable to history again.
 
 ---
 
+## Hours per Employee, Including the Zeros
+
+```powershell
+python employee_hours_report.py                       # Cincinnati, last 60 days
+python employee_hours_report.py --cost-center Toledo --days 30
+python employee_hours_report.py --list-levels         # what levels this tenant uses
+python employee_hours_report.py --list-cost-centers   # what cost centers exist
+```
+
+Defaults to cost center **Cincinnati** and levels **EMT - Driver**, **EMT - Non
+Driver**, **NEMT**, matched case-insensitively against both `level` and
+`license_level` and tolerant of spacing around the hyphen. Every matching
+employee is listed **including those with no hours at all** — a zero is the
+finding, and it sorts to the top of the sheet. Run `--list-levels` first if the
+roster comes back empty; the names have to match what the tenant actually uses.
+
+Output is `Employee_Hours_<cost center>_<start>_to_<end>.xlsx` with Summary,
+Employees, Daily and Roster sheets.
+
+### The hours are not backfillable — read this before asking for 60 days
+
+The roster is complete and current. **The hours are not.** Hours come from
+shift punches, and `/Schedule/Shifts` returns only `today-1..today+2` and
+ignores every date filter — verified byte-identical for requests at −30, +0 and
++30 days. There is no historical punch endpoint.
+
+So the report appends what it can see to `Employee_Hours_APPEND.xlsx` and the
+window fills in **one day at a time from the first run**. Ask for 60 days today
+and you get today's hours and a Summary sheet saying `Days of hours actually
+recorded: 1` with 59 missing. Nothing can recover a day that was never
+recorded.
+
+Run it daily, alongside `daily_report_runner_api.py`, and the 60-day question
+answers itself two months out. The Summary sheet states the covered window on
+every run, so a partial answer is never mistaken for a full one.
+
+`--no-append` gives a look without recording it — which means that day is lost.
+The Summary sheet says so when you use it.
+
+---
+
 ## How the Window Works
 
 The script runs over a midnight-to-midnight reporting window. [file:1]

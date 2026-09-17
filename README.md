@@ -316,6 +316,11 @@ Two things the Summary sheet states, both easy to misread:
 
 - **A "day crewed" is a day assigned to a unit, not hours.** Someone rostered
   and sent home early counts the same as someone who worked the full shift.
+- **Missing days are two different things, and the Coverage sheet separates
+  them.** Days *before the first record* were never capturable — the daily
+  runner did not exist yet, so nothing was lost through neglect. Days *after*
+  it with no record are runs that were missed; those were capturable on the day
+  and only the second kind can be prevented from recurring.
 - **Days with no record are counted and named — and they can manufacture false
   "never crewed" entries.** Someone who worked only on days the runner didn't
   cover looks identical to someone who didn't work. Check the covered-days

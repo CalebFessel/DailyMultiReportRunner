@@ -341,6 +341,46 @@ def test_summary_reports_gaps(tmpdir):
     check("a complete window says so", "COMPLETE" in note, f"got {note}")
 
 
+def test_coverage_sheet_separates_the_two_kinds_of_gap():
+    """
+    Missing days are not one thing, and conflating them misleads.
+
+    Days before the first record were never capturable -- the report did not
+    exist yet, so nothing was lost through neglect. Days after it that have no
+    record were capturable on the day and were not captured. Only the second
+    kind is a process problem, and only the second kind can be prevented from
+    recurring.
+    """
+    print("\ntest_coverage_sheet_separates_the_two_kinds_of_gap")
+
+    present = [date(2026, 8, 19), date(2026, 8, 20), date(2026, 8, 22)]
+    df = S.coverage_sheet(present, date(2026, 8, 17), date(2026, 8, 23))
+
+    check("every day in the window has a row", len(df) == 7, f"got {len(df)}")
+    by_date = df.set_index("date")
+
+    check("days before the first record are named as such",
+          by_date.loc[date(2026, 8, 17), "note"] == "before the first recorded day")
+    check("a skipped run after it is named a missed run",
+          by_date.loc[date(2026, 8, 21), "note"] == "run missed")
+    check("and the two are not conflated",
+          by_date.loc[date(2026, 8, 17), "note"]
+          != by_date.loc[date(2026, 8, 21), "note"])
+    check("recorded days carry no note", by_date.loc[date(2026, 8, 19), "note"] == "")
+    check("recorded is yes/no per day",
+          list(df["recorded"]) == ["no", "no", "yes", "yes", "no", "yes", "no"],
+          f"got {list(df['recorded'])}")
+    check("the weekday is shown, so a weekend pattern is visible",
+          by_date.loc[date(2026, 8, 23), "weekday"] == "Sun")
+
+    empty = S.coverage_sheet([], date(2026, 8, 17), date(2026, 8, 19))
+    check("with no history at all every day says so",
+          set(empty["note"]) == {"no history at all"}, f"got {set(empty['note'])}")
+    check("and none are called missed runs",
+          "run missed" not in set(empty["note"]),
+          "blaming a missed run when the report never existed is the wrong story")
+
+
 def test_cli():
     print("\ntest_cli")
 
@@ -378,6 +418,7 @@ def main():
         (test_days_since_last_seen_flags_the_stale, (tmpdir,)),
         (test_hours_column_is_supplementary, (tmpdir,)),
         (test_summary_reports_gaps, (tmpdir,)),
+        (test_coverage_sheet_separates_the_two_kinds_of_gap, ()),
         (test_cli, ()),
     ]
     try:

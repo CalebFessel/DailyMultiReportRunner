@@ -265,6 +265,44 @@ def recorded_hours(append_dir, start, end):
     return {str(user_id): float(value) for user_id, value in totals.items()}
 
 
+def coverage_sheet(days_present, start, end):
+    """
+    Every day in the window, recorded or not.
+
+    "38 days missing" reads as 38 anonymous holes, which invites the wrong
+    conclusion -- that the report is unreliable, or that someone stopped
+    running it. The shape matters: a run of missing days at the start of the
+    window usually predates the runner entirely, while scattered gaps after it
+    are runs that did not happen. Only the second kind was ever recoverable,
+    and only on the day.
+    """
+    present = set(days_present)
+    rows = []
+    cursor = start
+    while cursor <= end:
+        rows.append({
+            "date": cursor,
+            "weekday": cursor.strftime("%a"),
+            "recorded": "yes" if cursor in present else "no",
+        })
+        cursor += timedelta(days=1)
+    df = pd.DataFrame(rows)
+
+    # A leading run of missing days is almost always "before this report
+    # existed" rather than "a run was skipped", and saying so stops the gap
+    # being read as neglect.
+    if not present:
+        df["note"] = "no history at all"
+        return df
+    earliest = min(present)
+    df["note"] = [
+        "before the first recorded day" if row["date"] < earliest
+        else ("" if row["recorded"] == "yes" else "run missed")
+        for _, row in df.iterrows()
+    ]
+    return df
+
+
 def summary_sheet(args, roster_df, days_present, start, end, seen, never,
                   hours_by_user, result=None):
     asked = (end - start).days + 1
@@ -316,8 +354,19 @@ def summary_sheet(args, roster_df, days_present, start, end, seen, never,
             "depend on it."),
     ]
     if days_present:
-        rows.append(row("Earliest snapshot", min(days_present), ""))
-        rows.append(row("Latest snapshot", max(days_present), ""))
+        earliest = min(days_present)
+        before = (earliest - start).days
+        after = (end - earliest).days + 1 - len(days_present)
+        rows.append(row("Earliest day recorded", earliest,
+                        "Nothing before this exists. History begins when the "
+                        "daily runner first ran; it cannot reach further back."))
+        rows.append(row("Latest day recorded", max(days_present), ""))
+        rows.append(row("  days before that", before,
+                        "Inside the window but before any record. Not lost -- "
+                        "never captured, because there was nothing capturing."))
+        rows.append(row("  runs missed since", after,
+                        "Days after the history starts with no record. These "
+                        "were capturable on the day and were not captured."))
     return pd.DataFrame(rows)
 
 
@@ -393,12 +442,20 @@ def main():
                      person["last_name"], person["first_name"],
                      person["last_seen"], int(person["days_since_last_seen"]))
 
-    if len(days_present) < args["days"]:
+    if len(days_present) < args["days"] and days_present:
+        earliest = min(days_present)
+        before = (earliest - start).days
+        missed = (end - earliest).days + 1 - len(days_present)
         log.warning("")
-        log.warning("  %s of %s days have no record. A person listed as never",
+        log.warning("  %s of %s days have no record:",
                     args["days"] - len(days_present), args["days"])
-        log.warning("  crewed may simply have worked only on days the runner")
-        log.warning("  did not cover -- read the never-crewed list with that in mind.")
+        if before:
+            log.warning("    %s before %s -- history starts there and cannot "
+                        "reach back", before, earliest)
+        if missed:
+            log.warning("    %s run(s) missed since then", missed)
+        log.warning("  A person listed as never crewed may have worked only on")
+        log.warning("  those days. See the Coverage sheet for which days they are.")
 
     sheets = {
         "Summary": summary_sheet(args, roster_df, days_present, start, end,
@@ -407,6 +464,7 @@ def main():
         "Never Crewed": result[(result["days_crewed"] == 0)
                                & (~result["hired_during_window"])],
         "New Hires": result[result["hired_during_window"]],
+        "Coverage": coverage_sheet(days_present, start, end),
         "Roster": roster_df,
     }
 

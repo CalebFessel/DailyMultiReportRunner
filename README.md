@@ -270,6 +270,47 @@ Getting a read path opened is what would make OTP comparable to history again.
 
 ---
 
+## Staffing Review
+
+For the manager's question — **who is actually being put on a truck, and who
+isn't** — use this rather than the hours report.
+
+```powershell
+python staffing_review.py                            # Cincinnati, last 60 days
+python staffing_review.py --cost-center Toledo --days 30
+python staffing_review.py --all-levels               # every position in the cost center
+```
+
+Output is `Staffing_Review_<cost center>_<start>_to_<end>.xlsx`: Summary,
+Review, **Never Crewed**, Roster. Everyone appears; zero-day people sort to the
+top, and the console prints them plus anyone not seen in 14+ days.
+
+**It reads assignments, not punches**, and unlike hours this history already
+exists. The daily run has been appending `Staffing_Report_APPEND.xlsx` since
+the changeover, one row per unit per run, each carrying its crew's names and
+ids — retention is 730 days, so the window goes back as far as the runner has
+been going. Nothing needs to accrue first.
+
+Reading assignments is also the better measure here. Crews are paid from
+Paycor, not Traumasoft, so they have no reason to close a Traumasoft punch —
+punch-outs are unreliable by construction and hours built on them vary with who
+remembered. Whether someone was *put on a unit* comes from the schedule, not
+from crew discipline.
+
+Two things the Summary sheet states, both easy to misread:
+
+- **A "day crewed" is one look at the board, not a timesheet.** Active Now is a
+  single snapshot per run, so someone crewed at 07:45 and gone by 09:00 counts
+  the same as someone who worked the whole shift.
+- **Days with no snapshot are named.** A person missing from the report may
+  simply have worked a day the runner didn't cover. A missing append file and
+  an empty one are reported differently — the first is a setup problem, the
+  second means nobody was crewed.
+
+The `hours_recorded` column fills in from `employee_hours_report.py`'s append
+where it exists, and stays blank otherwise — blank meaning "not recorded",
+never 0.00.
+
 ## Hours per Employee, Including the Zeros
 
 ```powershell

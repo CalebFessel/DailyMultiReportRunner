@@ -140,7 +140,14 @@ def employee_level(employee):
 
 
 def matches_levels(employee, wanted):
-    """True when either level field matches one of the requested positions."""
+    """
+    True when either level field matches one of the requested positions.
+
+    `wanted` of None means every level, which is how a caller asks for the
+    whole cost center rather than a subset.
+    """
+    if wanted is None:
+        return True
     normalized = {normalize_level(name) for name in wanted}
     return any(
         normalize_level(employee.get(field)) in normalized
@@ -153,7 +160,11 @@ def matches_cost_center(employee, needle):
 
 
 def roster(employees, cost_center, levels, include_inactive):
-    """Every employee the report is about, whether or not they worked."""
+    """
+    Every employee the report is about, whether or not they worked.
+
+    `levels` of None takes the whole cost center.
+    """
     rows = []
     for employee in employees:
         if not matches_cost_center(employee, cost_center):

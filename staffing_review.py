@@ -193,6 +193,21 @@ def assignments_in_window(append_dir, start, end):
     return seen, sorted(set(window["work_date"]))
 
 
+def hired_after(hire_date, when):
+    """
+    True when someone started after `when`, so far as the record says.
+
+    A new hire has no assignment history because they were not employed yet,
+    not because they are not being used. Left unmarked they sit in the
+    never-crewed list next to people who genuinely are not working, which is
+    the one error in this report that would embarrass whoever presents it.
+    """
+    parsed = pd.to_datetime(hire_date, errors="coerce")
+    if pd.isna(parsed):
+        return False
+    return parsed.date() > when
+
+
 def review(roster_df, seen, hours_by_user, start, end):
     """One row per employee: how often they were crewed, zero included."""
     if roster_df.empty:
@@ -220,6 +235,9 @@ def review(roster_df, seen, hours_by_user, start, end):
             "first_seen": day_list[0] if day_list else None,
             "last_seen": last_seen,
             "days_since_last_seen": (end - last_seen).days if last_seen else None,
+            # Marked rather than filtered out: a new hire with no assignments
+            # is still worth a manager's eye, just for a different reason.
+            "hired_during_window": hired_after(person.get("hire_date"), start),
             "hours_recorded": round(hours_by_user.get(user_id, 0.0), 2)
                               if hours_by_user else None,
         })
@@ -227,7 +245,7 @@ def review(roster_df, seen, hours_by_user, start, end):
     df = pd.DataFrame(rows).sort_values(
         ["days_crewed", "last_name", "first_name"], ascending=[True, True, True]
     )
-    never = df[df["days_crewed"] == 0]
+    never = df[(df["days_crewed"] == 0) & (~df["hired_during_window"])]
     return df, list(zip(never["last_name"], never["first_name"]))
 
 
@@ -247,7 +265,8 @@ def recorded_hours(append_dir, start, end):
     return {str(user_id): float(value) for user_id, value in totals.items()}
 
 
-def summary_sheet(args, roster_df, days_present, start, end, seen, never, hours_by_user):
+def summary_sheet(args, roster_df, days_present, start, end, seen, never,
+                  hours_by_user, result=None):
     asked = (end - start).days + 1
     missing = asked - len(days_present)
 
@@ -255,6 +274,7 @@ def summary_sheet(args, roster_df, days_present, start, end, seen, never, hours_
         return {"item": item, "value": value, "note": note}
 
     crewed = len(roster_df) - len(never) if not roster_df.empty else 0
+    new_hires = int(result["hired_during_window"].sum()) if result is not None and not result.empty else 0
     rows = [
         row("Cost center", args["cost_center"], "Matched against employee cost_center_name."),
         row("Levels included",
@@ -264,7 +284,12 @@ def summary_sheet(args, roster_df, days_present, start, end, seen, never, hours_
             "Everyone matching, whether or not they were ever crewed."),
         row("Crewed at least once", crewed, ""),
         row("Never crewed in the window", len(never),
-            "The finding this report exists for. Listed first in the Review sheet."),
+            "The finding this report exists for. Listed first in the Review "
+            "sheet. Excludes anyone hired during the window, who has no "
+            "history because they were not employed yet."),
+        row("Hired during the window", new_hires,
+            "Flagged by hired_during_window and kept out of the never-crewed "
+            "count. Still worth a look, for a different reason."),
         row("Window asked for", f"{start} to {end}", f"{asked} day(s)"),
         row("Days actually recorded", len(days_present),
             ("THE WINDOW IS COMPLETE." if missing == 0 else
@@ -351,7 +376,10 @@ def main():
     log.info("--- %s staffing review, %s to %s ---", args["cost_center"], start, end)
     log.info("  employees reviewed : %s", len(result))
     log.info("  days recorded      : %s of %s asked for", len(days_present), args["days"])
-    log.info("  never crewed       : %s", len(never))
+    new_hires = int(result["hired_during_window"].sum())
+    log.info("  never crewed       : %s%s", len(never),
+             f"  (plus {new_hires} hired during the window, listed apart)"
+             if new_hires else "")
     for last, first in never[:20]:
         log.info("      %s, %s", last, first)
     if len(never) > 20:
@@ -374,9 +402,11 @@ def main():
 
     sheets = {
         "Summary": summary_sheet(args, roster_df, days_present, start, end,
-                                 seen, never, hours_by_user),
+                                 seen, never, hours_by_user, result),
         "Review": result,
-        "Never Crewed": result[result["days_crewed"] == 0],
+        "Never Crewed": result[(result["days_crewed"] == 0)
+                               & (~result["hired_during_window"])],
+        "New Hires": result[result["hired_during_window"]],
         "Roster": roster_df,
     }
 

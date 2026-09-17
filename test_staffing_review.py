@@ -235,6 +235,46 @@ def test_never_crewed_employees_are_reported(tmpdir):
           "would read as 'crewed today'")
 
 
+def test_new_hires_are_not_reported_as_never_crewed(tmpdir):
+    """
+    Someone hired mid-window has no history because they were not there.
+
+    Left in the never-crewed list they sit beside people who genuinely are not
+    being used, and a manager acting on that list would be asking the wrong
+    question of the wrong person. They are marked and listed apart, not hidden:
+    a brand-new hire with no assignments is still worth a look.
+    """
+    print("\ntest_new_hires_are_not_reported_as_never_crewed")
+
+    roster_df = H.roster([
+        employee(1, "Established", hire_date="2024-01-01"),
+        employee(2, "JustHired", hire_date="2026-09-10"),
+    ], "Cincinnati", list(H.DEFAULT_LEVELS), include_inactive=False)
+
+    result, never = S.review(roster_df, {}, {}, date(2026, 7, 19), date(2026, 9, 16))
+
+    check("the long-standing employee is reported as never crewed",
+          [n for n, _ in never] == ["Established"], f"got {never}")
+    check("the new hire is not", "JustHired" not in [n for n, _ in never])
+
+    hired = result[result["last_name"] == "JustHired"].iloc[0]
+    check("but is flagged so they can still be looked at",
+          bool(hired["hired_during_window"]))
+    established = result[result["last_name"] == "Established"].iloc[0]
+    check("and the established employee is not flagged",
+          not bool(established["hired_during_window"]))
+
+    check("someone hired before the window counts normally",
+          not S.hired_after("2024-01-01", date(2026, 7, 19)))
+    check("someone hired inside it is flagged",
+          S.hired_after("2026-09-10", date(2026, 7, 19)))
+    check("an unparseable hire date does not flag",
+          not S.hired_after("not a date", date(2026, 7, 19)),
+          "an unreadable date must not quietly excuse someone from the list")
+    check("a missing hire date does not flag",
+          not S.hired_after(None, date(2026, 7, 19)))
+
+
 def test_days_since_last_seen_flags_the_stale(tmpdir):
     print("\ntest_days_since_last_seen_flags_the_stale")
 
@@ -276,8 +316,9 @@ def test_summary_reports_gaps(tmpdir):
                          list(H.DEFAULT_LEVELS), include_inactive=False)
     days_present = [date(2026, 9, 15), date(2026, 9, 16)]
 
+    result, _ = S.review(roster_df, {}, {}, date(2026, 7, 19), date(2026, 9, 16))
     sheet = S.summary_sheet(args, roster_df, days_present, date(2026, 7, 19),
-                            date(2026, 9, 16), {}, [("Someone", "A")], {})
+                            date(2026, 9, 16), {}, [("Someone", "A")], {}, result)
     items = dict(zip(sheet["item"], sheet["value"]))
     notes = dict(zip(sheet["item"], sheet["note"]))
 
@@ -295,7 +336,7 @@ def test_summary_reports_gaps(tmpdir):
           "someone who worked only on missing days looks like they never worked")
 
     full = S.summary_sheet(args, roster_df, days_present, date(2026, 9, 15),
-                           date(2026, 9, 16), {}, [], {})
+                           date(2026, 9, 16), {}, [], {}, result)
     note = dict(zip(full["item"], full["note"]))["Days actually recorded"]
     check("a complete window says so", "COMPLETE" in note, f"got {note}")
 
@@ -333,6 +374,7 @@ def main():
         (test_both_sheets_are_read, (tmpdir,)),
         (test_missing_append_is_distinguished_from_empty, (tmpdir,)),
         (test_never_crewed_employees_are_reported, (tmpdir,)),
+        (test_new_hires_are_not_reported_as_never_crewed, (tmpdir,)),
         (test_days_since_last_seen_flags_the_stale, (tmpdir,)),
         (test_hours_column_is_supplementary, (tmpdir,)),
         (test_summary_reports_gaps, (tmpdir,)),

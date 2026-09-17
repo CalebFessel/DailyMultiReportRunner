@@ -282,7 +282,11 @@ python staffing_review.py --all-levels               # every position in the cos
 ```
 
 Output is `Staffing_Review_<cost center>_<start>_to_<end>.xlsx`: Summary,
-Review, **Never Crewed**, Roster. Everyone appears; zero-day people sort to the
+Review, **Never Crewed**, **New Hires**, Roster. Anyone hired during the window
+is flagged and kept out of the never-crewed count — they have no history
+because they weren't employed yet, and listing them beside people who genuinely
+aren't being used is the one error that would embarrass whoever presents this.
+They get their own sheet rather than being hidden. Everyone appears; zero-day people sort to the
 top, and the console prints them plus anyone not seen in 14+ days.
 
 **It reads assignments, not punches**, and unlike hours this history already

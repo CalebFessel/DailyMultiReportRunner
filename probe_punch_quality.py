@@ -266,6 +266,27 @@ def report_completion(rows, now):
     }
 
 
+def day_is_finished(shifts, day, offset, now):
+    """
+    True when every shift starting on `day` has already ended.
+
+    A day still in progress cannot be judged on punch discipline: its open
+    punches are crews on the road, not missed punch-outs, and the fallback
+    bounds them at `now` exactly as it should.
+    """
+    latest = None
+    for shift in shifts:
+        if shift.get("deleted"):
+            continue
+        start = R.parse_shift_ts(shift.get("start_time"), offset)
+        end = R.parse_shift_ts(shift.get("end_time"), offset)
+        if not start or not end or start.date() != day:
+            continue
+        if latest is None or end > latest:
+            latest = end
+    return latest is not None and latest <= now
+
+
 def report_fabricated_hours(shifts, offset, now, dates):
     """
     How much of the UHU denominator is measured, and how much is invented.
@@ -274,6 +295,14 @@ def report_fabricated_hours(shifts, offset, now, dates):
     once over a copy of the feed with every open punch stripped out. The
     difference is exactly what the shift-end fallback contributed -- not an
     estimate of it, the thing itself.
+
+    **The headline counts finished days only.** An in-progress day is nearly
+    all fallback by construction -- every crew currently on the road has an
+    open punch, correctly bounded at now -- so pooling it with finished days
+    produced a figure that was six times the real one and described nothing
+    anybody publishes. The daily runner reports on yesterday, a finished day,
+    so a finished day is what the number has to describe. In-progress days are
+    still shown, marked, and left out of the total.
     """
     print("\n" + "=" * 78)
     print("3. HOW MUCH OF THE UHU DENOMINATOR IS REAL?")
@@ -296,38 +325,56 @@ def report_fabricated_hours(shifts, offset, now, dates):
         stripped.append(clone)
 
     print(f"  {'date':<12} {'as shipped':>12} {'punched only':>14} "
-          f"{'fabricated':>12} {'share':>8}")
-    print("  " + "-" * 62)
+          f"{'fabricated':>12} {'share':>8}  state")
+    print("  " + "-" * 72)
 
     totals = {"shipped": 0.0, "measured": 0.0}
     per_day = {}
+    finished_days = []
     for day in dates:
         shipped = worked_total(shifts, day)
         measured = worked_total(stripped, day)
         gap = shipped - measured
-        totals["shipped"] += shipped
-        totals["measured"] += measured
+        finished = day_is_finished(shifts, day, offset, now)
+        if finished:
+            totals["shipped"] += shipped
+            totals["measured"] += measured
+            finished_days.append(day)
         per_day[day.isoformat()] = {
             "worked_hours_as_shipped": round(shipped, 2),
             "worked_hours_measured": round(measured, 2),
             "fabricated_hours": round(gap, 2),
+            "day_finished": finished,
         }
         print(f"  {day.isoformat():<12} {shipped:>12.2f} {measured:>14.2f} "
-              f"{gap:>12.2f} {pct(gap, shipped):>7.1f}%")
+              f"{gap:>12.2f} {pct(gap, shipped):>7.1f}%  "
+              f"{'finished' if finished else 'IN PROGRESS -- excluded'}")
 
     gap = totals["shipped"] - totals["measured"]
-    print("  " + "-" * 62)
-    print(f"  {'total':<12} {totals['shipped']:>12.2f} {totals['measured']:>14.2f} "
+    print("  " + "-" * 72)
+    print(f"  {'finished':<12} {totals['shipped']:>12.2f} {totals['measured']:>14.2f} "
           f"{gap:>12.2f} {pct(gap, totals['shipped']):>7.1f}%")
+
+    if not finished_days:
+        print("\n  No finished day in the window, so there is nothing to judge yet.")
+        print("  Every open punch belongs to a crew still on the road. Re-run")
+        print("  tomorrow, when today has ended.")
+        return {"per_day": per_day, "finished_days": [], "fabricated_pct": None}
 
     print(f"\n  {pct(gap, totals['shipped']):.1f}% of the unit hours in the UHU")
     print("  denominator come from bounding an unclosed punch at the shift end,")
     print("  not from a crew clocking out. For those units worked_hours IS")
     print("  scheduled_hours, and utilization reads low by exactly that much.")
+    print(f"\n  Finished day(s) only: {', '.join(d.isoformat() for d in finished_days)}.")
+    print("  A day still running is nearly all fallback by construction -- every")
+    print("  crew currently out has an open punch -- so counting it would say")
+    print("  nothing about punch discipline. The daily runner reports on")
+    print("  yesterday, which is why a finished day is the one that matters.")
     if gap > 0 and totals["shipped"]:
         implied = pct(totals["measured"], totals["shipped"])
-        print(f"\n  Put the other way: only {implied:.1f}% of the denominator is evidence.")
+        print(f"\n  Put the other way: {implied:.1f}% of the denominator is evidence.")
     return {"per_day": per_day,
+            "finished_days": [d.isoformat() for d in finished_days],
             "worked_hours_as_shipped": round(totals["shipped"], 2),
             "worked_hours_measured": round(totals["measured"], 2),
             "fabricated_hours": round(gap, 2),
@@ -538,14 +585,22 @@ def report_next_steps(summary):
         print("    the window cannot be backfilled, so today's number only exists")
         print("    if today's run captured it.")
     if fab is not None:
+        finished = summary.get("hours", {}).get("finished_days") or []
         print(f"  * {fab:.1f}% of the UHU denominator is the shift-end fallback")
-        print("    rather than a measured punch. Until that falls, every")
-        print("    utilization figure built on worked_hours reads low.")
+        print("    rather than a measured punch, on the finished day(s) in the")
+        print(f"    window ({', '.join(finished)}). That is the figure that")
+        print("    describes what the daily runner publishes, because it reports")
+        print("    on yesterday. A day still in progress is nearly all fallback")
+        print("    by construction and says nothing about punch discipline.")
+    else:
+        print("  * No finished day in this window, so the UHU denominator cannot")
+        print("    be judged yet. Re-run once today has ended.")
     print("  * Run this daily with --json to accumulate a baseline. Four days is")
     print("    all the API will ever show you at once.")
-    print("  * The Dependencies sheet does not yet say that worked_hours rests on")
-    print("    punches nobody is paid from. That caveat is the honest reading of")
-    print("    every UHU number in the bundle.")
+    print("  * worked_hours still rests on punches nobody is paid from, which is")
+    print("    what the Paycor push is meant to change. Whether that matters is")
+    print("    now an empirical question rather than an assumption -- read the")
+    print("    punch-out completion figure in section 2 before arguing from it.")
 
 
 # =============================

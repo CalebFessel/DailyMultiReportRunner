@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+
+# Traumasoft ThirdParty API probe output
+api_probe/
+
+# Generated report output
+Reports/
+
+# Accumulated state. These are this deployment's learned data -- the
+# cost-center map, the OOS history -- and the operation's own decisions about
+# regions and crew minimums. They belong to the machine that runs the reports,
+# not to the repository, and a clone of C:\Reports would otherwise show them
+# as untracked forever and invite committing one by accident. The .example
+# files stay tracked: they are the templates.
+state/*.json
+!state/*.example.json

@@ -1,0 +1,19 @@
+{
+  "note": [
+    "Hand-written shift profile -> cost center mappings, for profiles the normal",
+    "route cannot reach. A profile is attributed through its scheduled crew, so",
+    "one that carries real runs but has no crew on the schedule -- outsourced",
+    "work, for instance -- can only be mapped deliberately.",
+    "",
+    "by_name is an exact match, case-insensitive. by_prefix matches the start of",
+    "the profile name, longest rule first. Both win over what was learned from",
+    "the shift feed, being a decision rather than an observation.",
+    "",
+    "Rename this file to shift_cost_center_overrides.json to put it in effect.",
+    "Run diagnose_cost_centers.py to see which profiles still need an entry."
+  ],
+  "by_name": {
+    "MD-EC-OUTSOURCED TRIPS": "PUT THE RIGHT COST CENTER HERE"
+  },
+  "by_prefix": {}
+}

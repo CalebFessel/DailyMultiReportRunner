@@ -105,14 +105,46 @@ def main():
         if key in claims:
             print(f"  {key:<18} {claims[key]}")
 
+    # Paycor packs the entities this token is actually for into paycor_clients,
+    # and its ClientId is the legal entity id -- the spec says so outright:
+    # "Unique identifier of the legal entity in Paycor's system. This is also
+    # known as the Client Id." So the token states the correct value, and a
+    # mismatch here is the whole explanation for a 403.
+    token_entities = []
+    clients = claims.get("paycor_clients")
+    if isinstance(clients, str):
+        try:
+            clients = json.loads(clients)
+        except ValueError:
+            clients = None
+    if isinstance(clients, dict):
+        for row in clients.get("C") or []:
+            if isinstance(row, dict) and row.get("ClientId") is not None:
+                token_entities.append(str(row["ClientId"]))
+
     entity = str(client.legal_entity_id or "").strip()
-    if entity:
-        blob = json.dumps(claims)
-        print(f"\n  legal entity {entity} appears in the token: "
-              f"{'yes' if entity in blob else 'no'}")
-        if entity not in blob:
-            print("  A token that never names this entity is the likelier")
-            print("  explanation for a 403 than a missing scope would be.")
+
+    print("\n" + "-" * 78)
+    print("LEGAL ENTITY")
+    print("-" * 78)
+    if token_entities:
+        print(f"  the token is for: {', '.join(token_entities)}")
+    else:
+        print("  the token names no client id, so the entity cannot be read from it")
+    print(f"  .env is asking about: {entity or '(not set)'}")
+
+    if token_entities and entity and entity not in token_entities:
+        print("\n  MISMATCH. This is the 403: the credential is valid, it just")
+        print("  has no access to the entity being asked about. Set")
+        suggestion = token_entities[0]
+        prefix = "PAYCOR_PRODUCTION_" if paycor_api.IS_PRODUCTION else "PAYCOR_SANDBOX_"
+        print(f"\n    {prefix}LEGAL_ENTITY_ID={suggestion}\n")
+        print("  No re-activation is needed; the token is fine.")
+    elif token_entities and entity:
+        print("\n  These agree, so a 403 is not about the entity.")
+    elif token_entities and not entity:
+        prefix = "PAYCOR_PRODUCTION_" if paycor_api.IS_PRODUCTION else "PAYCOR_SANDBOX_"
+        print(f"\n  Set {prefix}LEGAL_ENTITY_ID={token_entities[0]}")
 
     # ---- everything else, for the things worth seeing that are not guessed ----
     print("\n" + "-" * 78)

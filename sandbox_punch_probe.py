@@ -52,6 +52,9 @@ from paycor_api import (
 # Paycor may apply a delete asynchronously; wait before judging it.
 DELETE_SETTLE_SECONDS = 5
 
+# Paycor does not necessarily serve a punch back the instant it accepts it.
+READ_SETTLE_SECONDS = 5
+
 PUNCH_IN_HOUR = 8
 PUNCH_OUT_HOUR = 16
 
@@ -268,18 +271,23 @@ def main():
         print("idempotency test, which would only add noise.")
         return 1
 
+    time.sleep(READ_SETTLE_SECONDS)
     first = read_back(paycor, employee_id, day, correlations)
-    print(f"\n  Read back {sum(len(v) for v in first.values())} punch(es) "
-          f"carrying the probe's correlation ids.")
+    first_count = sum(len(v) for v in first.values())
+    print(f"\n  Read back {first_count} punch(es) carrying the probe's "
+          f"correlation ids (after {READ_SETTLE_SECONDS}s).")
     for cid, entries in sorted(first.items()):
         for entry in entries:
             print(f"    {entry.get('punchStatusType'):<4} "
                   f"{entry.get('punchDateTime')}  punchId={entry.get('punchId')}")
     if not first:
-        print("    None. Paycor accepted the batch and reported no errors, but")
-        print("    the punches do not read back -- correlationId may not be")
-        print("    returned on this endpoint, which would break the push's")
-        print("    ability to recognise its own writes.")
+        print("\n    NONE. Paycor accepted the batch, reported no errors, and")
+        print("    created nothing. This is the failure mode worth carrying")
+        print("    into production: a 202 with an empty error log is NOT")
+        print("    evidence that punches exist.")
+        print("\n    The usual cause is a punch already sitting at that")
+        print("    employee and time. Paycor keeps the existing one and says")
+        print("    nothing. Try --date on a day this employee has no punches.")
 
     # ---- 2. idempotency ----
     second = {}
@@ -430,14 +438,20 @@ def main():
         print("The write path did not complete.")
         print("=" * 78)
         return 1
-    print("Writes work: CreatePunches accepted, the tracking id resolved, the")
-    print("error log was empty, and the punches read back with their")
-    print("correlation ids intact.")
+    if first_count:
+        print("Writes work: CreatePunches accepted, the tracking id resolved,")
+        print("the error log was empty, and the punches read back carrying")
+        print("their correlation ids -- which is what lets a re-run recognise")
+        print("its own writes.")
+    else:
+        print("Writes are UNCONFIRMED. Paycor accepted the batch and reported")
+        print("no errors, but nothing read back, so no punch is known to have")
+        print("been created. Do not read this run as a working write path.")
     if not deleted_cleanly:
         print("\nDeletePunches is UNPROVEN -- it reported success and the")
         print("punches remained. Do not rely on it to undo anything.")
     print("=" * 78)
-    return 0 if deleted_cleanly else 1
+    return 0 if (deleted_cleanly and first_count) else 1
 
 
 if __name__ == "__main__":

@@ -369,18 +369,42 @@ def main():
         # id. Never a blanket delete over a time window.
         everything = correlations | fresh_correlations
         latest = read_back(paycor, employee_id, day, everything)
-        punch_ids = [e.get("punchId") for entries in latest.values()
-                     for e in entries if e.get("punchId")]
-        if not punch_ids:
+        # The whole record, not just the id: the spec requires punchRefId on
+        # the delete whenever the punch carries one, and only the record knows.
+        records = [e for entries in latest.values() for e in entries
+                   if e.get("punchId")]
+        if not records:
             print("  Nothing to delete -- no punch ids read back.")
         else:
             try:
-                paycor.delete_punches(employee_id, punch_ids)
-                print(f"  Deleted {len(punch_ids)} punch(es) this probe created.")
+                delete_tracking = paycor.delete_punches(employee_id, records)
             except (PaycorAPIError, PaycorAuthError) as exc:
                 print(f"  Could not delete: {exc}")
-                print(f"  Left behind: {', '.join(str(p) for p in punch_ids)}")
+                body = getattr(exc, "body", None)
+                if body:
+                    rendered = body if isinstance(body, str) else json.dumps(body)
+                    print(f"  response body: {rendered[:600]}")
                 return 1
+
+            print(f"  Delete accepted for {len(records)} punch(es), "
+                  f"tracking id {delete_tracking or '(none returned)'}")
+
+            # A delete is asynchronous exactly like a create, so acceptance
+            # says nothing. The error log is the only place a rejected delete
+            # appears.
+            if delete_tracking:
+                try:
+                    delete_errors = paycor.punch_errors(delete_tracking)
+                except PaycorAPIError as exc:
+                    print(f"  Could not read the delete error log: {exc}")
+                    delete_errors = []
+                if delete_errors:
+                    print(f"  Paycor rejected {len(delete_errors)} delete(s):")
+                    for entry in delete_errors:
+                        print(f"    {entry.get('errorDetail')} | {entry.get('punchDetail')}")
+                    deleted_cleanly = False
+                else:
+                    print("  Delete error log is empty.")
 
             # Paycor may apply the delete asynchronously, so an immediate
             # re-read can be stale. Give it a moment before calling it a

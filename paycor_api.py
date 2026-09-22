@@ -531,18 +531,57 @@ class PaycorClient:
             )
         return tracking_id
 
-    def delete_punches(self, employee_id, punch_ids):
+    def delete_punches(self, employee_id, punches):
         """
         DELETE /v1/employees/{id}/DeletePunches. Requires read_only=False.
 
-        Takes the punch guids returned by `get_employee_punches`. This is what
-        makes a sandbox test reversible -- a test you cannot undo is not a test
-        you should run against payroll.
+        Returns the tracking id from the 202, exactly like `create_punches`:
+        the delete is applied asynchronously and a rejected one is visible
+        only through `punch_errors(tracking_id)`. A caller that treats the
+        return of this method as success will report punches as deleted that
+        are still there -- which is how a sandbox probe came to announce a
+        clean cleanup over punches Paycor had kept.
+
+        Takes either punch guids or the punch records from
+        `get_employee_punches`. Prefer the records: the spec requires that
+        when a punch carries a punchRefId, the delete must name it too, and
+        only the record knows whether it has one.
+
+        This is what makes a test reversible, and a test you cannot undo is
+        not one to run against payroll.
         """
-        body = [{"punchId": pid} for pid in punch_ids]
+        body = []
+        for punch in punches:
+            if isinstance(punch, dict):
+                punch_id = punch.get("punchId") or punch.get("id")
+                if not punch_id:
+                    continue
+                entry = {"punchId": str(punch_id)}
+                # Required by the spec whenever it is present on the punch.
+                ref_id = punch.get("punchRefId")
+                if ref_id:
+                    entry["punchRefId"] = str(ref_id)
+                body.append(entry)
+            elif punch:
+                body.append({"punchId": str(punch)})
+
         if not body:
             return None
-        return self.request(
+        if len(body) > MAX_PUNCH_BATCH:
+            raise ValueError(
+                f"{len(body)} punches exceeds the {MAX_PUNCH_BATCH} batch "
+                "ceiling; delete them in chunks so one error log stays readable."
+            )
+
+        payload = self.request(
             "DELETE", f"v1/employees/{employee_id}/DeletePunches",
             json_body=body, write=True,
         )
+        resource = (payload or {}).get("resourceUrl") or {}
+        tracking_id = resource.get("id")
+        if not tracking_id:
+            log.warning(
+                "DeletePunches returned no tracking id (%s); whether the "
+                "delete was applied cannot be checked.", json.dumps(payload)[:200]
+            )
+        return tracking_id

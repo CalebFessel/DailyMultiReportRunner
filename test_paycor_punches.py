@@ -564,6 +564,61 @@ else:
 
 
 # =============================
+section("delete punches")
+
+# The sandbox probe reported a clean cleanup over punches Paycor had kept,
+# because a delete is asynchronous like a create and nothing read its result.
+# These pin down the two things that made that possible.
+sent = {}
+
+
+def capture_delete(method, path, params=None, json_body=None, write=False):
+    sent["method"] = method
+    sent["path"] = path
+    sent["body"] = json_body
+    return {"resourceUrl": {"id": "trk-delete-1"}}
+
+
+deleter = PaycorClient(subscription_key="k", access_token="t",
+                       legal_entity_id="LE-1", read_only=False)
+deleter.request = capture_delete
+
+tracking = deleter.delete_punches("emp-1", ["punch-1", "punch-2"])
+check("delete_punches returns the tracking id from the 202",
+      tracking == "trk-delete-1", str(tracking))
+check("bare ids still work", sent["body"] == [{"punchId": "punch-1"},
+                                              {"punchId": "punch-2"}],
+      str(sent["body"]))
+check("and it is a DELETE", sent["method"] == "DELETE", sent["method"])
+
+# The spec: when a punch carries a punchRefId, the delete must name it too.
+# Passing records rather than ids is what makes that possible.
+deleter.delete_punches("emp-1", [
+    {"punchId": "punch-1", "punchRefId": "ref-1"},
+    {"punchId": "punch-2"},
+])
+check("punchRefId is passed through when the punch carries one",
+      sent["body"] == [{"punchId": "punch-1", "punchRefId": "ref-1"},
+                       {"punchId": "punch-2"}],
+      str(sent["body"]))
+
+deleter.delete_punches("emp-1", [{"id": "punch-9"}])
+check("a record keyed 'id' is accepted too",
+      sent["body"] == [{"punchId": "punch-9"}], str(sent["body"]))
+
+sent.clear()
+check("an empty delete sends nothing",
+      deleter.delete_punches("emp-1", []) is None and not sent)
+
+raised = None
+try:
+    deleter.delete_punches("emp-1", [{"punchId": f"p{i}"} for i in range(101)])
+except ValueError as exc:
+    raised = exc
+check("a delete over the batch ceiling is refused", raised is not None)
+
+
+# =============================
 section("per-environment credentials")
 
 # env_credential reads module-level IS_PRODUCTION, which is fixed at import.

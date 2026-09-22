@@ -1,17 +1,32 @@
 """
-Turn a Paycor authorization code into a refresh token.
+Exchange a Paycor authorization code for a refresh token -- IF that is even
+the flow. Read this before using it.
 
-Paycor's App Activation page runs a PKCE authorization-code flow: it shows a
-Code Verifier, you click Initiate, and it redirects to
-hcm.paycor.com/appactivation/clientredirect with ?code=... in the address bar.
-That code is short-lived and single use; this exchanges it for the refresh
-token every other call needs.
+Paycor's App Activation page displays a Code Verifier and redirects through
+hcm.paycor.com/appactivation/clientredirect with ?code=..., which looks like a
+PKCE authorization-code flow, and this script was written on that reading.
+The evidence since says otherwise:
 
-The Code Verifier shown on the activation page must be the one from the *same*
-attempt that produced the code. Reloading the page issues a new verifier and
-invalidates the old pairing.
+  * docs/paycor-public-api-v1.json documents no authorization-code grant at
+    all -- no grant_type, no code_verifier, no authorization_code anywhere in
+    the spec. What it does document is a RefreshToken schema requiring
+    refresh_token + client_id + client_secret, the refresh grant the client
+    already uses.
+  * Exchanging a real sandbox code and verifier against sts/v1/common/token
+    returned 400 invalid_grant.
+  * Production's refresh token was obtained by completing App Activation and
+    reading the tokens off the page, not by running this.
 
-    python paycor_exchange_code.py --code <code> --code-verifier <verifier>
+So the normal path is: complete App Activation in the browser and copy the
+refresh token it shows you. The Code Verifier on that page appears to belong
+to Paycor's own internal flow rather than to anything a caller performs.
+
+This script is kept for the case where an activation does hand back a bare
+?code= and no tokens, since the exchange it attempts is the obvious shape and
+costs one request to rule out. Treat a 400 from it as confirmation that the
+activation page is where the tokens come from, not as something to debug.
+
+    python paycor_exchange_code.py --code CODE --code-verifier VERIFIER
 
 Prints the refresh token so it can be pasted into .env. That value is a
 payroll credential: keep it out of chat, tickets and shared drives.

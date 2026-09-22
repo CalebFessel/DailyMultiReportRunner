@@ -620,6 +620,45 @@ check("legal entity id is scoped too, so the entity matches the tenant",
 
 
 # =============================
+section("sandbox probe refuses production")
+
+# The probe writes punches and then deletes them. Both are fine in a sandbox
+# and neither belongs in a tenant where people are paid, so the refusal is a
+# safety property worth a regression test rather than a code comment.
+probe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sandbox_punch_probe.py")
+if os.path.exists(probe):
+    import subprocess
+
+    env = dict(os.environ)
+    env.update({
+        "PAYCOR_ENVIRONMENT": "production",
+        "PAYCOR_SUBSCRIPTION_KEY": "test-subscription-key",
+        "PAYCOR_ACCESS_TOKEN": "test-access-token",
+        "PAYCOR_LEGAL_ENTITY_ID": "LE-1",
+    })
+    result = subprocess.run([sys.executable, probe], env=env,
+                            capture_output=True, text=True, timeout=60)
+
+    check("the sandbox probe exits non-zero when pointed at production",
+          result.returncode != 0, f"exit {result.returncode}")
+    check("and says why", "production" in result.stdout.lower())
+    # If it got as far as talking to Paycor it would have had to authenticate,
+    # and the placeholder credentials above would have surfaced as an error.
+    check("and refuses before making any request",
+          "Could not" not in result.stdout and "Traceback" not in result.stderr,
+          result.stderr[-200:] if result.stderr else "")
+
+    env["PAYCOR_ENVIRONMENT"] = "PRODUCTION"
+    upper = subprocess.run([sys.executable, probe], env=env,
+                           capture_output=True, text=True, timeout=60)
+    check("the refusal is not case-sensitive", upper.returncode != 0,
+          f"exit {upper.returncode}")
+else:
+    skip("sandbox probe production guard",
+         "sandbox_punch_probe.py not present in this checkout")
+
+
+# =============================
 print("\n" + "=" * 60)
 for note in SKIPPED:
     print(f"SKIPPED: {note}")

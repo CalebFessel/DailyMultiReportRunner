@@ -39,12 +39,16 @@ def main():
     ap.add_argument("--redirect-uri", default=DEFAULT_REDIRECT)
     args = ap.parse_args()
 
-    subscription_key = os.getenv("PAYCOR_SUBSCRIPTION_KEY", "").strip()
-    client_id = os.getenv("PAYCOR_CLIENT_ID", "").strip()
-    client_secret = os.getenv("PAYCOR_CLIENT_SECRET", "").strip()
+    # Resolved per environment, so exchanging a sandbox code uses the sandbox
+    # credentials and cannot accidentally mint a production token.
+    subscription_key = paycor_api.env_credential("SUBSCRIPTION_KEY", "").strip()
+    client_id = paycor_api.env_credential("CLIENT_ID", "").strip()
+    client_secret = paycor_api.env_credential("CLIENT_SECRET", "").strip()
 
     if not subscription_key:
-        print("PAYCOR_SUBSCRIPTION_KEY is not set.")
+        print(f"No subscription key for environment {paycor_api.ENVIRONMENT!r}.")
+        print("Set PAYCOR_SUBSCRIPTION_KEY, or the environment-specific")
+        print("PAYCOR_SANDBOX_SUBSCRIPTION_KEY / PAYCOR_PRODUCTION_SUBSCRIPTION_KEY.")
         return 2
 
     base = paycor_api.PRODUCTION_BASE_URL if paycor_api.IS_PRODUCTION else paycor_api.SANDBOX_BASE_URL
@@ -100,13 +104,17 @@ def main():
     refresh = payload.get("refresh_token")
     access = payload.get("access_token")
 
+    scope = "PAYCOR_PRODUCTION_" if paycor_api.IS_PRODUCTION else "PAYCOR_SANDBOX_"
+
     if refresh:
         print("\nSUCCESS. Put this in .env, then delete it from your terminal history:\n")
-        print(f"    PAYCOR_REFRESH_TOKEN={refresh}\n")
+        print(f"    {scope}REFRESH_TOKEN={refresh}\n")
+        print("(Or PAYCOR_REFRESH_TOKEN if you keep only one environment's")
+        print("credentials in this .env.)\n")
     elif access:
         print("\nNo refresh token came back, only an access token. It expires in")
         print(f"~{int(payload.get('expires_in') or 3600) // 60} minutes, so this is a test credential, not a scheduled one:\n")
-        print(f"    PAYCOR_ACCESS_TOKEN={access}\n")
+        print(f"    {scope}ACCESS_TOKEN={access}\n")
     else:
         print(f"\nNeither token present. Response keys: {sorted(payload)}")
         return 1

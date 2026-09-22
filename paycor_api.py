@@ -52,6 +52,33 @@ SANDBOX_BASE_URL = "https://apis-sandbox.paycor.com"
 ENVIRONMENT = os.getenv("PAYCOR_ENVIRONMENT", "sandbox").strip().lower()
 IS_PRODUCTION = ENVIRONMENT == "production"
 
+
+def env_credential(name, default=""):
+    """
+    Read a credential for whichever environment is selected.
+
+    Sandbox and production are separate Paycor tenants with separate keys,
+    tokens and legal entity ids. Holding one set of PAYCOR_* names means
+    switching environments is a hand edit of the .env -- which is exactly how
+    production credentials end up pointed at the sandbox host, or sandbox
+    credentials at production, with nothing in the output saying so.
+
+    So an environment-specific name wins when it is set:
+
+        PAYCOR_SANDBOX_SUBSCRIPTION_KEY     used when environment=sandbox
+        PAYCOR_PRODUCTION_SUBSCRIPTION_KEY  used when environment=production
+        PAYCOR_SUBSCRIPTION_KEY             used when neither is
+
+    Both sets live in the .env at once and PAYCOR_ENVIRONMENT selects between
+    them coherently. The bare name still works on its own, so an existing .env
+    keeps behaving exactly as it did.
+    """
+    prefix = "PAYCOR_PRODUCTION_" if IS_PRODUCTION else "PAYCOR_SANDBOX_"
+    scoped = os.getenv(f"{prefix}{name}", "").strip()
+    if scoped:
+        return scoped
+    return os.getenv(f"PAYCOR_{name}", default)
+
 DEFAULT_TIMEOUT = int(os.getenv("PAYCOR_API_TIMEOUT", "60"))
 DEFAULT_MIN_INTERVAL = float(os.getenv("PAYCOR_MIN_INTERVAL", "0.3"))
 
@@ -151,11 +178,11 @@ class PaycorClient:
         min_interval=DEFAULT_MIN_INTERVAL,
         read_only=True,
     ):
-        self.subscription_key = subscription_key or os.getenv("PAYCOR_SUBSCRIPTION_KEY", "")
-        self.refresh_token = refresh_token or os.getenv("PAYCOR_REFRESH_TOKEN", "")
-        self.client_id = client_id or os.getenv("PAYCOR_CLIENT_ID", "")
-        self.client_secret = client_secret or os.getenv("PAYCOR_CLIENT_SECRET", "")
-        self.legal_entity_id = legal_entity_id or os.getenv("PAYCOR_LEGAL_ENTITY_ID", "")
+        self.subscription_key = subscription_key or env_credential("SUBSCRIPTION_KEY")
+        self.refresh_token = refresh_token or env_credential("REFRESH_TOKEN")
+        self.client_id = client_id or env_credential("CLIENT_ID")
+        self.client_secret = client_secret or env_credential("CLIENT_SECRET")
+        self.legal_entity_id = legal_entity_id or env_credential("LEGAL_ENTITY_ID")
         self.timeout = timeout
         self.min_interval = min_interval
         self.read_only = read_only
@@ -166,7 +193,7 @@ class PaycorClient:
         # A directly-supplied access token short-circuits the refresh dance,
         # which is how you test with a token pasted out of the developer portal
         # before wiring the OAuth flow up properly.
-        self._access_token = access_token or os.getenv("PAYCOR_ACCESS_TOKEN", "") or None
+        self._access_token = access_token or env_credential("ACCESS_TOKEN") or None
         self._token_expires_at = float("inf") if self._access_token else 0.0
         self._last_call = 0.0
 

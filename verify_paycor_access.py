@@ -29,7 +29,7 @@ CHECKS = (
 
 
 def main():
-    entity = os.getenv("PAYCOR_LEGAL_ENTITY_ID", "").strip()
+    entity = paycor_api.env_credential("LEGAL_ENTITY_ID", "").strip()
     print("=" * 74)
     print("PAYCOR ACCESS VERIFICATION")
     print(f"environment:     {paycor_api.ENVIRONMENT}")

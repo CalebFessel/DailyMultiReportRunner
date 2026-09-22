@@ -564,6 +564,62 @@ else:
 
 
 # =============================
+section("per-environment credentials")
+
+# env_credential reads module-level IS_PRODUCTION, which is fixed at import.
+# Rather than reimport the module, exercise the resolution directly against a
+# patched flag -- the behaviour under test is the name precedence, not the
+# import-time gate.
+def resolve(name, environ, production):
+    saved_env = dict(os.environ)
+    saved_flag = paycor_api.IS_PRODUCTION
+    try:
+        for key in [k for k in os.environ if k.startswith("PAYCOR_")]:
+            del os.environ[key]
+        os.environ.update(environ)
+        paycor_api.IS_PRODUCTION = production
+        return paycor_api.env_credential(name, "")
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+        paycor_api.IS_PRODUCTION = saved_flag
+
+
+check("the bare name is used when no scoped name is set",
+      resolve("SUBSCRIPTION_KEY", {"PAYCOR_SUBSCRIPTION_KEY": "bare"}, False) == "bare")
+
+check("a sandbox-scoped name wins in the sandbox",
+      resolve("SUBSCRIPTION_KEY",
+              {"PAYCOR_SUBSCRIPTION_KEY": "bare",
+               "PAYCOR_SANDBOX_SUBSCRIPTION_KEY": "sand"}, False) == "sand")
+
+check("a production-scoped name wins in production",
+      resolve("SUBSCRIPTION_KEY",
+              {"PAYCOR_SUBSCRIPTION_KEY": "bare",
+               "PAYCOR_PRODUCTION_SUBSCRIPTION_KEY": "prod"}, True) == "prod")
+
+# The whole point of the change: one environment's credentials must never be
+# reachable while the other is selected.
+check("a production-scoped name is invisible in the sandbox",
+      resolve("SUBSCRIPTION_KEY",
+              {"PAYCOR_PRODUCTION_SUBSCRIPTION_KEY": "prod"}, False) == "")
+
+check("a sandbox-scoped name is invisible in production",
+      resolve("SUBSCRIPTION_KEY",
+              {"PAYCOR_SANDBOX_SUBSCRIPTION_KEY": "sand"}, True) == "")
+
+check("an empty scoped name falls back rather than blanking the credential",
+      resolve("SUBSCRIPTION_KEY",
+              {"PAYCOR_SUBSCRIPTION_KEY": "bare",
+               "PAYCOR_SANDBOX_SUBSCRIPTION_KEY": "   "}, False) == "bare")
+
+check("legal entity id is scoped too, so the entity matches the tenant",
+      resolve("LEGAL_ENTITY_ID",
+              {"PAYCOR_LEGAL_ENTITY_ID": "196750",
+               "PAYCOR_SANDBOX_LEGAL_ENTITY_ID": "42"}, False) == "42")
+
+
+# =============================
 print("\n" + "=" * 60)
 for note in SKIPPED:
     print(f"SKIPPED: {note}")

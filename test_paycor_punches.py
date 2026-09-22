@@ -564,6 +564,77 @@ else:
 
 
 # =============================
+section("publish verifies by reading back")
+
+# Sandbox run 3: a batch accepted with a tracking id and an empty error log
+# that created nothing, because punches already occupied those times. An empty
+# error log says nothing was rejected -- never that anything was written.
+import push_paycor_timecards as PUSH
+
+PUSH.PUBLISH_VERIFY_SETTLE_SECONDS = 0
+
+
+def publish_row(uid, cid_in, cid_out):
+    return {
+        "user_id": uid,
+        "employee_name": f"Crew {uid}",
+        "paycor_employee_id": f"emp-{uid}",
+        "department_id": "dept-1",
+        "activity_type_id": "act-1",
+        "punch_in": datetime(2026, 9, 2, 8, 0),
+        "punch_out": datetime(2026, 9, 2, 16, 0),
+        "profile": "TEST-1",
+        "punch_id": f"p{uid}",
+        "correlation_in": cid_in,
+        "correlation_out": cid_out,
+    }
+
+
+class FakePaycor:
+    """Accepts everything, and returns only the correlation ids it was told."""
+
+    def __init__(self, readable):
+        self.readable = readable
+
+    def create_punches(self, payload, legal_entity_id=None):
+        return "trk-1"
+
+    def punch_errors(self, tracking_id, legal_entity_id=None):
+        return []
+
+    def get_employee_punches(self, employee_id, start, end):
+        return [{"correlationId": c} for c in self.readable.get(employee_id, [])]
+
+
+# Both halves come back: genuinely written.
+rows = [publish_row("1", "cid-in-1", "cid-out-1")]
+sent, failed, unverified = PUSH.publish(
+    FakePaycor({"emp-1": ["cid-in-1", "cid-out-1"]}), rows)
+check("a punch that reads back is reported as sent",
+      len(sent) == 1 and not unverified and not failed,
+      f"sent={len(sent)} unverified={len(unverified)}")
+
+# Accepted, no errors, and nothing created. The case that was reported as sent.
+rows = [publish_row("2", "cid-in-2", "cid-out-2")]
+sent, failed, unverified = PUSH.publish(FakePaycor({"emp-2": []}), rows)
+check("a punch accepted with an empty error log but absent from Paycor "
+      "is NOT reported as sent", not sent, f"sent={len(sent)}")
+check("it is reported as unverified", len(unverified) == 1)
+check("and says it was not created",
+      "not created" in (unverified[0].get("error") or ""),
+      unverified[0].get("error"))
+
+# Half a shift is still a problem: an In with no Out is an open punch.
+rows = [publish_row("3", "cid-in-3", "cid-out-3")]
+sent, failed, unverified = PUSH.publish(
+    FakePaycor({"emp-3": ["cid-in-3"]}), rows)
+check("a punch whose Out did not land is unverified, not sent",
+      not sent and len(unverified) == 1)
+check("and names which half is missing",
+      "Out" in (unverified[0].get("error") or ""), unverified[0].get("error"))
+
+
+# =============================
 section("delete punches")
 
 # The sandbox probe reported a clean cleanup over punches Paycor had kept,

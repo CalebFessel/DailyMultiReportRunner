@@ -59,6 +59,7 @@ Usage:
 import os
 import sys
 import json
+import time
 import logging
 import argparse
 from collections import defaultdict
@@ -88,6 +89,9 @@ log = logging.getLogger("push-paycor")
 
 STATE_DIR = os.getenv("TS_STATE_DIR", "state")
 OVERRIDES_FILE = os.path.join(STATE_DIR, "paycor_employee_overrides.json")
+
+# Paycor accepts a punch before it serves it back, so verification waits.
+PUBLISH_VERIFY_SETTLE_SECONDS = int(os.getenv("PAYCOR_VERIFY_SETTLE", "5"))
 
 # Which activity type a pushed punch is filed under. Required by Paycor, with
 # no default of its own; "Work" is the ordinary productive type on most
@@ -543,13 +547,20 @@ def jsonable(row):
 # =============================
 def publish(paycor, queue, legal_entity_id=None):
     """
-    Send the queue in batches, then read the error log for each batch.
+    Send the queue in batches, read each batch's error log, then read the
+    punches back and confirm they exist.
 
-    A 202 only says Paycor accepted the batch for processing. The error log is
-    the only place a rejected punch appears, so a batch is not reported as sent
-    until its log has been read.
+    A 202 only says Paycor accepted the batch for processing, and an empty
+    error log only says nothing was *rejected*. Neither says anything was
+    *created*. Sandbox testing found exactly that case: a batch accepted with
+    an empty error log that created nothing, because punches already occupied
+    those times and Paycor silently kept them.
+
+    So a row is reported as sent only once both of its correlation ids come
+    back from Paycor. Anything else is unverified, which is a different thing
+    from failed and has to be read by a human rather than retried blindly.
     """
-    sent, failed, unverified = [], [], []
+    accepted, failed, unverified = [], [], []
     objects = []
     for row in queue:
         for obj in punch_objects(row):
@@ -606,9 +617,47 @@ def publish(paycor, queue, legal_entity_id=None):
 
         for row in rows:
             row["tracking_id"] = tracking_id
-        sent.extend(rows)
-        log.info("Tracking id %s reports no errors: %s punch(es) landed.",
-                 tracking_id, len(rows))
+        accepted.extend(rows)
+        log.info("Tracking id %s reports no errors on %s punch(es); "
+                 "verifying they exist.", tracking_id, len(rows))
+
+    # ---- the part an empty error log does not tell you ----
+    if not accepted:
+        return [], failed, unverified
+
+    # Paycor does not necessarily serve a punch back the instant it accepts it.
+    time.sleep(PUBLISH_VERIFY_SETTLE_SECONDS)
+
+    window_start = min(r["punch_in"] for r in accepted).date()
+    window_end = max(r["punch_in"] for r in accepted).date() + timedelta(days=1)
+    try:
+        present = collect_correlations(paycor, accepted, window_start, window_end)
+    except (PaycorAPIError, PaycorAuthError) as exc:
+        log.error("Could not read the punches back to verify them: %s", exc)
+        for row in accepted:
+            row["error"] = f"accepted, but could not be read back to verify: {exc}"
+        return [], failed, unverified + accepted
+
+    sent = []
+    for row in accepted:
+        missing = [half for half, cid in (("In", row.get("correlation_in")),
+                                          ("Out", row.get("correlation_out")))
+                   if not cid or str(cid).lower() not in present]
+        if missing:
+            row["error"] = (
+                f"accepted with no errors, but the {' and '.join(missing)} "
+                "punch does not read back from Paycor -- it was not created"
+            )
+            unverified.append(row)
+        else:
+            sent.append(row)
+
+    if len(sent) != len(accepted):
+        log.error("%s of %s punch(es) were accepted without error but do NOT "
+                  "exist in Paycor. An empty error log is not proof of a write.",
+                  len(accepted) - len(sent), len(accepted))
+    else:
+        log.info("Verified: all %s punch(es) read back from Paycor.", len(sent))
 
     return sent, failed, unverified
 
@@ -762,9 +811,20 @@ def main():
         print(f"\n  landed {len(sent)}   rejected {len(failed)}   "
               f"unverified {len(unverified)}   already present {len(skipped)}")
         if unverified:
-            print("  'unverified' means Paycor accepted the batch but the error log")
-            print("  could not be read. Those punches may or may not be in payroll;")
-            print("  check before re-running, or a re-run could double them.")
+            print("\n  'unverified' means Paycor accepted the punch and raised no")
+            print("  error, but it could not be confirmed to exist afterwards --")
+            print("  either the read-back failed, or Paycor created nothing. An")
+            print("  accepted batch with an empty error log is not proof of a")
+            print("  write; only reading the punch back is.")
+            print("\n  Check each of these in Paycor before re-running. Paycor")
+            print("  refuses an identical re-send, so a re-run cannot double")
+            print("  them, but it will not fix them either:")
+            for row in unverified[:20]:
+                print(f"    {row.get('employee_name') or row.get('user_id')}"
+                      f"  {row['punch_in']:%m-%d %H:%M} - {row['punch_out']:%H:%M}"
+                      f"  {row.get('error', '')[:90]}")
+            if len(unverified) > 20:
+                print(f"    ... and {len(unverified) - 20} more (see --json)")
     elif sendable:
         print(f"\n  Dry run: nothing was sent. {len(sendable)} punch(es) are ready.")
         if not args.reconcile:

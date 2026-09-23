@@ -441,23 +441,47 @@ def report_reconciliation(sendable, timecard_index, known_correlations):
     print(f"  Not in Paycor at all           : {len(missing)}")
 
     if drifted:
-        print("\n  Both systems hold these, with times that differ. Understand")
-        print("  these before trusting either clock:")
-        for row in sorted(drifted, key=lambda r: -(r["drift_in_minutes"] or 0))[:15]:
+        print("\n  Both systems hold these, with times that differ. Both clocks are")
+        print("  shown in full, with dates: a shift crossing midnight reads as a")
+        print("  13-hour day or a 37-hour one depending on which date the out")
+        print("  carries, and an out printed as a bare wall time hides that.")
+        print()
+        print(f"    {'crew':<22} {'Traumasoft in':<17} {'Traumasoft out':<17} "
+              f"{'Paycor in':<17} {'Paycor out':<17}  drift")
+        for row in sorted(drifted, key=lambda r: -max(
+                r.get("drift_in_minutes") or 0, r.get("drift_out_minutes") or 0))[:15]:
+            existing_in, existing_out = row.get("paycor_existing", (None, None))
             out_gap = row["drift_out_minutes"]
-            print(f"    in {row['drift_in_minutes']:>6.1f}m  "
-                  f"out {('%6.1fm' % out_gap) if out_gap is not None else '     -'}  "
-                  f"{(row['employee_name'] or row['user_id'])!s:<24} "
-                  f"TS {row['punch_in']:%m-%d %H:%M}-"
-                  f"{row['punch_out']:%H:%M}")
+            drift = (f"in {row['drift_in_minutes']:.0f}m"
+                     + (f" out {out_gap:.0f}m" if out_gap is not None else ""))
+            print(f"    {(row['employee_name'] or row['user_id'])!s:<22} "
+                  f"{row['punch_in']:%m-%d %H:%M}     "
+                  f"{row['punch_out']:%m-%d %H:%M}     "
+                  f"{existing_in:%m-%d %H:%M}     "
+                  f"{(f'{existing_out:%m-%d %H:%M}' if existing_out else 'open'):<17}"
+                  f"  {drift}")
+
+        # A whole day of drift is a different problem from a few minutes, and
+        # only one of them is a clock.
+        day_off = [r for r in drifted
+                   if r.get("drift_out_minutes") is not None
+                   and abs(r["drift_out_minutes"] - 1440) <= 60]
+        if day_off:
+            print(f"\n  {len(day_off)} of these differ by close to exactly 24 hours on the")
+            print("  clock-out, and every one crosses midnight. That is a date being")
+            print("  assigned wrong rather than two clocks drifting apart. Check the")
+            print("  Paycor dates above against what the crew actually worked before")
+            print("  deciding which side is right -- and note that a publish would")
+            print("  not correct these: it adds punches, it does not amend one.")
 
     if missing:
         print(f"\n  Punches Traumasoft has and Paycor does not ({len(missing)}).")
         print("  These are what a publish would add:")
         for row in missing[:15]:
+            hours = (row["punch_out"] - row["punch_in"]).total_seconds() / 3600.0
             print(f"    {(row['employee_name'] or row['user_id'])!s:<24} "
-                  f"{row['punch_in']:%m-%d %H:%M} - {row['punch_out']:%H:%M}  "
-                  f"{row['profile']}")
+                  f"{row['punch_in']:%m-%d %H:%M} - {row['punch_out']:%m-%d %H:%M} "
+                  f"({hours:4.1f}h)  {row['profile']}")
         if len(missing) > 15:
             print(f"    ... and {len(missing) - 15} more")
 

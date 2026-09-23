@@ -564,6 +564,142 @@ else:
 
 
 # =============================
+section("rotated refresh tokens are written back")
+
+# Paycor rotates the refresh token on use in some configurations. Held in
+# memory only, the next run starts from a credential Paycor has retired, and
+# that arrives as an auth error on a morning nobody changed anything.
+import shutil
+import tempfile as _tempfile
+
+env_dir = _tempfile.mkdtemp()
+env_path = os.path.join(env_dir, ".env")
+
+
+def write_env(body):
+    with open(env_path, "w", encoding="utf-8") as handle:
+        handle.write(body)
+
+
+def read_env():
+    with open(env_path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+write_env("# comment\nTS_API_KEY=keep-me\nPAYCOR_REFRESH_TOKEN=old-token\nOTHER=untouched\n")
+paycor_api.write_env_value(env_path, "PAYCOR_REFRESH_TOKEN", "new-token")
+body = read_env()
+check("the rotated value replaces the old one",
+      "PAYCOR_REFRESH_TOKEN=new-token" in body and "old-token" not in body, body)
+check("every other line survives",
+      "# comment" in body and "TS_API_KEY=keep-me" in body and "OTHER=untouched" in body,
+      body)
+check("and nothing is duplicated", body.count("PAYCOR_REFRESH_TOKEN") == 1, body)
+
+write_env("EXISTING=1\n")
+added = paycor_api.write_env_value(env_path, "PAYCOR_REFRESH_TOKEN", "fresh")
+check("a name not yet present is appended rather than lost",
+      added is False and "PAYCOR_REFRESH_TOKEN=fresh" in read_env(), read_env())
+
+write_env("export PAYCOR_REFRESH_TOKEN=old\n")
+paycor_api.write_env_value(env_path, "PAYCOR_REFRESH_TOKEN", "new")
+check("an exported line is replaced too, not duplicated",
+      read_env().count("PAYCOR_REFRESH_TOKEN") == 1 and "new" in read_env(), read_env())
+
+# The scoped name has to win: writing the bare one back while a scoped one is
+# set would leave the retired value winning on the next run.
+saved = dict(os.environ)
+try:
+    for key in [k for k in os.environ if k.startswith("PAYCOR_")]:
+        del os.environ[key]
+    os.environ["PAYCOR_REFRESH_TOKEN"] = "bare"
+    os.environ["PAYCOR_SANDBOX_REFRESH_TOKEN"] = "scoped"
+    paycor_api.IS_PRODUCTION = False
+    check("the write-back targets the name that supplied the credential",
+          paycor_api.credential_var_name("REFRESH_TOKEN") == "PAYCOR_SANDBOX_REFRESH_TOKEN",
+          paycor_api.credential_var_name("REFRESH_TOKEN"))
+    del os.environ["PAYCOR_SANDBOX_REFRESH_TOKEN"]
+    check("and falls back to the bare name when no scoped one is set",
+          paycor_api.credential_var_name("REFRESH_TOKEN") == "PAYCOR_REFRESH_TOKEN")
+    del os.environ["PAYCOR_REFRESH_TOKEN"]
+    check("a credential that came from code has no variable to write back to",
+          paycor_api.credential_var_name("REFRESH_TOKEN") is None)
+finally:
+    os.environ.clear()
+    os.environ.update(saved)
+    paycor_api.IS_PRODUCTION = paycor_api.ENVIRONMENT == "production"
+
+# A failed write must not take down a run that may be part way through payroll.
+rotating = PaycorClient(subscription_key="k", refresh_token="old",
+                        legal_entity_id="LE-1", read_only=True)
+saved = dict(os.environ)
+try:
+    os.environ["PAYCOR_ENV_FILE"] = os.path.join(env_dir, "no", "such", "file")
+    os.environ["PAYCOR_REFRESH_TOKEN"] = "old"
+    persisted = rotating._persist_refresh_token("rotated")
+    check("an unwritable env file is reported, not raised", persisted is False)
+
+    os.environ["PAYCOR_PERSIST_REFRESH_TOKEN"] = "false"
+    check("persistence can be turned off for a host that owns the secret",
+          rotating._persist_refresh_token("rotated") is False)
+finally:
+    os.environ.clear()
+    os.environ.update(saved)
+
+# End to end: a token refresh whose response carries a new refresh token must
+# actually reach the .env. The pieces above can all pass while nothing wires
+# them together.
+import contextlib
+import io
+import urllib.request as _urllib_request
+
+write_env("PAYCOR_REFRESH_TOKEN=old-token\n")
+
+
+class FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+saved = dict(os.environ)
+real_urlopen = _urllib_request.urlopen
+try:
+    for key in [k for k in os.environ if k.startswith("PAYCOR_")]:
+        del os.environ[key]
+    os.environ["PAYCOR_ENV_FILE"] = env_path
+    os.environ["PAYCOR_REFRESH_TOKEN"] = "old-token"
+    paycor_api.IS_PRODUCTION = False
+
+    _urllib_request.urlopen = lambda *a, **k: FakeResponse(json.dumps({
+        "access_token": "an-access-token",
+        "refresh_token": "rotated-by-paycor",
+        "expires_in": 3600,
+    }).encode("utf-8"))
+
+    rotator = PaycorClient(subscription_key="k", legal_entity_id="LE-1",
+                           read_only=True)
+    token = rotator._token()
+    check("the refresh still yields an access token", token == "an-access-token", token)
+    check("the rotated refresh token is held in memory",
+          rotator.refresh_token == "rotated-by-paycor", rotator.refresh_token)
+    check("and written to the env file, so the next run does not start retired",
+          "PAYCOR_REFRESH_TOKEN=rotated-by-paycor" in read_env(), read_env())
+    check("and the process environment is updated too",
+          os.environ.get("PAYCOR_REFRESH_TOKEN") == "rotated-by-paycor")
+finally:
+    _urllib_request.urlopen = real_urlopen
+    os.environ.clear()
+    os.environ.update(saved)
+    paycor_api.IS_PRODUCTION = paycor_api.ENVIRONMENT == "production"
+
+shutil.rmtree(env_dir, ignore_errors=True)
+
+
+# =============================
 section("publish verifies by reading back")
 
 # Sandbox run 3: a batch accepted with a tracking id and an empty error log

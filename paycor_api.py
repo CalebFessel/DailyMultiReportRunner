@@ -37,6 +37,9 @@ import os
 import time
 import urllib.error
 import urllib.parse
+import re
+import sys
+import tempfile
 import urllib.request
 import uuid
 
@@ -51,6 +54,92 @@ SANDBOX_BASE_URL = "https://apis-sandbox.paycor.com"
 # the sandbox, so a typo fails safe rather than going live.
 ENVIRONMENT = os.getenv("PAYCOR_ENVIRONMENT", "sandbox").strip().lower()
 IS_PRODUCTION = ENVIRONMENT == "production"
+
+
+def credential_var_name(name):
+    """
+    The environment variable that actually supplied this credential, or None.
+
+    env_credential() resolves a value; this resolves where it came from, which
+    is what a write-back needs. A rotated refresh token has to replace the name
+    that produced it -- writing PAYCOR_REFRESH_TOKEN when the sandbox-scoped
+    name is in use would leave the stale value winning on the next run.
+    """
+    prefix = "PAYCOR_PRODUCTION_" if IS_PRODUCTION else "PAYCOR_SANDBOX_"
+    scoped = f"{prefix}{name}"
+    if os.getenv(scoped, "").strip():
+        return scoped
+    if os.getenv(f"PAYCOR_{name}", "").strip():
+        return f"PAYCOR_{name}"
+    return None
+
+
+def dotenv_path():
+    """
+    The .env the credentials were loaded from, if one was.
+
+    traumasoft_api loads it and records where from. Read that through
+    sys.modules rather than importing it, so this module keeps no dependency
+    on the other -- and fall back to the same search when it was never loaded,
+    so a Paycor-only script still finds the file.
+    """
+    override = os.getenv("PAYCOR_ENV_FILE", "").strip()
+    if override:
+        return override
+
+    loader = sys.modules.get("traumasoft_api")
+    loaded_from = getattr(loader, "_DOTENV_LOADED_FROM", None) if loader else None
+    if loaded_from:
+        return loaded_from
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    for directory in (here, os.getcwd()):
+        for name in (".env", ".env.txt"):
+            candidate = os.path.join(directory, name)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def write_env_value(path, key, value):
+    """
+    Replace one KEY=VALUE in an env file, leaving every other byte alone.
+
+    Written to a temporary file in the same directory and moved into place, so
+    an interruption cannot leave a half-written .env -- which on this file
+    would mean losing every other credential in it.
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            lines = handle.read().splitlines()
+    except OSError as exc:
+        raise OSError(f"could not read {path}: {exc}") from exc
+
+    pattern = re.compile(rf"^\s*(?:export\s+)?{re.escape(key)}\s*=")
+    replaced = False
+    for index, line in enumerate(lines):
+        if pattern.match(line):
+            lines[index] = f"{key}={value}"
+            replaced = True
+            break
+    if not replaced:
+        lines.append(f"{key}={value}")
+
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=directory, delete=False, newline="\n"
+    )
+    try:
+        handle.write("\n".join(lines) + "\n")
+        handle.close()
+        os.replace(handle.name, path)
+    except Exception:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+        raise
+    return replaced
 
 
 def env_credential(name, default=""):
@@ -263,14 +352,74 @@ class PaycorClient:
             )
         # Paycor rotates the refresh token on use in some configurations. Keep
         # whichever came back, so a long run does not authenticate once and then
-        # fail on a stale credential.
-        if payload.get("refresh_token"):
-            self.refresh_token = payload["refresh_token"]
+        # fail on a stale credential -- and write it back, or the next run
+        # starts from a refresh token Paycor has already retired. That failure
+        # arrives as an ordinary auth error on a morning nobody changed
+        # anything, which is a bad way to find out.
+        rotated = payload.get("refresh_token")
+        if rotated and rotated != self.refresh_token:
+            self.refresh_token = rotated
+            self._persist_refresh_token(rotated)
         self._access_token = token
         expires_in = float(payload.get("expires_in") or 3600)
         self._token_expires_at = time.time() + expires_in - TOKEN_EXPIRY_MARGIN_SECONDS
         log.info("Paycor access token acquired, valid ~%.0f minutes.", expires_in / 60)
         return token
+
+    def _persist_refresh_token(self, token):
+        """
+        Write a rotated refresh token back where it came from.
+
+        Best effort by design: a failure here means the next run authenticates
+        with a retired credential, which is worth a loud warning, but it must
+        not take down a run that has already authenticated and may be part way
+        through writing payroll.
+
+        Set PAYCOR_PERSIST_REFRESH_TOKEN=false on a host with a read-only
+        checkout or an injected secret, where the write would fail every time
+        and the platform owns the credential anyway.
+        """
+        if os.getenv("PAYCOR_PERSIST_REFRESH_TOKEN", "true").strip().lower() in (
+            "false", "0", "no"
+        ):
+            log.info("Paycor rotated the refresh token; persistence is disabled, "
+                     "so update the stored credential yourself.")
+            return False
+
+        key = credential_var_name("REFRESH_TOKEN")
+        if not key:
+            # The token was passed in code, not read from the environment, so
+            # there is nothing to write back to.
+            log.warning(
+                "Paycor rotated the refresh token, but the old one did not come "
+                "from an environment variable, so it cannot be written back. "
+                "The next run will use a retired credential."
+            )
+            return False
+
+        path = dotenv_path()
+        if not path:
+            log.warning(
+                "Paycor rotated the refresh token and no .env was found to write "
+                "%s back to. Store the new value before the next run, or it will "
+                "authenticate with a retired credential.", key
+            )
+            return False
+
+        try:
+            write_env_value(path, key, token)
+        except Exception as exc:
+            log.warning(
+                "Paycor rotated the refresh token but %s could not be updated in "
+                "%s (%s). Store the new value before the next run.", key, path, exc
+            )
+            return False
+
+        # Keep the process's own environment in step, so anything reading it
+        # later in this run sees the live credential rather than the retired one.
+        os.environ[key] = token
+        log.info("Paycor rotated the refresh token; %s updated in %s.", key, path)
+        return True
 
     def _token(self):
         if not self._access_token or time.time() >= self._token_expires_at:

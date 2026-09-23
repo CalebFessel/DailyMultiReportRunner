@@ -382,6 +382,143 @@ def report_tags_vs_cost_centers(api, tag_counts, out):
     out["tag_cost_center_candidates"] = pairs
 
 
+def normalize_vin(value):
+    """
+    A VIN reduced to what is comparable between the two systems.
+
+    Case and stray punctuation differ between hand-entered and telematics-fed
+    records; nothing else about a VIN is safe to alter, so this only upper-
+    cases and drops anything that is not a letter or digit.
+    """
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+
+def report_vin_join(ts_vehicles, sam_vehicles, out):
+    """
+    The VIN join, measured against the name join it would replace.
+
+    A VIN is the only identifier both systems hold independently -- Traumasoft
+    from whoever typed it, Samsara from the gateway -- so it is the one key
+    that cannot drift when somebody renames a unit. It also settles the
+    duplicate-name records, which a name join cannot see past: two rows called
+    A-101 are one truck if they carry one VIN and two trucks if they do not.
+
+    Reported as a comparison rather than a number, because replacing a working
+    join with a better-sounding one that quietly covers fewer trucks is the
+    failure this is meant to prevent.
+    """
+    print("\n8. VIN JOIN")
+    print("   " + "-" * 66)
+
+    ts_total = len(ts_vehicles)
+    ts_with = [v for v in ts_vehicles if normalize_vin(v.get("vin"))]
+    sam_with = [v for v in sam_vehicles if normalize_vin(v.get("vin"))]
+    print(f"   Traumasoft: {len(ts_with)} of {ts_total} record(s) carry a VIN "
+          f"({pct(len(ts_with), ts_total).strip()})")
+    print(f"   Samsara:    {len(sam_with)} of {len(sam_vehicles)} "
+          f"({pct(len(sam_with), len(sam_vehicles)).strip()})")
+
+    # A VIN is 17 characters. Anything else is a typo or a placeholder, and
+    # joining on it would be joining on nothing.
+    odd = [
+        (str(v.get("name") or "?"), v.get("vin"))
+        for v in ts_with if len(normalize_vin(v.get("vin"))) != 17
+    ]
+    if odd:
+        print(f"\n   Traumasoft VINs that are not 17 characters ({len(odd)}):")
+        for name, vin in odd[:20]:
+            print(f"      {name[:26]:<28}{str(vin)[:22]:<24}"
+                  f"{len(normalize_vin(vin))} chars")
+
+    sam_by_vin = defaultdict(list)
+    for vehicle in sam_with:
+        sam_by_vin[normalize_vin(vehicle.get("vin"))].append(vehicle)
+    ts_by_vin = defaultdict(list)
+    for vehicle in ts_with:
+        ts_by_vin[normalize_vin(vehicle.get("vin"))].append(vehicle)
+
+    # The duplicate-name records are the reason for doing this at all, so say
+    # plainly which ones one VIN resolves and which ones it does not.
+    shared = [
+        (vin, rows) for vin, rows in ts_by_vin.items() if len(rows) > 1
+    ]
+    if shared:
+        print(f"\n   One VIN on several Traumasoft records ({len(shared)}) -- "
+              f"these are one truck:")
+        for vin, rows in shared:
+            names = ", ".join(sorted({str(r.get('name') or '?') for r in rows}))
+            statuses = ", ".join(sorted({str(r.get('vehicle_status') or '?') for r in rows}))
+            print(f"      {vin[:19]:<21}{names[:26]:<28}{statuses[:24]}")
+
+    matched = {v: rows for v, rows in ts_by_vin.items() if v in sam_by_vin}
+    ts_only = sorted(set(ts_by_vin) - set(sam_by_vin))
+    sam_only = sorted(set(sam_by_vin) - set(ts_by_vin))
+
+    print(f"\n   VINs in both systems: {len(matched)}")
+    print(f"   Traumasoft only:      {len(ts_only)}")
+    print(f"   Samsara only:         {len(sam_only)}")
+
+    joined_records = sum(len(rows) for rows in matched.values())
+    print(f"   Traumasoft records reached by VIN: {joined_records} of {ts_total} "
+          f"({pct(joined_records, ts_total).strip()})")
+
+    if sam_only:
+        print(f"\n   In Samsara with no Traumasoft VIN ({len(sam_only)}) -- these "
+              f"vanish\n   if Samsara is the roster and the join is VIN:")
+        for vin in sam_only[:25]:
+            names = ", ".join(v.get("name", "?") for v in sam_by_vin[vin])
+            print(f"      {vin[:19]:<21}{names[:36]}")
+
+    # Which join covers more, and where they disagree. A unit reached by name
+    # but not by VIN is a truck the switch would lose.
+    overrides = SR.load_vehicle_overrides()
+    ts_names = sorted({str(v.get("name") or "").strip() for v in ts_vehicles} - {""})
+    by_name, _, _ = SR.match_vehicles(ts_names, sam_vehicles, overrides)
+    name_reached = set(by_name)
+    vin_reached = {
+        str(r.get("name") or "").strip()
+        for rows in matched.values() for r in rows
+    }
+    lost = sorted(name_reached - vin_reached)
+    gained = sorted(vin_reached - name_reached)
+    print(f"\n   Name join reached {len(name_reached)} unit(s); "
+          f"VIN join reaches {len(vin_reached)}.")
+    if gained:
+        print(f"   VIN rescues ({len(gained)}): {', '.join(gained)[:180]}")
+    if lost:
+        print(f"   VIN loses ({len(lost)}): {', '.join(lost)[:180]}")
+        print("   Those need a VIN in Traumasoft before the switch, or they")
+        print("   drop off every sheet.")
+
+    # externalIds is populated on every Samsara vehicle; if it carries a
+    # Traumasoft id it beats both joins outright.
+    keys = Counter()
+    for vehicle in sam_vehicles:
+        for key in (vehicle.get("externalIds") or {}):
+            keys[key] += 1
+    if keys:
+        print(f"\n   Samsara externalIds keys: "
+              f"{', '.join(f'{k} ({c})' for k, c in keys.most_common())}")
+
+    out["vin"] = {
+        "traumasoft_with_vin": len(ts_with),
+        "traumasoft_total": ts_total,
+        "samsara_with_vin": len(sam_with),
+        "matched_vins": len(matched),
+        "traumasoft_only": ts_only,
+        "samsara_only": sam_only,
+        "records_reached": joined_records,
+        "malformed": [{"name": n, "vin": v} for n, v in odd],
+        "duplicate_vin_records": [
+            {"vin": v, "names": sorted({str(r.get("name") or "?") for r in rows})}
+            for v, rows in shared
+        ],
+        "name_join_only": lost,
+        "vin_join_only": gained,
+        "external_id_keys": dict(keys),
+    }
+
+
 def report_vehicle_status(ts_vehicles, out):
     """
     The current status picture.
@@ -444,6 +581,7 @@ def main(argv=None):
     report_tags_per_unit(ts_vehicles, matched, out)
     report_tags_vs_cost_centers(api, tag_counts or Counter(), out)
     report_vehicle_status(ts_vehicles, out)
+    report_vin_join(ts_vehicles, sam_vehicles, out)
 
     print("\n" + "=" * 72)
     print("  Safe to paste. Operational values only, no patient data.")

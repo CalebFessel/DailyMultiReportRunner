@@ -382,6 +382,130 @@ def report_tags_vs_cost_centers(api, tag_counts, out):
     out["tag_cost_center_candidates"] = pairs
 
 
+def report_traumasoft_roster(ts_vehicles, out):
+    """
+    What the fleet sheets actually see, as opposed to what the API returns.
+
+    Everything above this reads the raw vehicle list, which is not the roster
+    any report is built from: the fleet sheets drop deleted and disabled
+    records, drop the non-fleet statuses, and apply VehicleExclusions before
+    counting anything. Reporting the raw list alongside findings about the
+    reports invites the conclusion that the sheets are full of iPads, which
+    they are not.
+
+    So this runs the same filter chain the reports run -- by importing it
+    rather than restating it, since a second copy of the rule would drift --
+    and reports the funnel. What matters is the last row: the records that
+    survive every filter and still collide, because those are the ones
+    actually double-counted on a live sheet.
+    """
+    print("\n9. WHAT THE FLEET SHEETS ACTUALLY SEE")
+    print("   " + "-" * 66)
+
+    total = len(ts_vehicles)
+    counts = Counter()
+    for vehicle in ts_vehicles:
+        for key, value in vehicle.items():
+            if populated(value):
+                counts[key] += 1
+    print(f"   Traumasoft returns {total} record(s). Field population\n"
+          f"   (presence, not truth -- a boolean reads 100% when it is\n"
+          f"   always returned, whatever its value):\n")
+    print(f"   {'field':<28}{'present':>10}")
+    print("   " + "-" * 40)
+    for key in sorted(counts, key=lambda k: (-counts[k], k)):
+        print(f"   {key[:27]:<28}{pct(counts[key], total):>10}")
+
+    try:
+        import traumasoft_reports as R
+    except Exception as exc:  # noqa: BLE001 -- probe must still be useful without it
+        print(f"\n   traumasoft_reports unavailable ({type(exc).__name__}: {exc}).")
+        print("   Cannot reproduce the report's filter chain; funnel skipped.")
+        out["roster"] = {"field_population": dict(counts), "funnel": None}
+        return
+
+    flagged = lambda v: (  # noqa: E731
+        R._is_truthy_flag(v.get("deleted")) or R._is_truthy_flag(v.get("disabled"))
+    )
+    exclusions = R.VehicleExclusions()
+
+    # The list call asks the server to omit these. Whether it honours that is
+    # worth knowing on its own: if deleted records arrive anyway, every caller
+    # that trusts the parameter instead of re-checking the field is wrong.
+    really_deleted = sum(1 for v in ts_vehicles if R._is_truthy_flag(v.get("deleted")))
+    really_disabled = sum(1 for v in ts_vehicles if R._is_truthy_flag(v.get("disabled")))
+    print(f"\n   deleted=true returned despite include_deleted=false:   {really_deleted}")
+    print(f"   disabled=true returned despite include_disabled=false: {really_disabled}")
+    if really_deleted or really_disabled:
+        print("   The server did NOT honour the parameter. The reports re-check")
+        print("   the field, so their sheets are unaffected -- but anything that")
+        print("   trusts the parameter alone is counting deleted trucks.")
+
+    survivors, dropped = [], defaultdict(list)
+    for vehicle in ts_vehicles:
+        name = str(vehicle.get("name") or "?")
+        if flagged(vehicle):
+            dropped["deleted or disabled"].append(name)
+        elif vehicle.get("vehicle_status") in R.NON_FLEET_STATUSES:
+            dropped[f"status {vehicle.get('vehicle_status')}"].append(name)
+        else:
+            reason = exclusions.excludes(vehicle)
+            if reason:
+                dropped[f"excluded: {reason}"].append(name)
+            else:
+                survivors.append(vehicle)
+
+    print(f"\n   {'filter':<42}{'dropped':>9}")
+    print("   " + "-" * 54)
+    for reason in sorted(dropped, key=lambda r: -len(dropped[r])):
+        print(f"   {reason[:41]:<42}{len(dropped[reason]):>9}")
+    print("   " + "-" * 54)
+    print(f"   {'REACHES THE FLEET SHEETS':<42}{len(survivors):>9}")
+
+    # The exclusions file is local knowledge; say whether there is any, since
+    # an empty one means only the built-in name patterns are doing the work.
+    if not exclusions.ids and not exclusions.names:
+        print(f"\n   No {R.VEHICLE_EXCLUSIONS_FILE} in effect -- built-in name")
+        print(f"   patterns only: {', '.join(exclusions.patterns)}")
+
+    # The part that still matters: collisions among the records that survive.
+    by_vin, by_name = defaultdict(list), defaultdict(list)
+    for vehicle in survivors:
+        vin = normalize_vin(vehicle.get("vin"))
+        if len(vin) == 17:
+            by_vin[vin].append(vehicle)
+        by_name[str(vehicle.get("name") or "").strip().lower()].append(vehicle)
+
+    vin_dupes = {v: rows for v, rows in by_vin.items() if len(rows) > 1}
+    name_dupes = {n: rows for n, rows in by_name.items() if len(rows) > 1}
+
+    print(f"\n   Among those {len(survivors)}:")
+    print(f"      same name twice:      {len(name_dupes)}")
+    print(f"      same VIN, any name:   {len(vin_dupes)}")
+    if vin_dupes:
+        print("\n   One truck counted twice on a live sheet:")
+        for vin, rows in sorted(vin_dupes.items()):
+            names = ", ".join(sorted({str(r.get('name') or '?') for r in rows}))
+            statuses = ", ".join(sorted({str(r.get('vehicle_status') or '?') for r in rows}))
+            print(f"      {vin:<20}{names[:28]:<30}{statuses[:22]}")
+        print("\n   These survive every filter, so each inflates the fleet count")
+        print("   by one and splits its own history across two records. A name")
+        print("   pattern cannot catch them -- the names are both legitimate.")
+
+    out["roster"] = {
+        "field_population": dict(counts),
+        "returned": total,
+        "reaches_sheets": len(survivors),
+        "dropped": {k: sorted(v) for k, v in dropped.items()},
+        "surviving_vin_duplicates": [
+            {"vin": v,
+             "names": sorted({str(r.get("name") or "?") for r in rows}),
+             "statuses": sorted({str(r.get("vehicle_status") or "?") for r in rows})}
+            for v, rows in sorted(vin_dupes.items())
+        ],
+    }
+
+
 def normalize_vin(value):
     """
     A VIN reduced to what is comparable between the two systems.
@@ -582,6 +706,7 @@ def main(argv=None):
     report_tags_vs_cost_centers(api, tag_counts or Counter(), out)
     report_vehicle_status(ts_vehicles, out)
     report_vin_join(ts_vehicles, sam_vehicles, out)
+    report_traumasoft_roster(ts_vehicles, out)
 
     print("\n" + "=" * 72)
     print("  Safe to paste. Operational values only, no patient data.")

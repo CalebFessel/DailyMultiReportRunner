@@ -751,11 +751,17 @@ recon_rows = [
 ]
 
 shift_in = datetime(2026, 9, 2, 8, 0)
+def held(punch_in, punch_out, hours=None, pay=None):
+    return {"in": punch_in, "out": punch_out, "hours": hours, "pay": pay}
+
+
 timecards = {
-    "emp-10": [(shift_in, datetime(2026, 9, 2, 16, 0))],
-    "emp-11": [(shift_in + timedelta(minutes=30), datetime(2026, 9, 2, 21, 0))],
+    "emp-10": [held(shift_in, datetime(2026, 9, 2, 16, 0), 8.0, 200.0)],
+    "emp-11": [held(shift_in + timedelta(minutes=30),
+                    datetime(2026, 9, 2, 21, 0), 12.5, 312.50)],
     # Five hours off the clock-in: too far to pair, same day all the same.
-    "emp-12": [(shift_in + timedelta(hours=5), datetime(2026, 9, 2, 23, 0))],
+    "emp-12": [held(shift_in + timedelta(hours=5),
+                    datetime(2026, 9, 2, 23, 0), 10.0, 250.0)],
 }
 
 PUSH.report_reconciliation(recon_rows, timecards, set())
@@ -773,6 +779,44 @@ check("and the genuinely new shift is not",
 check("the unpaired one names the day rather than a clock match",
       "too far off to pair" in (by_user["12"].get("paycor_holds") or ""),
       by_user["12"].get("paycor_holds"))
+
+# The pay impact: a shift Traumasoft says is 8h that Paycor pays 8h for has no
+# gap; one Paycor pays less for does, priced at the rate Paycor itself implies.
+impact = [r for r in recon_rows if r["user_id"] == "11"][0]
+check("a shift both systems hold carries Paycor's own pay figure",
+      impact["paycor_existing"]["pay"] == 312.50)
+check("and its hours", impact["paycor_existing"]["hours"] == 12.5)
+
+# 200.00 over 8.0 hours = 25.00/h implied, against a Traumasoft 8.0h shift:
+# no gap, so nothing is claimed.
+agreed = [r for r in recon_rows if r["user_id"] == "10"][0]
+ts_hours = (agreed["punch_out"] - agreed["punch_in"]).total_seconds() / 3600.0
+check("a shift whose hours agree shows no gap",
+      abs(ts_hours - agreed["paycor_existing"]["hours"]) < 0.01)
+
+# A timecard with no pay figure must not crash the report or invent one.
+PUSH.report_pay_impact([{
+    "employee_name": "No Pay Data",
+    "user_id": "99",
+    "punch_in": datetime(2026, 9, 2, 8, 0),
+    "punch_out": datetime(2026, 9, 2, 20, 0),
+    "paycor_existing": {"in": datetime(2026, 9, 2, 8, 0),
+                        "out": datetime(2026, 9, 2, 16, 0),
+                        "hours": 8.0, "pay": None},
+}])
+check("a timecard with no pay figure is reported without inventing one", True)
+
+# An open punch on Paycor's side has no hours to compare; it must be skipped
+# rather than counted as a zero-hour shift, which would overstate every gap.
+PUSH.report_pay_impact([{
+    "employee_name": "Still Open",
+    "user_id": "98",
+    "punch_in": datetime(2026, 9, 2, 8, 0),
+    "punch_out": datetime(2026, 9, 2, 20, 0),
+    "paycor_existing": {"in": datetime(2026, 9, 2, 8, 0), "out": None,
+                        "hours": None, "pay": None},
+}])
+check("an open Paycor punch is skipped rather than scored as zero hours", True)
 
 
 # =============================

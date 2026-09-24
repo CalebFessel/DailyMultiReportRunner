@@ -371,8 +371,21 @@ def parse_paycor_time(value):
     return None
 
 
+def _as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def index_timecards(timecards):
-    """paycor employee guid -> [(punch_in, punch_out), ...] from the paired read."""
+    """
+    paycor employee guid -> the punch pairs Paycor holds, with what it pays.
+
+    `hourAmount` and `estimatedGrossPay` come free on this read and are what
+    turn "the clock-out is twelve hours early" into a number a payroll
+    conversation can act on.
+    """
     index = defaultdict(list)
     for row in timecards:
         emp_id = str(row.get("employeeId") or "").strip()
@@ -381,7 +394,12 @@ def index_timecards(timecards):
         punch_in = parse_paycor_time(row.get("punchIn"))
         punch_out = parse_paycor_time(row.get("punchOut"))
         if punch_in:
-            index[emp_id].append((punch_in, punch_out))
+            index[emp_id].append({
+                "in": punch_in,
+                "out": punch_out,
+                "hours": _as_float(row.get("hourAmount")),
+                "pay": _as_float(row.get("estimatedGrossPay")),
+            })
     return index
 
 
@@ -413,6 +431,111 @@ def collect_correlations(paycor, sendable, window_start, window_end):
     return seen
 
 
+def report_pay_impact(rows):
+    """
+    What the disputed shifts are worth, as Paycor currently has them.
+
+    hourAmount and estimatedGrossPay ride along on the timecard read, so the
+    difference between the two clocks can be stated in hours and in money
+    rather than in minutes of drift. That is the difference between a report
+    payroll reads and one they act on.
+
+    The money is approximate and labelled as such. An implied rate taken from
+    one punch pair does not know about overtime multipliers, shift
+    differentials or anything else the pay engine applies, so a shift that
+    crosses an overtime boundary is understated here. Treat it as the floor of
+    the gap, not the amount owed.
+    """
+    lines = []
+    total_hours = 0.0
+    total_pay = 0.0
+    priced = 0
+
+    for row in rows:
+        held = row.get("paycor_existing")
+        if held is None:
+            same_day = row.get("paycor_same_day") or []
+            held = same_day[0] if same_day else None
+        if not held or not row.get("punch_out"):
+            continue
+
+        ts_hours = (row["punch_out"] - row["punch_in"]).total_seconds() / 3600.0
+        paycor_hours = held.get("hours")
+        if paycor_hours is None and held.get("out"):
+            paycor_hours = (held["out"] - held["in"]).total_seconds() / 3600.0
+        if paycor_hours is None:
+            continue
+
+        gap_hours = ts_hours - paycor_hours
+        pay = held.get("pay")
+        # An hourly rate implied by what Paycor already pays this pair.
+        rate = (pay / paycor_hours) if (pay and paycor_hours) else None
+        gap_pay = (gap_hours * rate) if rate is not None else None
+
+        total_hours += gap_hours
+        if gap_pay is not None:
+            total_pay += gap_pay
+            priced += 1
+        lines.append((gap_hours, row, ts_hours, paycor_hours, pay, gap_pay))
+
+    if not lines:
+        return
+
+    print("\n" + "-" * 78)
+    print("WHAT THE DISAGREEMENTS ARE WORTH")
+    print("-" * 78)
+    print("  Hours as Traumasoft records them against hours as Paycor holds them.")
+    print("  A positive gap is work Paycor is not currently paying for.\n")
+    print(f"    {'crew':<22} {'TS h':>6} {'Paycor h':>9} {'gap h':>7} "
+          f"{'Paycor pay':>11} {'approx gap':>11}")
+
+    for gap_hours, row, ts_hours, paycor_hours, pay, gap_pay in sorted(
+            lines, key=lambda item: -abs(item[0]))[:20]:
+        print(f"    {(row['employee_name'] or row['user_id'])!s:<22} "
+              f"{ts_hours:>6.1f} {paycor_hours:>9.1f} {gap_hours:>+7.1f} "
+              f"{(f'${pay:,.2f}' if pay is not None else '-'):>11} "
+              f"{(f'${gap_pay:,.2f}' if gap_pay is not None else '-'):>11}")
+
+    if len(lines) > 20:
+        print(f"    ... and {len(lines) - 20} more")
+
+    # Netting one person's shortfall against another's excess would report a
+    # small number over two separate problems. They are owed to and by
+    # different people and never cancel.
+    under = [l for l in lines if l[0] > 0]
+    over = [l for l in lines if l[0] < 0]
+    under_pay = sum(l[5] for l in under if l[5] is not None)
+    over_pay = sum(-l[5] for l in over if l[5] is not None)
+    unpriced = len(lines) - priced
+
+    print(f"\n  Across {len(lines)} disputed shift(s):")
+    print(f"    {len(under):>3} where Paycor holds FEWER hours "
+          f"({sum(l[0] for l in under):+.1f}h"
+          + (f", about ${under_pay:,.2f} unpaid)" if under_pay else ")"))
+    if over:
+        print(f"    {len(over):>3} where Paycor holds MORE hours "
+              f"({sum(l[0] for l in over):+.1f}h"
+              + (f", about ${over_pay:,.2f} already paid)" if over_pay else ")"))
+    if unpriced:
+        print(f"\n  {unpriced} could not be priced -- Paycor carries no pay figure,")
+        print("  which happens when it holds zero hours for the shift. Those are")
+        print("  the largest shortfalls, so both totals understate the gap.")
+
+    if priced:
+        print("\n  Money here is a FLOOR, not an amount owed. The rate is implied")
+        print("  by dividing what Paycor pays a punch pair by its hours, so it")
+        print("  knows nothing about overtime multipliers, shift differentials or")
+        print("  anything else the pay engine applies. A shift crossing an")
+        print("  overtime boundary is understated. Payroll has the real numbers;")
+        print("  this says which shifts to look at and roughly how much is at")
+        print("  stake.")
+    if over:
+        print("\n  The shifts where Paycor holds MORE hours matter as much as the")
+        print("  others: making Traumasoft authoritative would pay those people")
+        print("  less. That has to be a decision someone takes, not a side")
+        print("  effect of a cutover.")
+
+
 def report_reconciliation(sendable, timecard_index, known_correlations):
     print("\n" + "=" * 78)
     print("RECONCILIATION -- Traumasoft against what Paycor already holds")
@@ -427,9 +550,9 @@ def report_reconciliation(sendable, timecard_index, known_correlations):
         # hand or by the crew themselves. That is the interesting case: the
         # same work recorded twice, by two clocks that may disagree.
         match = None
-        for existing_in, existing_out in timecard_index.get(row["paycor_employee_id"], []):
-            if abs((existing_in - row["punch_in"]).total_seconds()) <= 3600:
-                match = (existing_in, existing_out)
+        for held in timecard_index.get(row["paycor_employee_id"], []):
+            if abs((held["in"] - row["punch_in"]).total_seconds()) <= 3600:
+                match = held
                 break
         if match is None:
             # "No punch within an hour" is not the same as "no punch". Paycor
@@ -440,10 +563,8 @@ def report_reconciliation(sendable, timecard_index, known_correlations):
             # duplicate detection will not catch it: a fresh correlation id
             # makes it a new punch as far as Paycor is concerned.
             same_day = [
-                (existing_in, existing_out)
-                for existing_in, existing_out
-                in timecard_index.get(row["paycor_employee_id"], [])
-                if abs((existing_in.date() - row["punch_in"].date()).days) <= 1
+                held for held in timecard_index.get(row["paycor_employee_id"], [])
+                if abs((held["in"].date() - row["punch_in"].date()).days) <= 1
             ]
             if same_day:
                 row["paycor_same_day"] = same_day
@@ -459,10 +580,10 @@ def report_reconciliation(sendable, timecard_index, known_correlations):
         # the clocks agree decides which bucket it is reported in; either way
         # sending it again adds a SECOND punch for one shift.
         row["paycor_holds"] = "matched an existing Paycor punch"
-        gap_in = abs((match[0] - row["punch_in"]).total_seconds()) / 60.0
+        gap_in = abs((match["in"] - row["punch_in"]).total_seconds()) / 60.0
         gap_out = (
-            abs((match[1] - row["punch_out"]).total_seconds()) / 60.0
-            if match[1] and row["punch_out"] else None
+            abs((match["out"] - row["punch_out"]).total_seconds()) / 60.0
+            if match["out"] and row["punch_out"] else None
         )
         row["drift_in_minutes"] = round(gap_in, 1)
         row["drift_out_minutes"] = round(gap_out, 1) if gap_out is not None else None
@@ -492,7 +613,8 @@ def report_reconciliation(sendable, timecard_index, known_correlations):
               f"{'Paycor in':<17} {'Paycor out':<17}  drift")
         for row in sorted(drifted, key=lambda r: -max(
                 r.get("drift_in_minutes") or 0, r.get("drift_out_minutes") or 0))[:15]:
-            existing_in, existing_out = row.get("paycor_existing", (None, None))
+            held = row.get("paycor_existing") or {}
+            existing_in, existing_out = held.get("in"), held.get("out")
             out_gap = row["drift_out_minutes"]
             drift = (f"in {row['drift_in_minutes']:.0f}m"
                      + (f" out {out_gap:.0f}m" if out_gap is not None else ""))
@@ -502,6 +624,8 @@ def report_reconciliation(sendable, timecard_index, known_correlations):
                   f"{existing_in:%m-%d %H:%M}     "
                   f"{(f'{existing_out:%m-%d %H:%M}' if existing_out else 'open'):<17}"
                   f"  {drift}")
+
+        report_pay_impact(drifted + collided)
 
         # A whole day of drift is a different problem from a few minutes, and
         # only one of them is a clock.
@@ -525,8 +649,9 @@ def report_reconciliation(sendable, timecard_index, known_correlations):
         print("  Resolve each by hand before publishing anything.\n")
         for row in collided[:15]:
             held = ", ".join(
-                f"{i:%m-%d %H:%M}-" + (f"{o:%m-%d %H:%M}" if o else "open")
-                for i, o in row["paycor_same_day"][:2]
+                f"{r['in']:%m-%d %H:%M}-"
+                + (f"{r['out']:%m-%d %H:%M}" if r.get("out") else "open")
+                for r in row["paycor_same_day"][:2]
             )
             print(f"    {(row['employee_name'] or row['user_id'])!s:<22} "
                   f"TS {row['punch_in']:%m-%d %H:%M}-{row['punch_out']:%m-%d %H:%M}"

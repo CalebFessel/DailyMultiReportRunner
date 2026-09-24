@@ -164,6 +164,7 @@ def main():
 
     confident, ambiguous, absent, nameless = {}, [], [], []
     matched_detail = {}
+    loose_matches = []
 
     for num, name in sorted(unmatched.items()):
         ts_emp = ts_by_num.get(num.lower()) or {}
@@ -173,16 +174,22 @@ def main():
             continue
 
         hits = []
-        for key in keys:
+        loose = False
+        for index, key in enumerate(keys):
             hits = by_name.get(key) or []
             if hits:
+                # keys[0] is the full name; anything after it matched on last
+                # name plus first initial, which is a different claim.
+                loose = index > 0
                 break
 
         unique = {h["id"]: h for h in hits}
         if len(unique) == 1:
             hit = next(iter(unique.values()))
             confident[num.lower()] = hit["id"]
-            matched_detail[num.lower()] = hit
+            matched_detail[num.lower()] = dict(hit, loose=loose)
+            if loose:
+                loose_matches.append((num, ts_emp, hit))
         elif len(unique) > 1:
             ambiguous.append((num, name, [h["name"] for h in unique.values()]))
         else:
@@ -198,8 +205,19 @@ def main():
         for num, guid in sorted(confident.items()):
             hit = matched_detail.get(num, {})
             ts_name = next((n for k, n in unmatched.items() if k.lower() == num), None)
+            mark = "  <-- CHECK" if hit.get("loose") else ""
             print(f"    TS {num:<14} {ts_name or '?':<28}"
-                  f" -> Paycor {hit.get('name', '?')} (#{hit.get('number')})")
+                  f" -> Paycor {hit.get('name', '?')} (#{hit.get('number')}){mark}")
+
+    if loose_matches:
+        print(f"\n  {len(loose_matches)} of those matched on LAST NAME + FIRST INITIAL,")
+        print("  not on the full name. That rule is for Bob against Robert, and it")
+        print("  also accepts Christina against Christiana. Read these before")
+        print("  promoting them; the rest of the table is an exact name match:\n")
+        for num, ts_emp, hit in loose_matches:
+            ts_full = " ".join(p for p in (ts_emp.get("first_name"),
+                                           ts_emp.get("last_name")) if p)
+            print(f"    TS {num:<14} {ts_full:<28} -> {hit['name']} (#{hit['number']})")
 
     if ambiguous:
         print(f"\n  Name matches more than one Paycor employee ({len(ambiguous)}).")
@@ -220,12 +238,14 @@ def main():
             print(f"    TS {num:<14} {name or '?'}")
 
     if confident:
+        loose_keys = sorted(n.lower() for n, _e, _h in loose_matches)
         payload = {
+            "_verify_first": loose_keys,
             "_comment": (
                 "CANDIDATES ONLY, produced by diagnose_paycor_employee_match.py. "
                 "Each entry was matched by name, not by number. Verify every line "
                 "against payroll before copying it into "
-                "paycor_employee_overrides.json -- a wrong guid pays the wrong person."
+                "paycor_employee_overrides.json -- a wrong guid pays the wrong person. The keys under _verify_first matched on last name and first initial only, so check those against payroll before anything else."
             ),
             "overrides": confident,
         }

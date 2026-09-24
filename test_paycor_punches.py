@@ -266,12 +266,36 @@ entry, how = PUSH.resolve_employee(employee(3, ""), {}, index)
 check("no employee_num at all is refused", entry is None)
 check("and says why", "no employee_num" in how, how)
 
-entry, how = PUSH.resolve_employee(employee(2, "1002"), {"1002": "px-chosen"}, index)
+# An override names WHICH employee. The department still comes from Paycor's
+# roster: carrying none refused every overridden punch in production for want
+# of a departmentId that was available all along.
+entry, how = PUSH.resolve_employee(employee(2, "1002"), {"1002": "px-1"}, index)
 check("an override beats an ambiguous match",
-      entry and entry["id"] == "px-chosen" and how == "override")
+      entry and entry["id"] == "px-1" and how == "override")
+check("and inherits the department Paycor holds for that employee",
+      entry and entry["department_id"] == "dept-1", str(entry))
 
-entry, how = PUSH.resolve_employee(employee(3, ""), {"user_id:3": "px-byuser"}, index)
-check("an override can key on user_id", entry and entry["id"] == "px-byuser")
+entry, how = PUSH.resolve_employee(employee(3, ""), {"user_id:3": "px-2"}, index)
+check("an override can key on user_id", entry and entry["id"] == "px-2")
+check("and picks up that employee's department too",
+      entry and entry["department_id"] == "dept-2", str(entry))
+
+# A guid the roster does not contain is a bad override, and it has to say so:
+# silently continuing would fail later as a missing department, which sends
+# the reader after the wrong problem.
+entry, how = PUSH.resolve_employee(employee(2, "1002"), {"1002": "px-gone"}, index)
+check("an override naming an employee Paycor does not have is refused",
+      entry is None)
+check("and blames the override rather than the department",
+      "not in the roster" in (how or ""), how)
+
+# An overridden employee who genuinely has no department still fails on the
+# department, which is a different fix.
+entry, how = PUSH.resolve_employee(employee(4, "zzz"), {"zzz": "px-4"}, index)
+check("an override to an employee with no department still resolves",
+      entry and entry["id"] == "px-4", str(entry))
+check("leaving the missing department to be caught as such",
+      entry and entry["department_id"] is None)
 
 entry, how = PUSH.resolve_employee(employee(1, "1001"), {}, {})
 check("with no roster the employee cannot be resolved", entry is None)

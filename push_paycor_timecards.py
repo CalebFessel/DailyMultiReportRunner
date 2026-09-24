@@ -146,6 +146,9 @@ def paycor_employee_index(paycor_employees):
             value = str(emp.get(key) or "").strip()
             if value:
                 index[value.lower()].append(entry)
+        # Also by guid, so an override that names one can pick up the
+        # department Paycor already holds instead of supplying none.
+        index[f"id:{str(emp_id).lower()}"].append(entry)
     return index
 
 
@@ -185,8 +188,22 @@ def resolve_employee(ts_employee, overrides, paycor_index):
     number = str(ts_employee.get("employee_num") or "").strip()
 
     for key in (number.lower(), f"user_id:{user_id}".lower()):
-        if key and key in overrides:
-            return {"id": overrides[key], "department_id": None, "label": None}, "override"
+        if not key or key not in overrides:
+            continue
+        guid = overrides[key]
+        # An override answers WHICH Paycor employee this is, and nothing more.
+        # The department still comes from Paycor's own roster -- carrying None
+        # here refused every overridden punch for want of a departmentId that
+        # was available all along.
+        known = (paycor_index.get(f"id:{str(guid).lower()}") or [None])[0]
+        if known is not None:
+            return known, "override"
+        # A guid the roster does not contain is a bad override, not a
+        # department problem. Say which, because they need different fixes.
+        return None, (
+            f"override maps to Paycor employee {guid}, which is not in the "
+            "roster -- the override is stale or wrong"
+        )
 
     if not number:
         return None, "Traumasoft employee carries no employee_num"

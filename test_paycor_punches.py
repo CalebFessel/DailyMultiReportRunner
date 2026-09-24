@@ -724,6 +724,58 @@ shutil.rmtree(env_dir, ignore_errors=True)
 
 
 # =============================
+section("reconciliation protects the publish")
+
+# Correlation ids only recognise OUR OWN previous writes. A punch the crew
+# clocked themselves carries none, so nothing downstream stops a publish from
+# adding a second punch for a shift Paycor already holds. A production run had
+# 86 such shifts against 63 genuinely new ones.
+def recon_row(uid):
+    return {
+        "user_id": uid,
+        "employee_name": f"Crew {uid}",
+        "paycor_employee_id": f"emp-{uid}",
+        "punch_in": datetime(2026, 9, 2, 8, 0),
+        "punch_out": datetime(2026, 9, 2, 16, 0),
+        "profile": "TEST-1",
+        "correlation_in": f"cid-in-{uid}",
+        "correlation_out": f"cid-out-{uid}",
+    }
+
+
+recon_rows = [
+    recon_row("10"),   # Paycor has it, clocks agree
+    recon_row("11"),   # Paycor has it, clocks differ
+    recon_row("12"),   # Paycor has that day, too far off to pair
+    recon_row("13"),   # Paycor has nothing
+]
+
+shift_in = datetime(2026, 9, 2, 8, 0)
+timecards = {
+    "emp-10": [(shift_in, datetime(2026, 9, 2, 16, 0))],
+    "emp-11": [(shift_in + timedelta(minutes=30), datetime(2026, 9, 2, 21, 0))],
+    # Five hours off the clock-in: too far to pair, same day all the same.
+    "emp-12": [(shift_in + timedelta(hours=5), datetime(2026, 9, 2, 23, 0))],
+}
+
+PUSH.report_reconciliation(recon_rows, timecards, set())
+
+by_user = {r["user_id"]: r for r in recon_rows}
+check("a shift Paycor already holds is marked as held",
+      bool(by_user["10"].get("paycor_holds")), str(by_user["10"].get("paycor_holds")))
+check("so is one where the clocks disagree",
+      bool(by_user["11"].get("paycor_holds")))
+check("so is one Paycor has that day but could not be paired",
+      bool(by_user["12"].get("paycor_holds")),
+      str(by_user["12"].get("paycor_holds")))
+check("and the genuinely new shift is not",
+      not by_user["13"].get("paycor_holds"))
+check("the unpaired one names the day rather than a clock match",
+      "too far off to pair" in (by_user["12"].get("paycor_holds") or ""),
+      by_user["12"].get("paycor_holds"))
+
+
+# =============================
 section("publish verifies by reading back")
 
 # Sandbox run 3: a batch accepted with a tracking id and an empty error log

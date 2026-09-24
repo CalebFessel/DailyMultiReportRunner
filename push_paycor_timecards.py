@@ -418,7 +418,7 @@ def report_reconciliation(sendable, timecard_index, known_correlations):
     print("RECONCILIATION -- Traumasoft against what Paycor already holds")
     print("=" * 78)
 
-    already, missing, drifted = [], [], []
+    already, missing, drifted, collided = [], [], [], []
     for row in sendable:
         if str(row["correlation_in"]).lower() in known_correlations:
             already.append(row)
@@ -432,9 +432,33 @@ def report_reconciliation(sendable, timecard_index, known_correlations):
                 match = (existing_in, existing_out)
                 break
         if match is None:
+            # "No punch within an hour" is not the same as "no punch". Paycor
+            # may hold this shift under a clock-in further off than the match
+            # window -- and those are exactly the records above, where the out
+            # is a day early or pinned to a round number. Publishing one of
+            # those adds a SECOND punch for work already recorded, and the
+            # duplicate detection will not catch it: a fresh correlation id
+            # makes it a new punch as far as Paycor is concerned.
+            same_day = [
+                (existing_in, existing_out)
+                for existing_in, existing_out
+                in timecard_index.get(row["paycor_employee_id"], [])
+                if abs((existing_in.date() - row["punch_in"].date()).days) <= 1
+            ]
+            if same_day:
+                row["paycor_same_day"] = same_day
+                row["paycor_holds"] = (
+                    "Paycor holds a punch that day, too far off to pair"
+                )
+                collided.append(row)
+                continue
             missing.append(row)
             continue
         row["paycor_existing"] = match
+        # Paycor holds this work already, from the crew's own clock. Whether
+        # the clocks agree decides which bucket it is reported in; either way
+        # sending it again adds a SECOND punch for one shift.
+        row["paycor_holds"] = "matched an existing Paycor punch"
         gap_in = abs((match[0] - row["punch_in"]).total_seconds()) / 60.0
         gap_out = (
             abs((match[1] - row["punch_out"]).total_seconds()) / 60.0
@@ -455,6 +479,7 @@ def report_reconciliation(sendable, timecard_index, known_correlations):
     print(f"  Matched an existing Paycor punch: "
           f"{sum(1 for r in already if 'paycor_existing' in r)}")
     print(f"  Same shift, clocks disagree    : {len(drifted)}")
+    print(f"  Paycor has that day, clocks too far apart to pair: {len(collided)}")
     print(f"  Not in Paycor at all           : {len(missing)}")
 
     if drifted:
@@ -491,9 +516,28 @@ def report_reconciliation(sendable, timecard_index, known_correlations):
             print("  deciding which side is right -- and note that a publish would")
             print("  not correct these: it adds punches, it does not amend one.")
 
+    if collided:
+        print(f"\n  HOLD -- {len(collided)} shift(s) where Paycor already holds a punch")
+        print("  for that employee on that day, but the clock-ins are more than an")
+        print("  hour apart so they could not be paired. Publishing these would add")
+        print("  a second punch for work Paycor already has, and the duplicate")
+        print("  detection would not stop it: a new correlation id is a new punch.")
+        print("  Resolve each by hand before publishing anything.\n")
+        for row in collided[:15]:
+            held = ", ".join(
+                f"{i:%m-%d %H:%M}-" + (f"{o:%m-%d %H:%M}" if o else "open")
+                for i, o in row["paycor_same_day"][:2]
+            )
+            print(f"    {(row['employee_name'] or row['user_id'])!s:<22} "
+                  f"TS {row['punch_in']:%m-%d %H:%M}-{row['punch_out']:%m-%d %H:%M}"
+                  f"   Paycor holds {held}")
+        if len(collided) > 15:
+            print(f"    ... and {len(collided) - 15} more")
+
     if missing:
         print(f"\n  Punches Traumasoft has and Paycor does not ({len(missing)}).")
-        print("  These are what a publish would add:")
+        print("  Paycor holds nothing for these people on these days, so a publish")
+        print("  adds work that is currently recorded nowhere:")
         for row in missing[:15]:
             hours = (row["punch_out"] - row["punch_in"]).total_seconds() / 3600.0
             print(f"    {(row['employee_name'] or row['user_id'])!s:<24} "
@@ -831,11 +875,26 @@ def main():
             return 2
 
         queue = []
+        held_by_paycor = []
         for row in sendable:
             if str(row["correlation_in"]).lower() in known_correlations:
                 skipped.append(row)
+            elif row.get("paycor_holds"):
+                # Reconciliation found this shift already on Paycor's side.
+                # Correlation ids only protect against re-sending OUR OWN
+                # writes; a punch the crew clocked themselves carries none of
+                # ours, so nothing downstream would stop this becoming a
+                # second punch for one shift.
+                held_by_paycor.append(row)
             else:
                 queue.append(row)
+
+        if held_by_paycor:
+            print(f"\n  Holding back {len(held_by_paycor)} punch(es) that Paycor")
+            print("  already holds from the crew's own clock. Sending them would")
+            print("  pay the shift twice. Where the clocks disagree, the existing")
+            print("  record has to be corrected in Paycor -- a publish adds")
+            print("  punches, it never amends one.")
 
         if args.limit:
             held = queue[args.limit:]
@@ -850,7 +909,8 @@ def main():
         print("=" * 78)
         sent, failed, unverified = publish(paycor, queue)
         print(f"\n  landed {len(sent)}   rejected {len(failed)}   "
-              f"unverified {len(unverified)}   already present {len(skipped)}")
+              f"unverified {len(unverified)}   already ours {len(skipped)}   "
+              f"held back {len(held_by_paycor)}")
         if unverified:
             print("\n  'unverified' means Paycor accepted the punch and raised no")
             print("  error, but it could not be confirmed to exist afterwards --")

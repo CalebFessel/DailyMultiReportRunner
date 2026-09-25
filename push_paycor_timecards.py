@@ -67,6 +67,7 @@ from datetime import datetime, date, timedelta
 
 from traumasoft_api import TraumasoftAPI, TraumasoftAPIError
 import traumasoft_reports as R
+import report_alerts as alerts
 import paycor_api
 from paycor_api import (
     PaycorClient,
@@ -1036,6 +1037,42 @@ def main():
         print(f"\n  landed {len(sent)}   rejected {len(failed)}   "
               f"unverified {len(unverified)}   already ours {len(skipped)}   "
               f"held back {len(held_by_paycor)}")
+
+        # A publish that half-worked is the case worth waking someone for: the
+        # window closes in days, and a punch nobody notices is missing is a
+        # punch nobody is paid for.
+        if failed or unverified:
+            lines = []
+            for row in (failed + unverified)[:25]:
+                lines.append(
+                    f"{row.get('employee_name') or row.get('user_id')}  "
+                    f"{row['punch_in']:%m-%d %H:%M}-{row['punch_out']:%m-%d %H:%M}  "
+                    f"{row.get('error', '')[:120]}"
+                )
+            more = len(failed) + len(unverified) - len(lines)
+            alerts.alert(
+                alerts.CRITICAL,
+                f"{len(failed)} rejected and {len(unverified)} unverified "
+                f"punch(es) after publishing to "
+                f"{'PRODUCTION' if paycor_api.IS_PRODUCTION else 'the sandbox'}",
+                "These punches were NOT confirmed in Paycor. The shift window "
+                "is four days wide, so they cannot be recovered after it "
+                "closes.\n\n"
+                + "\n".join(lines)
+                + (f"\n... and {more} more" if more > 0 else "")
+                + "\n\nRe-running will not fix an unverified punch: Paycor "
+                  "refuses an identical re-send. Each needs checking in Paycor."
+            )
+        elif sent:
+            alerts.alert(
+                alerts.INFO,
+                f"{len(sent)} punch(es) published and verified",
+                f"All {len(sent)} read back from Paycor carrying their "
+                f"correlation ids.\n"
+                f"Held back because Paycor already holds them: "
+                f"{len(held_by_paycor)}.\n"
+                f"Already ours from a previous run: {len(skipped)}."
+            )
         if unverified:
             print("\n  'unverified' means Paycor accepted the punch and raised no")
             print("  error, but it could not be confirmed to exist afterwards --")
@@ -1081,4 +1118,18 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Outermost, so an unhandled exception alerts before the process dies and
+    # the heartbeat only fires on a clean exit. A scheduled run that crashes
+    # otherwise leaves nothing behind but an exit code nobody reads.
+    with alerts.guarded("Paycor timeclock push"):
+        code = main()
+    if code:
+        alerts.alert(
+            alerts.CRITICAL,
+            f"Paycor timeclock push exited {code} without publishing",
+            "The run stopped before completing. Nothing was written to "
+            "payroll, and today's punches stay unsent until it runs "
+            "successfully. The shift window is four days wide."
+        )
+        alerts.heartbeat(ok=False, detail=f"exit {code}")
+    sys.exit(code)

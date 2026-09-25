@@ -724,6 +724,161 @@ shutil.rmtree(env_dir, ignore_errors=True)
 
 
 # =============================
+section("alerting")
+
+import report_alerts as ALERTS
+
+alert_calls = {"email": [], "sms": [], "webhook": [], "heartbeat": []}
+
+
+def reset_alert_calls():
+    for value in alert_calls.values():
+        del value[:]
+
+
+def fake_email(severity, headline, detail, recipients):
+    alert_calls["email"].append((severity, headline, recipients))
+
+
+def fake_sms(headline, recipients):
+    alert_calls["sms"].append((headline, recipients))
+
+
+def fake_webhook(severity, headline, detail, url):
+    alert_calls["webhook"].append((severity, headline, url))
+
+
+real = (ALERTS._send_email, ALERTS._send_sms, ALERTS._send_webhook)
+ALERTS._send_email, ALERTS._send_sms, ALERTS._send_webhook = (
+    fake_email, fake_sms, fake_webhook)
+
+saved = dict(os.environ)
+try:
+    os.environ.update({
+        "ALERT_EMAIL_TO": "ops@example.com",
+        "ALERT_SMS_TO": "5551234567@example.net",
+        "ALERT_WEBHOOK_URL": "https://example.com/hook",
+    })
+
+    reset_alert_calls()
+    result = ALERTS.alert(ALERTS.CRITICAL, "it broke", "detail")
+    check("a critical alert reaches every channel",
+          sorted(result["sent"]) == ["email", "sms", "webhook"], str(result))
+
+    # A warning must not wake anyone at 3am.
+    reset_alert_calls()
+    result = ALERTS.alert(ALERTS.WARNING, "needs a look")
+    check("a warning does not send SMS",
+          "sms" not in result["sent"] and not alert_calls["sms"], str(result))
+    check("but does reach email and the channel",
+          sorted(result["sent"]) == ["email", "webhook"], str(result))
+
+    reset_alert_calls()
+    result = ALERTS.alert(ALERTS.INFO, "all fine")
+    check("routine completion is email only",
+          result["sent"] == ["email"], str(result))
+
+    # The channel that fails may be the reason an alert was needed.
+    def boom(*a, **k):
+        raise RuntimeError("smtp down")
+
+    ALERTS._send_email = boom
+    reset_alert_calls()
+    result = ALERTS.alert(ALERTS.CRITICAL, "it broke")
+    check("a failing channel does not stop the others",
+          "webhook" in result["sent"] and "sms" in result["sent"], str(result))
+    check("and the failure is reported rather than swallowed",
+          any("email" in f for f in result["failed"]), str(result))
+    ALERTS._send_email = fake_email
+
+    raised = None
+    try:
+        ALERTS.alert("URGENT-ISH", "wrong severity")
+    except ValueError as exc:
+        raised = exc
+    check("an unknown severity is refused", raised is not None)
+
+    # A host with nothing configured must not crash the payroll run.
+    for key in ("ALERT_EMAIL_TO", "ALERT_SMS_TO", "ALERT_WEBHOOK_URL"):
+        del os.environ[key]
+    result = ALERTS.alert(ALERTS.CRITICAL, "nowhere to go")
+    check("no configured channel is survivable, not fatal",
+          result == {"sent": [], "failed": []}, str(result))
+finally:
+    os.environ.clear()
+    os.environ.update(saved)
+    ALERTS._send_email, ALERTS._send_sms, ALERTS._send_webhook = real
+
+# The heartbeat is the only thing that catches a run that never happened, so
+# it must fire on success and NOT on failure.
+pings = []
+saved = dict(os.environ)
+real_urlopen = ALERTS.urllib.request.urlopen
+try:
+    os.environ["ALERT_HEARTBEAT_URL"] = "https://hc.example.com/abc"
+
+    class FakePing:
+        def __init__(self, req):
+            pings.append(req.full_url)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b""
+
+    ALERTS.urllib.request.urlopen = lambda req, timeout=None: FakePing(req)
+
+    ALERTS.heartbeat(ok=True)
+    check("a good run pings the watcher", pings == ["https://hc.example.com/abc"],
+          str(pings))
+
+    del pings[:]
+    ALERTS.heartbeat(ok=False)
+    check("a bad run pings the failure endpoint instead",
+          pings == ["https://hc.example.com/abc/fail"], str(pings))
+
+    del pings[:]
+    del os.environ["ALERT_HEARTBEAT_URL"]
+    check("no watcher configured means no ping and no error",
+          ALERTS.heartbeat(ok=True) is False and not pings)
+finally:
+    ALERTS.urllib.request.urlopen = real_urlopen
+    os.environ.clear()
+    os.environ.update(saved)
+
+# guarded() must alert AND re-raise: swallowing would leave a zero exit code
+# and a scheduler that thinks the run succeeded.
+raised = None
+alerted = []
+real_alert, real_heartbeat = ALERTS.alert, ALERTS.heartbeat
+try:
+    ALERTS.alert = lambda sev, headline, detail="": alerted.append((sev, headline))
+    ALERTS.heartbeat = lambda ok=True, detail="": alerted.append(("heartbeat", ok))
+    try:
+        with ALERTS.guarded("test run"):
+            raise ValueError("something broke")
+    except ValueError as exc:
+        raised = exc
+    check("a crash inside guarded is re-raised, not swallowed", raised is not None)
+    check("and alerts CRITICAL first",
+          alerted and alerted[0][0] == ALERTS.CRITICAL, str(alerted))
+    check("and tells the watcher the run failed",
+          ("heartbeat", False) in alerted, str(alerted))
+
+    del alerted[:]
+    with ALERTS.guarded("test run"):
+        pass
+    check("a clean run pings the watcher and raises nothing",
+          alerted == [("heartbeat", True)], str(alerted))
+finally:
+    ALERTS.alert, ALERTS.heartbeat = real_alert, real_heartbeat
+
+
+# =============================
 section("reconciliation protects the publish")
 
 # Correlation ids only recognise OUR OWN previous writes. A punch the crew

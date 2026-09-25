@@ -17,10 +17,18 @@ be solved from inside the job:
 Channels are each optional and configured by environment variable, so a host
 that has only mail still works:
 
-    ALERT_EMAIL_TO       comma-separated; uses the same SMTP as the reports
+    ALERT_WEBHOOK_URL    a Teams or Slack incoming webhook. Needs no account
+                         and no credential beyond the URL itself.
+    PUSHOVER_TOKEN       Pushover application token, and
+    PUSHOVER_USER        the user or group key. CRITICAL is sent at emergency
+                         priority, which re-alerts until acknowledged on the
+                         phone -- the only channel here that reliably wakes
+                         someone.
+    ALERT_EMAIL_TO       comma-separated; uses the same SMTP as the reports,
+                         so it works only where that is configured.
     ALERT_SMS_TO         comma-separated carrier gateway addresses, e.g.
-                         5551234567@vtext.com -- CRITICAL only, short body
-    ALERT_WEBHOOK_URL    a Teams or Slack incoming webhook
+                         5551234567@txt.att.net. This is EMAIL, so it needs
+                         working SMTP, and carriers filter it unpredictably.
     ALERT_HEARTBEAT_URL  pinged on success; the dead man's switch
     ALERT_SOURCE         a name for this host, so two machines are told apart
 
@@ -106,6 +114,38 @@ def _send_sms(headline, recipients):
     send_email("", body, recipients)
 
 
+# Pushover's emergency priority repeats until a person acknowledges it on the
+# device. Anything less can be slept through, which defeats the point.
+PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
+PUSHOVER_PRIORITY = {CRITICAL: 2, WARNING: 0, INFO: -1}
+PUSHOVER_RETRY_SECONDS = int(os.getenv("PUSHOVER_RETRY", "60"))
+PUSHOVER_EXPIRE_SECONDS = int(os.getenv("PUSHOVER_EXPIRE", "3600"))
+
+
+def _send_pushover(severity, headline, detail, token, user):
+    form = {
+        "token": token,
+        "user": user,
+        "title": f"{SUBJECT_PREFIX[severity]} {source_name()}",
+        "message": (f"{headline}\n\n{detail}" if detail else headline)[:1024],
+        "priority": PUSHOVER_PRIORITY[severity],
+    }
+    if form["priority"] == 2:
+        # Required at emergency priority: how often to re-alert, and when to
+        # give up. Without these Pushover rejects the message outright.
+        form["retry"] = PUSHOVER_RETRY_SECONDS
+        form["expire"] = PUSHOVER_EXPIRE_SECONDS
+
+    request = urllib.request.Request(
+        PUSHOVER_URL,
+        data=urllib.parse.urlencode(form).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        response.read()
+
+
 def _send_webhook(severity, headline, detail, url):
     payload = {
         "@type": "MessageCard",
@@ -143,6 +183,25 @@ def alert(severity, headline, detail=""):
 
     sent, failed = [], []
 
+    # Webhook and Pushover first: they need no SMTP, so they still work on a
+    # host that has none -- which is the situation that made them necessary.
+    webhook_first = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+    if webhook_first and severity in (CRITICAL, WARNING):
+        try:
+            _send_webhook(severity, headline, detail, webhook_first)
+            sent.append("webhook")
+        except Exception as exc:
+            failed.append(f"webhook ({exc})")
+
+    token = os.getenv("PUSHOVER_TOKEN", "").strip()
+    user = os.getenv("PUSHOVER_USER", "").strip()
+    if token and user:
+        try:
+            _send_pushover(severity, headline, detail, token, user)
+            sent.append("pushover")
+        except Exception as exc:
+            failed.append(f"pushover ({exc})")
+
     email_to = _recipients("ALERT_EMAIL_TO")
     if email_to:
         try:
@@ -150,14 +209,6 @@ def alert(severity, headline, detail=""):
             sent.append("email")
         except Exception as exc:
             failed.append(f"email ({exc})")
-
-    webhook = os.getenv("ALERT_WEBHOOK_URL", "").strip()
-    if webhook and severity in (CRITICAL, WARNING):
-        try:
-            _send_webhook(severity, headline, detail, webhook)
-            sent.append("webhook")
-        except Exception as exc:
-            failed.append(f"webhook ({exc})")
 
     sms_to = _recipients("ALERT_SMS_TO")
     if sms_to and severity == CRITICAL:

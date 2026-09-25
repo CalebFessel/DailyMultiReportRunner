@@ -748,9 +748,17 @@ def fake_webhook(severity, headline, detail, url):
     alert_calls["webhook"].append((severity, headline, url))
 
 
-real = (ALERTS._send_email, ALERTS._send_sms, ALERTS._send_webhook)
-ALERTS._send_email, ALERTS._send_sms, ALERTS._send_webhook = (
-    fake_email, fake_sms, fake_webhook)
+pushover_sent = []
+
+
+def fake_pushover(severity, headline, detail, token, user):
+    pushover_sent.append((severity, headline))
+
+
+real = (ALERTS._send_email, ALERTS._send_sms, ALERTS._send_webhook,
+        ALERTS._send_pushover)
+(ALERTS._send_email, ALERTS._send_sms, ALERTS._send_webhook,
+ ALERTS._send_pushover) = (fake_email, fake_sms, fake_webhook, fake_pushover)
 
 saved = dict(os.environ)
 try:
@@ -758,25 +766,49 @@ try:
         "ALERT_EMAIL_TO": "ops@example.com",
         "ALERT_SMS_TO": "5551234567@example.net",
         "ALERT_WEBHOOK_URL": "https://example.com/hook",
+        "PUSHOVER_TOKEN": "tok",
+        "PUSHOVER_USER": "usr",
     })
 
     reset_alert_calls()
     result = ALERTS.alert(ALERTS.CRITICAL, "it broke", "detail")
     check("a critical alert reaches every channel",
-          sorted(result["sent"]) == ["email", "sms", "webhook"], str(result))
+          sorted(result["sent"]) == ["email", "pushover", "sms", "webhook"],
+          str(result))
 
     # A warning must not wake anyone at 3am.
     reset_alert_calls()
     result = ALERTS.alert(ALERTS.WARNING, "needs a look")
     check("a warning does not send SMS",
           "sms" not in result["sent"] and not alert_calls["sms"], str(result))
-    check("but does reach email and the channel",
-          sorted(result["sent"]) == ["email", "webhook"], str(result))
+    check("but does reach email, the channel and the phone",
+          sorted(result["sent"]) == ["email", "pushover", "webhook"], str(result))
 
     reset_alert_calls()
+    del pushover_sent[:]
     result = ALERTS.alert(ALERTS.INFO, "all fine")
-    check("routine completion is email only",
-          result["sent"] == ["email"], str(result))
+    check("routine completion skips the channel webhook",
+          "webhook" not in result["sent"], str(result))
+    check("and is sent to the phone at a priority that will not buzz",
+          ALERTS.PUSHOVER_PRIORITY[ALERTS.INFO] < 0)
+
+    # Emergency priority is the whole point of this channel, and Pushover
+    # rejects it outright without retry/expire.
+    check("critical goes to Pushover at emergency priority",
+          ALERTS.PUSHOVER_PRIORITY[ALERTS.CRITICAL] == 2)
+    check("and a warning does not, so it cannot be slept through by mistake",
+          ALERTS.PUSHOVER_PRIORITY[ALERTS.WARNING] == 0)
+
+    captured = {}
+
+    def capture_pushover(severity, headline, detail, token, user):
+        captured["severity"] = severity
+
+    ALERTS._send_pushover = capture_pushover
+    ALERTS.alert(ALERTS.CRITICAL, "wake up")
+    check("the phone is told about a critical failure",
+          captured.get("severity") == ALERTS.CRITICAL, str(captured))
+    ALERTS._send_pushover = fake_pushover
 
     # The channel that fails may be the reason an alert was needed.
     def boom(*a, **k):
@@ -799,7 +831,8 @@ try:
     check("an unknown severity is refused", raised is not None)
 
     # A host with nothing configured must not crash the payroll run.
-    for key in ("ALERT_EMAIL_TO", "ALERT_SMS_TO", "ALERT_WEBHOOK_URL"):
+    for key in ("ALERT_EMAIL_TO", "ALERT_SMS_TO", "ALERT_WEBHOOK_URL",
+                "PUSHOVER_TOKEN", "PUSHOVER_USER"):
         del os.environ[key]
     result = ALERTS.alert(ALERTS.CRITICAL, "nowhere to go")
     check("no configured channel is survivable, not fatal",
@@ -807,7 +840,8 @@ try:
 finally:
     os.environ.clear()
     os.environ.update(saved)
-    ALERTS._send_email, ALERTS._send_sms, ALERTS._send_webhook = real
+    (ALERTS._send_email, ALERTS._send_sms, ALERTS._send_webhook,
+     ALERTS._send_pushover) = real
 
 # The heartbeat is the only thing that catches a run that never happened, so
 # it must fire on success and NOT on failure.

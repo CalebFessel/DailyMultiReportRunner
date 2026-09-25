@@ -8,17 +8,25 @@ a username where a payroll number belongs -- and they need different fixes.
 This separates them by falling back to the one identifier both systems
 independently carry: the person's name.
 
+By default it looks only at the crew who worked in the current shift window.
+--all-employees walks the whole Traumasoft roster instead, and that is the one
+to run: a tenant with 1,800 employees surfaces its unmatched people a handful
+at a time, as each happens to take a shift, and every one of those is a
+refused punch discovered after the fact -- a day's pay already lost by the
+time anyone looks. The full scan finds them all at once.
+
 Strictly read-only. It proposes overrides into a *candidate* file; it never
 writes the one push_paycor_timecards.py actually loads. A wrong override pays
 the wrong person, so the promotion from candidate to live stays a human act.
 
-    python diagnose_paycor_employee_match.py
+    python diagnose_paycor_employee_match.py --all-employees
 """
 
 import os
 import re
 import sys
 import json
+import argparse
 from collections import defaultdict
 from datetime import datetime
 
@@ -63,9 +71,21 @@ def name_keys(first, last):
 
 
 def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--all-employees", action="store_true",
+                    help="scan the whole Traumasoft roster, not just the crew "
+                         "who worked in the current shift window")
+    ap.add_argument("--include-disabled", action="store_true",
+                    help="with --all-employees, include disabled Traumasoft "
+                         "employees as well")
+    args = ap.parse_args()
+
     print("=" * 78)
     print("PAYCOR EMPLOYEE MATCH DIAGNOSIS")
     print(f"environment: {paycor_api.ENVIRONMENT}")
+    print(f"scope:       {'whole Traumasoft roster' if args.all_employees else 'crew who worked in the current window'}")
     print("=" * 78)
 
     ts = TraumasoftAPI()
@@ -76,11 +96,16 @@ def main():
         return 1
 
     print("Reading both rosters...")
-    shifts = ts.list_shifts()
-    ts_employees = ts.list_employees()
-    legs = ts.get_trips(datetime.now().date(), range_days=1)
-    offset = R.resolve_shift_offset(legs)
-    now = R.tenant_now(offset)
+    ts_employees = ts.list_employees(include_disabled=args.include_disabled)
+
+    # Shifts and trips decide which punches fall in the window. A full-roster
+    # scan does not look at punches at all, so it skips two slow reads.
+    shifts, offset, now = None, None, None
+    if not args.all_employees:
+        shifts = ts.list_shifts()
+        legs = ts.get_trips(datetime.now().date(), range_days=1)
+        offset = R.resolve_shift_offset(legs)
+        now = R.tenant_now(offset)
 
     try:
         paycor = PaycorClient(read_only=True)
@@ -125,21 +150,55 @@ def main():
     index = P.paycor_employee_index(paycor_roster)
     overrides = P.load_overrides()
     activity_type_id, _ = P.resolve_activity_type(activity_types)
-    sendable, refused = P.build_plan(
-        shifts, ts_employees, offset, now, overrides, index, activity_type_id,
-    )
-
     unmatched = {}
-    for row in refused:
-        reason = row.get("refused") or ""
-        if "matches no Paycor employee" not in reason:
-            continue
-        num = str(row.get("employee_num") or "").strip()
-        if num:
-            unmatched.setdefault(num, row.get("employee_name"))
+    no_number = []
+
+    if args.all_employees:
+        # Every employee who would fail to resolve if they clocked in right
+        # now, including the ones who have not worked lately and so never
+        # appear in a window-scoped run. Each of those is a refused punch
+        # waiting to happen on whichever day they next take a shift.
+        resolved = 0
+        for emp in ts_employees:
+            entry, _how = P.resolve_employee(emp, overrides, index)
+            if entry is not None:
+                resolved += 1
+                continue
+            num = str(emp.get("employee_num") or "").strip()
+            name = " ".join(p for p in (emp.get("first_name"),
+                                        emp.get("last_name")) if p)
+            if num:
+                unmatched.setdefault(num, name or None)
+            else:
+                no_number.append(name or f"user_id {emp.get('user_id')}")
+        sendable = [None] * resolved
+    else:
+        sendable, refused = P.build_plan(
+            shifts, ts_employees, offset, now, overrides, index,
+            activity_type_id,
+        )
+        for row in refused:
+            reason = row.get("refused") or ""
+            if "matches no Paycor employee" not in reason:
+                continue
+            num = str(row.get("employee_num") or "").strip()
+            if num:
+                unmatched.setdefault(num, row.get("employee_name"))
+
+    if no_number:
+        print("\n" + "-" * 78)
+        print(f"NO PAYROLL NUMBER AT ALL ({len(no_number)})")
+        print("-" * 78)
+        print("  These Traumasoft records carry nothing in the payroll number")
+        print("  field, so there is nothing to match on and no override can be")
+        print("  keyed to them. Fix the Traumasoft record:\n")
+        for name in sorted(no_number)[:30]:
+            print(f"    {name}")
+        if len(no_number) > 30:
+            print(f"    ... and {len(no_number) - 30} more")
 
     if not unmatched:
-        print("\nNo unmatched employee numbers in the current window.")
+        print("\nEvery Traumasoft employee in scope resolves to a Paycor employee.")
         return 0
 
     # ---- narrow the roster to the departments this operation actually uses ----
@@ -242,7 +301,9 @@ def main():
             absent.append((num, name))
 
     print("\n" + "-" * 78)
-    print(f"UNMATCHED EMPLOYEE NUMBERS IN THIS WINDOW: {len(unmatched)}")
+    scope_label = ("ACROSS THE WHOLE TRAUMASOFT ROSTER" if args.all_employees
+                   else "IN THIS WINDOW")
+    print(f"UNMATCHED EMPLOYEE NUMBERS {scope_label}: {len(unmatched)}")
     print("-" * 78)
 
     if confident:
@@ -305,7 +366,7 @@ def main():
         print("  under an \"overrides\" key. The push only reads the second file.")
 
     print("\n" + "=" * 78)
-    print(f"  currently sendable : {len(sendable)}")
+    print(f"  {'employees already resolving' if args.all_employees else 'currently sendable'} : {len(sendable)}")
     print(f"  recoverable by override : {len(confident)}")
     print(f"  needs a human decision  : {len(ambiguous) + len(absent) + len(nameless)}")
     print("=" * 78)

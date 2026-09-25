@@ -142,9 +142,55 @@ def main():
         print("\nNo unmatched employee numbers in the current window.")
         return 0
 
+    # ---- narrow the roster to the departments this operation actually uses ----
+    #
+    # The Paycor tenant is shared with the parent company, so most of this
+    # roster never appears in Traumasoft. Matching a name against all of it
+    # draws from thousands of unrelated people, and a surname plus an initial
+    # is not rare across that many.
+    #
+    # Employees who matched on their payroll NUMBER are known to be ours, so
+    # the departments they sit in describe this operation. Restricting the
+    # name fallback to those departments cannot pay someone at the parent
+    # company by accident.
+    #
+    # The failure mode is deliberately one-sided: one of ours in a department
+    # no number-matched employee occupies is excluded and reported as absent,
+    # which refuses a punch. The opposite error pays the wrong person.
+    ours_departments = set()
+    for emp in ts_employees:
+        entry, how = P.resolve_employee(emp, overrides, index)
+        if entry is not None and how == "employee_num":
+            dept = entry.get("department_id")
+            if dept:
+                ours_departments.add(str(dept))
+
+    def in_scope(emp):
+        if not ours_departments:
+            return True
+        dept = (emp.get("department") or {}).get("id")
+        return dept is not None and str(dept) in ours_departments
+
+    in_scope_roster = [e for e in paycor_roster if in_scope(e)]
+    print("\n" + "-" * 78)
+    print("ROSTER SCOPE")
+    print("-" * 78)
+    print(f"  departments in use by employees matched on payroll number: "
+          f"{len(ours_departments)}")
+    print(f"  Paycor employees in those departments: {len(in_scope_roster)} "
+          f"of {len(paycor_roster)}")
+    if not ours_departments:
+        print("\n  No employee matched on a payroll number, so the departments")
+        print("  this operation uses cannot be inferred and the whole roster is")
+        print("  in scope. Read every name match with that in mind.")
+    else:
+        print("\n  Name matching is restricted to these departments. The rest of")
+        print("  the tenant belongs to the parent company, and a name match")
+        print("  against it would put someone else's employee on this payroll.")
+
     # Name -> Paycor entries, for the fallback match.
     by_name = defaultdict(list)
-    for emp in paycor_roster:
+    for emp in in_scope_roster:
         if not emp.get("id"):
             continue
         entry = {

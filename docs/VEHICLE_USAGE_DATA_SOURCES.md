@@ -72,27 +72,29 @@ odometer fields.
 inferring it from the HTTP verb, so a read-only client cannot be talked into
 a write by a helper that happens to POST. Keep new reads `write=False`.
 
-## If the gap is to be closed
+## Closing the gap
 
-Samsara does carry engine state, idle time and distance; this integration
-simply never asks for them. Splitting "unused" into genuinely parked versus
-moved-but-never-dispatched is a real operational distinction and probably
-what a reader of that sheet wants.
+Two probes and one report now exist for this. None of the three has been run
+against live data yet, so everything below is built and unverified.
 
-Two things to settle before building it, both of which cost real time if
-skipped:
+**`probe_samsara_movement.py`** asks the four questions that cannot be
+answered from the documentation: whether the stats history endpoint returns
+engine states in the shape assumed, how far back retention actually reaches,
+whether an idle threshold separates the fleet at all, and which series -- OBD
+odometer, GPS odometer or GPS track -- carries distance on these trucks. It
+also counts, for one day, how far the movement-based answer differs from the
+dispatch-based one this document describes.
 
-**The endpoints must be checked, not recalled.** Samsara's vehicle stats API
-is roughly `/fleet/vehicles/stats` with a `types` parameter, plus a history
-variant for a window -- but that is a starting point for reading the live
-documentation, not a specification. `probe_samsara_readiness.py` is the
-read-only probe to extend.
+**`probe_samsara_tags.py`** section 8 measures the VIN join against the name
+join it would replace, and names the units each one loses. Run it before
+either becomes the join a number depends on -- the Paycor employee matching
+in this same repository failed in exactly this way.
 
-**The join key is unknown.** Samsara vehicles carry `id`, `name` and tags;
-Traumasoft vehicles carry their own `id` and `name`. Whether those names
-match across both systems has never been checked against live data. A
-near-miss join silently drops trucks and still produces a plausible-looking
-number. The Paycor employee matching in this same repository failed exactly
-this way -- 55 of roughly 85 crew did not match on what looked like a shared
-identifier -- so build the diagnostic that measures the overlap before
-building the feature that depends on it.
+**`vehicle_productivity.py`** classifies each vehicle-day against the
+Productive / Non-Productive / Indetermined definition upper management
+supplied, using Samsara for engine state and distance and Traumasoft for
+crew, calls and status. Two of the six inputs it needs are not settled: ePCR
+completion has no published route, and the Samsara telematics calls have
+never been run here. `docs/VEHICLE_PRODUCTIVITY.md` sets out what that leaves
+answerable, what it does not, and the decisions the definition leaves open.
+

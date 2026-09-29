@@ -12,7 +12,7 @@ Samsara instead:
     Roster   Samsara. A vehicle absent from Samsara is out of scope.
     Join     VIN
 
-Three things have to be true before that can be built, and none of them are
+Four things have to be true before that can be built, and none of them are
 knowable from the documentation:
 
   1. the stats history endpoint returns engine states in the shape assumed;
@@ -21,7 +21,11 @@ knowable from the documentation:
      entirely on Samsara's retention, which is not published;
   3. an 8-hour threshold actually separates the fleet. A rule that marks
      nearly every vehicle Unused is not a rule, and overnight shutdown makes
-     that a real possibility on a calendar-day window.
+     that a real possibility on a calendar-day window;
+  4. distance is readable at all. The vehicle productivity definition turns
+     on "moved more than a mile", and which series carries that -- the OBD
+     odometer, the GPS odometer, or the GPS track -- differs by what hardware
+     is fitted to each truck. Asking is the only way to find out.
 
 So this measures all three against the live API rather than asserting them.
 It reports the endpoint's real response shape before computing anything from
@@ -122,14 +126,19 @@ def parse_ts(text):
     return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
-def fetch_engine_states(samsara, start, end):
-    """One stats-history query for engineStates over a window, all vehicles."""
+def fetch_stats_types(samsara, start, end, types):
+    """One stats-history query for any set of types over a window."""
     return list(
         samsara.paginate(
             STATS_PATH,
-            params={"startTime": start, "endTime": end, "types": "engineStates"},
+            params={"startTime": start, "endTime": end, "types": types},
         )
     )
+
+
+def fetch_engine_states(samsara, start, end):
+    """One stats-history query for engineStates over a window, all vehicles."""
+    return fetch_stats_types(samsara, start, end, "engineStates")
 
 
 # =============================
@@ -416,12 +425,127 @@ def report_vs_dispatch(rows, zone, day, threshold, out):
     }
 
 
+def report_distance(samsara, zone, day, min_miles, out):
+    """
+    Whether distance can be measured, and by which series.
+
+    The productivity definition asks whether a vehicle moved more than a mile.
+    Samsara can answer that three ways and which ones are populated depends on
+    the hardware fitted to each truck, so all three are requested at once and
+    reported by coverage. Picking one on the strength of the documentation
+    would silently produce zero miles for every vehicle that lacks it -- and
+    zero miles reads as "did not move", which is the worst possible way for
+    this to be wrong.
+
+    The distribution against the threshold is printed for the same reason
+    section 3 prints bands: a cutoff nobody has seen the shape of is a guess.
+    """
+    print(f"\n5. CAN DISTANCE BE MEASURED? ({day.isoformat()})")
+    print("   " + "-" * 66)
+
+    import vehicle_productivity as VP
+
+    start, end, day_start, day_end = day_window(day, zone)
+    types = "obdOdometerMeters,gpsOdometerMeters,gps"
+    print(f"   GET /{STATS_PATH}")
+    print(f"   types={types}\n")
+    try:
+        rows = fetch_stats_types(samsara, start, end, types)
+    except Exception as exc:  # noqa: BLE001 -- reporting the failure IS the result
+        print(f"   FAILED: {type(exc).__name__}: {exc}")
+        print("\n   Without distance nothing can be called Productive: the")
+        print("   definition requires movement. Engine state alone cannot")
+        print("   stand in -- an idling truck has not moved.")
+        out["distance"] = {"ok": False, "error": str(exc)}
+        return
+
+    print(f"   OK -- {len(rows)} vehicle row(s) returned.")
+    coverage = Counter()
+    for row in rows:
+        for key in ("obdOdometerMeters", "gpsOdometerMeters", "gps"):
+            if row.get(key):
+                coverage[key] += 1
+    print(f"\n   {'series':<24}{'vehicles with data':>19}")
+    print("   " + "-" * 43)
+    for key in ("obdOdometerMeters", "gpsOdometerMeters", "gps"):
+        print(f"   {key:<24}{coverage.get(key, 0):>19}")
+
+    odo_miles, gps_miles = {}, {}
+    for row in rows:
+        name = str(row.get("name") or row.get("id") or "?")
+        value = VP.miles_from_odometer(row, day_start, day_end)
+        if value is not None:
+            odo_miles[name] = value
+        value = VP.miles_from_gps(row, day_start, day_end)
+        if value is not None:
+            gps_miles[name] = value
+
+    print(f"\n   Vehicles a day of miles can be computed for:")
+    print(f"      odometer delta   {len(odo_miles)}")
+    print(f"      GPS track        {len(gps_miles)}")
+
+    preferred = "odometer" if len(odo_miles) >= len(gps_miles) else "gps"
+    measured = odo_miles if preferred == "odometer" else gps_miles
+    if not measured:
+        print("\n   Neither series yields a day's distance. The productivity")
+        print("   report cannot call anything Productive until this is fixed.")
+        out["distance"] = {"ok": True, "rows": len(rows), "coverage": dict(coverage),
+                           "measurable": 0}
+        return
+
+    bands = [(0, 0.1), (0.1, 1), (1, 10), (10, 50), (50, 150), (150, 1e9)]
+    print(f"\n   Miles per vehicle on {day.isoformat()}, by {preferred}:")
+    print(f"   {'miles':<20}{'vehicles':>9}")
+    print("   " + "-" * 31)
+    for low, high in bands:
+        count = sum(1 for m in measured.values() if low <= m < high)
+        label = f"{low:g} to {high:g}" if high < 1e9 else f"{low:g} and up"
+        print(f"   {label:<20}{count:>9}")
+
+    moved = sorted(n for n, m in measured.items() if m > min_miles)
+    still = sorted(n for n, m in measured.items() if m <= min_miles)
+    print(f"\n   Moved more than {min_miles} mile: {len(moved)}")
+    print(f"   Did not:                   {len(still)}")
+
+    # The two series should broadly agree. Where they do not, one of them is
+    # wrong about a specific truck, and that is worth knowing before either
+    # becomes the number management reads.
+    both = set(odo_miles) & set(gps_miles)
+    disagree = [
+        (n, odo_miles[n], gps_miles[n]) for n in sorted(both)
+        if (odo_miles[n] > min_miles) != (gps_miles[n] > min_miles)
+    ]
+    if both:
+        print(f"\n   Measurable both ways: {len(both)}. "
+              f"Verdicts disagree on {len(disagree)}.")
+        for name, odometer, gps in disagree[:12]:
+            print(f"      {name[:22]:<24}odometer {odometer:>8.2f}   gps {gps:>8.2f}")
+
+    out["distance"] = {
+        "ok": True,
+        "rows": len(rows),
+        "coverage": dict(coverage),
+        "preferred": preferred,
+        "min_miles": min_miles,
+        "moved": moved,
+        "still": still,
+        "miles": {k: round(v, 2) for k, v in sorted(measured.items())},
+        "disagreements": [
+            {"vehicle": n, "odometer_miles": round(o, 2), "gps_miles": round(g, 2)}
+            for n, o, g in disagree
+        ],
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     parser.add_argument("--day", help="Day to analyse, YYYY-MM-DD. Default yesterday.")
     parser.add_argument("--threshold", type=float, default=8.0,
                         help="Hours of continuous engine-off that mark a vehicle "
                              "Unused (default 8).")
+    parser.add_argument("--min-miles", type=float, default=1.0,
+                        help="Miles a vehicle must exceed to count as having "
+                             "moved, for section 5 (default 1).")
     parser.add_argument("--skip-retention", action="store_true",
                         help="Skip the retention ladder, which is the slow part.")
     parser.add_argument("--json", dest="json_path", help="Also write findings as JSON.")
@@ -464,6 +588,7 @@ def main(argv=None):
             log.warning("Could not re-fetch with lookback: %s", exc)
         report_idle_rule(rows, zone, day, args.threshold, out)
         report_vs_dispatch(rows, zone, day, args.threshold, out)
+    report_distance(samsara, zone, day, args.min_miles, out)
 
     print("\n" + "=" * 72)
     print("  Safe to paste. Operational values only, no patient data.")

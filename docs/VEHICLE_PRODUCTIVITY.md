@@ -72,27 +72,52 @@ answer rather than a degraded version of it:
   not, something is reading ePCR from a source this document does not know
   about and it should be checked.
 
-## The three categories do not cover every vehicle
+## The gap in the definition, and how management closed it
 
-A vehicle that is crewed, in service, engine on, moving, and has **no call
-assigned** matches none of the three rules. It is not Non-Productive — it has
-crew and is in service. It is not Productive or Indetermined — both require a
-scheduled pickup. The same is true of a crewed, in-service truck that never
-started.
+As first written, the three categories did not cover every vehicle. A truck
+that is crewed, in service, engine on, moving, and has **no call assigned**
+matched none of them — it is not Non-Productive as defined, because it has
+crew and is in service, and it is not Productive or Indetermined, because
+both require a scheduled pickup. The same was true of a crewed, in-service
+truck that never started.
 
-These are not edge cases. The moved-but-never-dispatched truck is exactly
-what `docs/VEHICLE_USAGE_DATA_SOURCES.md` identifies as the blind spot in the
-current Daily Vehicle Overview: posting moves, repositioning, a maintenance
-run, a staffed unit that had a quiet shift.
+**Management settled both as Non-Productive.** The rule implemented is
+therefore *any Productive condition known to fail*, which covers the original
+two terms and both gaps:
 
-They land in **`unclassified`**, with the failing condition named, rather than
-being rounded into the nearest bucket. Section 3 of the report groups them by
-reason and calls out the moved-with-no-call count separately.
+```
+Non-Productive  out of service, OR no crew assigned, OR no call assigned,
+                OR the engine never ran, OR it did not move far enough
+```
 
-**Decision needed:** what should these be? The likely intent is that a
-crewed, in-service truck that did not run a call is non-productive, but that
-is a rule change, not an implementation detail, and it is management's to
-make.
+Note what this also buys: a condition **known** to fail settles the verdict
+without waiting on inputs that could not be read. A truck with no call
+assigned cannot become Productive on the strength of telematics nobody has,
+so it is called Non-Productive even when Samsara is unreachable. Without that,
+a dead telematics feed would turn the whole fleet into undetermined rows.
+
+### One verdict, several different problems
+
+A vehicle usually fails more than one condition at once — an unstaffed truck
+gets no calls and never starts. Reporting all of them would fragment the
+grouping into one bucket per combination and bury the thing to act on, so the
+**earliest break in the chain is the headline reason** and every failing
+condition is carried in the `failed_conditions` column:
+
+```
+available (in service) → staffed (crew) → given work (a call) → actually went
+```
+
+You cannot fix "never started" when the real problem is that nobody
+dispatched it. Section 3 of the report groups by that headline reason, and
+calls out two cases separately because they are different problems:
+
+- **Crewed, moved more than a mile, no call assigned.** Crew hours and fuel
+  spent with nothing dispatched — posting, repositioning, a maintenance run.
+  This is the blind spot `docs/VEHICLE_USAGE_DATA_SOURCES.md` identifies in
+  the current Daily Vehicle Overview, which reads these as simply unused.
+- **A call was assigned and the engine never ran.** Dispatch committed a unit
+  that did not go.
 
 ## Two more decisions the definition leaves open
 

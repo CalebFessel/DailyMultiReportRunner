@@ -8,8 +8,9 @@ them are load-bearing and each has tests here:
   * a factor that could not be read must never read as False. A silent
     telematics gateway is not a parked truck, and an absent ePCR route is not
     an incomplete ePCR;
-  * a vehicle-day the three definitions do not cover must not be rounded into
-    the nearest one;
+  * a Productive condition known to fail must settle the verdict without
+    waiting on inputs that could not be read, or Samsara being down turns
+    the whole fleet into undetermined rows;
   * a shift stamp arrives as bare UTC and the window is tenant-local, so an
     overnight roster lands on the wrong day if that is mishandled.
 
@@ -57,6 +58,12 @@ def test_all_conditions_but_an_incomplete_epcr_is_indetermined():
     assert verdict == V.INDETERMINATE
 
 
+def test_a_truck_that_moved_under_the_threshold_is_non_productive():
+    verdict, reason = V.classify(factors(moved=False))
+    assert verdict == V.NON_PRODUCTIVE
+    assert "did not move" in reason
+
+
 def test_no_crew_is_non_productive():
     verdict, reason = V.classify(factors(has_crew=False))
     assert verdict == V.NON_PRODUCTIVE
@@ -97,7 +104,10 @@ def test_unreadable_epcr_is_undetermined_not_productive():
     assert reason.startswith(V.PENDING_EPCR_REASON_PREFIX)
 
 
-def test_silent_gateway_is_undetermined_not_unclassified():
+def test_silent_gateway_is_undetermined_not_non_productive():
+    """A gateway that said nothing is not a truck that sat still. Unknown
+    engine state and unknown distance must not convict a vehicle that meets
+    every condition anyone could actually check."""
     verdict, reason = V.classify(factors(engine_on=None, moved=None))
     assert verdict == V.UNDETERMINED
     assert "engine state" in reason and "distance" in reason
@@ -106,31 +116,66 @@ def test_silent_gateway_is_undetermined_not_unclassified():
 def test_a_failed_condition_beats_an_unreadable_one():
     """
     No call was assigned, so no ePCR and no telematics reading could make
-    this Productive. Say the decisive thing, not the missing one.
+    this Productive. The verdict must not wait on inputs that cannot change
+    it -- otherwise Samsara being down turns the whole fleet undetermined.
     """
     verdict, reason = V.classify(
         factors(engine_on=None, moved=None, has_scheduled_pickup=False)
     )
-    assert verdict == V.UNCLASSIFIED
+    assert verdict == V.NON_PRODUCTIVE
     assert "no call was assigned" in reason
 
 
 # =============================
-# THE GAP IN THE DEFINITION
+# THE TWO CASES MANAGEMENT SETTLED
 # =============================
-def test_crewed_moving_truck_with_no_call_matches_no_rule():
+def test_crewed_moving_truck_with_no_call_is_non_productive():
     """The moved-but-never-dispatched case: posting, repositioning, a
-    maintenance run. It is not Non-Productive as defined -- it has crew and
-    is in service -- and it is not Productive or Indetermined either."""
+    maintenance run. Crew hours and fuel spent, nothing dispatched."""
     verdict, reason = V.classify(factors(has_scheduled_pickup=False))
-    assert verdict == V.UNCLASSIFIED
+    assert verdict == V.NON_PRODUCTIVE
     assert "no call was assigned" in reason
 
 
-def test_crewed_in_service_truck_that_never_started_matches_no_rule():
+def test_crewed_in_service_truck_that_never_started_is_non_productive():
     verdict, reason = V.classify(factors(engine_on=False, moved=False))
-    assert verdict == V.UNCLASSIFIED
+    assert verdict == V.NON_PRODUCTIVE
     assert "engine never ran" in reason
+
+
+def test_the_reason_keeps_the_two_cases_apart():
+    """
+    One verdict, two different operational problems. A truck that burned a
+    shift with nothing dispatched is a dispatch question; one that never
+    started is a readiness question. The totals have to be able to tell them
+    apart or the number is not actionable.
+    """
+    _, dispatched = V.classify(factors(has_scheduled_pickup=False))
+    _, started = V.classify(factors(engine_on=False, moved=False))
+    assert dispatched != started
+
+
+def test_a_call_assigned_to_a_truck_that_never_started_says_so():
+    """Worth seeing on its own: dispatch committed a unit that never ran."""
+    _, reason = V.classify(factors(engine_on=False, moved=False))
+    assert reason == "the engine never ran"
+
+
+def test_the_earliest_break_in_the_chain_is_the_headline():
+    """
+    An unstaffed truck gets no calls and never starts. Reporting all four
+    fragments the grouping into one bucket per combination and buries the
+    thing to act on -- you cannot fix "never started" when the real problem
+    is that nobody staffed it.
+    """
+    broken = factors(has_crew=False, has_scheduled_pickup=False,
+                     engine_on=False, moved=False)
+    verdict, reason = V.classify(broken)
+    assert verdict == V.NON_PRODUCTIVE
+    assert reason == "no crew assigned"
+    assert V.failed_conditions(broken) == [
+        "has_crew", "has_scheduled_pickup", "engine_on", "moved",
+    ]
 
 
 # =============================
@@ -481,6 +526,23 @@ def vehicle(vid, name, status="In Service", vin=""):
     return {"id": vid, "name": name, "vehicle_status": status, "vin": vin}
 
 
+def test_no_samsara_still_settles_a_crewed_truck_with_no_call():
+    """
+    The verdict turns on Traumasoft alone here, so a dead telematics feed
+    must not hide it. This is the case that would otherwise bury the fleet
+    in undetermined rows every time Samsara is unreachable.
+    """
+    rows, _ = V.build_rows(
+        [vehicle(7, "A-101")], [],
+        [shift("A-101", "2026-09-22T12:00:00", "2026-09-22T20:00:00")],
+        stats_rows=[], sam_index={}, window_start=DAY_START, window_end=DAY_END,
+        zone=EASTERN, day=DAY_START.date(),
+    )
+    assert rows[0]["classification"] == V.NON_PRODUCTIVE
+    assert "no call was assigned" in rows[0]["reason"]
+    assert rows[0]["engine_on"] is None
+
+
 def test_no_samsara_leaves_a_crewed_dispatched_truck_undetermined():
     """
     Samsara down must not turn working trucks into Non-Productive ones, and
@@ -507,6 +569,9 @@ def test_an_uncrewed_truck_is_non_productive_without_any_telematics():
     )
     assert rows[0]["classification"] == V.NON_PRODUCTIVE
     assert rows[0]["reason"] == "no crew assigned"
+    # It also had no call and no telematics, but the earliest break is the
+    # one to act on; the rest are carried in their own column.
+    assert rows[0]["failed_conditions"] == "has_crew;has_scheduled_pickup"
 
 
 def test_retired_vehicles_are_not_a_productivity_question():
@@ -562,7 +627,7 @@ def test_a_truck_that_moved_under_a_mile_did_not_move():
         day=DAY_START.date(),
     )
     assert rows[0]["moved"] is False
-    assert rows[0]["classification"] == V.UNCLASSIFIED
+    assert rows[0]["classification"] == V.NON_PRODUCTIVE
 
 
 def test_a_shift_naming_an_unknown_unit_is_reported_not_dropped():

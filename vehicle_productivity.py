@@ -34,11 +34,14 @@ meet every other condition is the size of the prize. The `epcr_complete`
 key is carried through every row as an explicit None, so one assignment
 turns it on the day the surface opens. See docs/VEHICLE_PRODUCTIVITY.md.
 
-THE THREE CATEGORIES DO NOT COVER EVERY VEHICLE. A truck that is crewed, in
-service, engine on and moving, with no call assigned to it, matches none of
-the three rules as written -- and it is precisely the case the existing Daily
-Vehicle Overview is blind to. Those land in `unclassified` with the reason
-spelled out rather than being forced into the nearest bucket.
+THE DEFINITION AS FIRST WRITTEN LEFT TWO CASES UNCOVERED: a crewed,
+in-service truck that moved with no call assigned, and one that never
+started. Management settled both as Non-Productive, so the rule implemented
+here is "any Productive condition known to fail". The specific condition is
+carried in every row's reason and broken out in the report, because a truck
+that burned crew hours and fuel with nothing dispatched is a different
+problem from one that never turned a wheel -- and the first is precisely the
+case the existing Daily Vehicle Overview is blind to.
 
 Unit of analysis is one vehicle, one tenant-local calendar day. Nothing in the
 definition says so; it is the unit the fleet sheets already use and the one
@@ -87,9 +90,31 @@ PRODUCTIVE = "productive"
 NON_PRODUCTIVE = "non-productive"
 INDETERMINATE = "indetermined"
 UNDETERMINED = "undetermined"      # a required input could not be read
-UNCLASSIFIED = "unclassified"      # inputs all read, no rule matches
 
-CLASS_ORDER = [PRODUCTIVE, INDETERMINATE, UNDETERMINED, UNCLASSIFIED, NON_PRODUCTIVE]
+CLASS_ORDER = [PRODUCTIVE, INDETERMINATE, UNDETERMINED, NON_PRODUCTIVE]
+
+# Why a vehicle-day is Non-Productive. The verdict is one word; these are the
+# operational stories behind it, and they are not the same story. A truck that
+# burned crew hours and fuel with no call is a dispatch or staffing question;
+# a truck that never started is a readiness one. Kept on every row so the
+# report can break the total down instead of just reporting it.
+NON_PRODUCTIVE_REASONS = {
+    "out_of_service": "out of service",
+    "has_crew": "no crew assigned",
+    "has_scheduled_pickup": "no call was assigned to it",
+    "engine_on": "the engine never ran",
+    "moved": "it did not move far enough",
+}
+
+# The order the chain actually breaks in: a truck has to be available, then
+# staffed, then given work, then actually go. A vehicle usually fails several
+# of these at once -- an unstaffed truck gets no calls and never starts -- and
+# reporting all four would fragment the grouping into one bucket per
+# combination while burying the thing to act on. So the EARLIEST break is the
+# headline reason, and every failing condition is carried in its own column
+# for anyone who wants the rest. You cannot fix "never started" when the real
+# problem is that nobody dispatched it.
+CONDITION_PRIORITY = ["has_crew", "has_scheduled_pickup", "engine_on", "moved"]
 
 MILES_PER_METER = 0.000621371
 EARTH_RADIUS_MILES = 3958.7613
@@ -483,44 +508,48 @@ def legs_by_vehicle(legs, exclude_cancelled=False):
 # =============================
 # CLASSIFICATION
 # =============================
+def failed_conditions(factors):
+    """
+    Every Productive condition known to be false, earliest break first.
+
+    Separate from `classify` so the verdict can name one thing while the row
+    still carries all of them.
+    """
+    return [name for name in CONDITION_PRIORITY if factors.get(name) is False]
+
+
 def classify(factors):
     """
     (classification, reason) for one vehicle-day.
 
     Three-valued throughout: every factor is True, False, or None for "could
-    not be read", and None never collapses into False. The rules are applied
-    in the order the definition states them, which matters -- Non-Productive
-    is the only one written as an OR, and both of its terms are knowable
-    without Samsara, so it is settled first and never depends on telematics
-    the tenant may not have.
+    not be read", and None never collapses into False.
+
+    A KNOWN FAILURE BEATS AN UNKNOWN. Any Productive condition that is
+    positively false makes the vehicle Non-Productive, whatever else could not
+    be read -- a truck with no call assigned cannot become Productive on the
+    strength of telematics nobody has, so the verdict does not wait for them.
+    That is what keeps Samsara being down from turning the whole fleet into
+    undetermined rows.
+
+    The definition as first written stated Non-Productive as only "no crew or
+    out of service", which left two real cases matching no rule at all: a
+    crewed, in-service truck that moved with no call assigned, and one that
+    never started. Management settled both as Non-Productive, so the rule is
+    now "any Productive condition known to fail". The specific condition is
+    carried in the reason, because those two cases are different operational
+    problems and the totals should still be able to tell them apart.
     """
     if factors.get("out_of_service") is True:
-        return NON_PRODUCTIVE, "out of service"
-    if factors.get("has_crew") is False:
-        return NON_PRODUCTIVE, "no crew assigned"
+        return NON_PRODUCTIVE, NON_PRODUCTIVE_REASONS["out_of_service"]
 
-    # Everything below needs the rest of the inputs. `out_of_service` is
-    # already known to be False and `has_crew` True or None.
-    terms = ["engine_on", "moved", "has_crew", "has_scheduled_pickup"]
-    unreadable = [name for name in terms if factors.get(name) is None]
-    failed = [name for name in terms if factors.get(name) is False]
-
+    failed = failed_conditions(factors)
     if failed:
-        # The inputs were all read and at least one of the Productive
-        # conditions does not hold. Non-Productive does not cover this -- it
-        # is only "no crew" or "out of service" -- and neither does
-        # Indetermined, which requires all four. Say which condition failed
-        # rather than rounding to the nearest bucket.
-        return UNCLASSIFIED, "in service and crewed, but " + " and ".join(
-            {
-                "engine_on": "the engine never ran",
-                "moved": "it did not move far enough",
-                "has_scheduled_pickup": "no call was assigned to it",
-                "has_crew": "no crew was assigned",
-            }[name]
-            for name in failed
-        )
+        return NON_PRODUCTIVE, NON_PRODUCTIVE_REASONS[failed[0]]
 
+    unreadable = [
+        name for name in CONDITION_PRIORITY if factors.get(name) is None
+    ]
     if unreadable:
         return UNDETERMINED, "could not read " + ", ".join(
             {
@@ -609,6 +638,9 @@ def build_rows(ts_vehicles, legs, shifts, stats_rows, sam_index, window_start,
             "out_of_service": oos,
         }
         classification, reason = classify(factors)
+        failed = failed_conditions(factors)
+        if factors["out_of_service"]:
+            failed = ["out_of_service"] + failed
 
         rows.append({
             "day": day.isoformat() if day else None,
@@ -617,6 +649,7 @@ def build_rows(ts_vehicles, legs, shifts, stats_rows, sam_index, window_start,
             "vehicle_status": status,
             "classification": classification,
             "reason": reason,
+            "failed_conditions": ";".join(failed),
             "engine_on": factors["engine_on"],
             "miles": None if miles is None else round(miles, 2),
             "moved": factors["moved"],
@@ -707,30 +740,38 @@ def print_report(rows, orphan_crew, ambiguous, day, min_miles, distance_source,
     if len(pending) > 20:
         print(f"      ... and {len(pending) - 20} more")
 
-    print("\n3. THE VEHICLES NO RULE COVERS")
+    print("\n3. WHY THE NON-PRODUCTIVE ONES ARE NON-PRODUCTIVE")
     print("   " + "-" * 66)
-    unclassified = [r for r in rows if r["classification"] == UNCLASSIFIED]
-    if not unclassified:
+    unproductive = [r for r in rows if r["classification"] == NON_PRODUCTIVE]
+    if not unproductive:
         print("   None.")
     else:
-        print(f"   {len(unclassified)} vehicle(s) match none of the three")
-        print("   definitions. Grouped by why:\n")
+        print("   One verdict, several different problems. Grouped by why:\n")
         for reason, count in Counter(
-            r["reason"] for r in unclassified
+            r["reason"] for r in unproductive
         ).most_common():
             wrapped = textwrap.wrap(reason, 56)
             print(f"      {count:>4}  {wrapped[0]}")
             for line in wrapped[1:]:
                 print(f"            {line}")
         moved_undispatched = [
-            r for r in unclassified if "no call was assigned" in r["reason"]
-            and r["moved"] is True
+            r for r in unproductive
+            if NON_PRODUCTIVE_REASONS["has_scheduled_pickup"] in r["reason"]
+            and r["moved"] is True and r["crew_assigned"] > 0
         ]
         if moved_undispatched:
-            print(f"\n   {len(moved_undispatched)} of those moved more than "
-                  f"{min_miles} mile with no call")
-            print("   assigned -- posting, repositioning or a maintenance run. The")
-            print("   current Daily Vehicle Overview cannot see these at all.")
+            plural = "was" if len(moved_undispatched) == 1 else "were"
+            print(f"\n   {len(moved_undispatched)} of those {plural} crewed and "
+                  f"moved more than {min_miles} mile")
+            print("   with no call assigned -- posting, repositioning or a")
+            print("   maintenance run. Crew hours and fuel spent, nothing")
+            print("   dispatched. The current Daily Vehicle Overview cannot see")
+            print("   these at all; it reads them as simply unused.")
+            for row in moved_undispatched[:15]:
+                print(f"      {str(row['vehicle_name'])[:20]:<22}"
+                      f"{row['crew_assigned']} crew  {row['miles']} mi")
+            if len(moved_undispatched) > 15:
+                print(f"      ... and {len(moved_undispatched) - 15} more")
 
     print("\n4. WHAT COULD NOT BE READ")
     print("   " + "-" * 66)

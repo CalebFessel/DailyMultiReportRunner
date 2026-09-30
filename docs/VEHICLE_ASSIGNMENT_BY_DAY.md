@@ -57,26 +57,94 @@ too does not take the day away.
 
 ## Whose vehicles count as Boardman's
 
-This is the hard part, and it bounds the whole answer. **Cost center is on
-neither vehicles nor trips** — only on employees — so the fleet has to be
-assembled, and the not-assigned list is only ever as complete as that
-assembly.
+This is the hard part, and it bounds the whole answer.
 
-The trap: a truck that sat idle for the whole of July ran no legs in July, so
-defining the fleet from July's own assignments would make **exactly the
-vehicle being asked about** invisible.
+**It is not dispatch subzone.** Nothing in this report reads `dispatch_subzone`
+or `response_subzone`. Attribution runs through the shift profile:
+
+```
+trip leg -> shift_name -> the crew who staffed that profile -> employee.cost_center_name
+```
+
+accumulated into `state/shift_cost_center_map.json` by the daily run, resolved
+by the repository's own `CostCenterMap`.
+
+**But the concern behind the question is right, for a different reason.** That
+chain answers *where did this truck work*. It is being read as *where does this
+truck belong*, and the two come apart exactly when it matters — a unit covering
+a neighbouring station for a week, a truck that ran nothing at all.
+
+And there is no better field to switch to inside Traumasoft. Cost center is not
+on a vehicle, and **not on a shift profile either**:
+`Lists/Schedule/ShiftProfiles` returns a generic list item — `id` and `name`,
+nothing more. Cost center appears on employees, and in the
+division/district/group tree from `Data/Organization`, where a district can
+span several cost centers. That is the whole surface.
+
+### Samsara tags: ownership instead of inference
+
+Samsara returns tags on its vehicle list. **If** those tags carry the station,
+they are a statement of ownership rather than an inference from behaviour, and
+they cover a vehicle that never moved.
+
+Whether they do is not assumed. Run the probe first:
+
+```
+python probe_samsara_tags.py
+```
+
+Section 2 is the tag vocabulary, section 4 the Traumasoft×Samsara join that
+bounds everything else, section 5 the tags per unit, section 6 which tags look
+like cost center names. If the answer is yes:
+
+```
+python build_vehicle_cost_centers.py --compare-days 30
+python vehicle_assignment_by_day.py --cost-center Boardman --month 2026-07 \
+    --vehicle-cost-centers
+```
+
+The generator writes `state/vehicle_cost_centers.json` and, before it does,
+**compares the tag answer against the behaviour-derived one**. That comparison
+is the point: agreement is reassurance, and each disagreement is either a truck
+filed under the wrong station in every report built so far, or a tag nobody
+kept up to date. Both are worth settling before the file is used.
+
+Two things it refuses to do:
+
+- A vehicle whose tags name **two** stations is left unset, not assigned to one.
+  A roster that looks authoritative and is partly invented is worse than no
+  roster.
+- Tags are matched by exact name, and by name ignoring the legal-entity wrapper
+  (`Parma Heights` finds `Lynx EMS LLC dba Lynx Parma Heights`). **No substring
+  pass.** A tag is a short label, and substring-matching short labels is how
+  `Columbus` claims Columbus Ohio and Columbus Indiana at once. Tags that say
+  the same thing in different words go in `state/tag_cost_center_map.json`.
+
+**The tags are current, not historical.** Using them for July assumes no vehicle
+changed station since. That is a far safer assumption for ownership than for
+behaviour, but it is still one, and the generated file records its build date so
+a reader can judge it.
+
+### The source ladder
 
 Sources, best first, each labelled per row in `in_fleet_because`:
 
-1. **Ran a leg for this cost center during the period.** Strongest.
-2. **Ran one in a lookback window before it** (`--lookback-days`, default 60).
-3. **Its live `shift_name` maps to this cost center.** Today's shift, not July's.
-4. **Named in `--roster`** — a JSON list of unit names. The only source that
-   cannot miss a truck which has not moved in months.
+| | Source | Says |
+| --- | --- | --- |
+| 0 | `--vehicle-cost-centers` (Samsara tags) | where it **belongs** |
+| 1 | Ran a leg for this cost center during the period | where it worked |
+| 2 | Ran one in the lookback (`--lookback-days`, default 60) | where it worked |
+| 3 | Its live `shift_name` maps here | where it works today |
+| 4 | Named in `--roster` | a decision |
 
-Section 2 breaks the fleet down by which source placed each vehicle. If no
-roster file is given, the report says so and explains what it may therefore be
-missing.
+The map wins outright where it speaks, and is silent where it has no entry —
+those vehicles fall back to the ladder below it. **A vehicle the map places at
+another station is excluded even if it ran legs here**, which is the point: a
+Cincinnati truck that covered Boardman for a week is Cincinnati's, and letting
+its behaviour override the map would put us back where we started.
+
+Section 2 of the report breaks the fleet down by which source placed each
+vehicle, and says so when it is leaning on inference.
 
 ## The cost center name
 

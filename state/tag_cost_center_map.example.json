@@ -1,0 +1,27 @@
+{
+  "note": [
+    "Samsara tag -> Traumasoft cost center, for tags a name match cannot reach.",
+    "",
+    "build_vehicle_cost_centers.py already matches a tag to a cost center by",
+    "exact name, and by name ignoring the legal-entity wrapper, so",
+    "'Parma Heights' finds 'Lynx EMS LLC dba Lynx Parma Heights' on its own.",
+    "This file is only for tags that say the same thing in different words --",
+    "a radio designator, a station code, an old name.",
+    "",
+    "DELIBERATELY NO SUBSTRING MATCHING. A tag is a short label, and",
+    "substring-matching short labels is how 'Columbus' claims Columbus Ohio",
+    "and Columbus Indiana at once. An entry here is a decision; a substring",
+    "hit would be an accident.",
+    "",
+    "Run probe_samsara_tags.py first. Its section 2 prints the real tag",
+    "vocabulary and section 6 shows which tags already look like cost center",
+    "names -- everything left over belongs here.",
+    "",
+    "Copy to state/tag_cost_center_map.json to put it in effect."
+  ],
+  "tags": {
+    "YO": "Boardman",
+    "Mahoning Valley": "Boardman",
+    "CIN": "Cincinnati"
+  }
+}

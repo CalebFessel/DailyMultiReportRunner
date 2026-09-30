@@ -34,11 +34,21 @@ that sat idle for the whole of July ran no legs in July, so defining the fleet
 from July's assignments alone would make exactly the vehicle being asked about
 invisible. Sources, best first, each labelled per row:
 
+    0. a vehicle -> cost center map (--vehicle-cost-centers), built from
+       Samsara's vehicle tags by build_vehicle_cost_centers.py. This is the
+       only source that states where a truck BELONGS rather than inferring it
+       from where it worked, and it covers a vehicle that never moved
     1. ran a leg for this cost center during the period
     2. ran one in a lookback window before it (--lookback-days)
     3. its live shift_name maps to this cost center
-    4. named in a roster file (--roster), which is the only source that
-       cannot miss a truck that has not moved in months
+    4. named in a roster file (--roster)
+
+Sources 1 to 3 all reduce to the same chain -- shift profile, then the crew
+who staffed it, then their employee cost_center_name -- because Traumasoft
+puts no cost center on a vehicle and none on a shift profile either. That
+chain answers "where did this truck work", which is not the same question,
+and comes apart exactly when it matters: a unit covering a neighbouring
+station for a week, or a truck that ran nothing at all.
 
 STRICTLY READ-ONLY. GETs only.
 
@@ -166,7 +176,7 @@ def legs_by_vehicle_day(legs, centres, cost_center_map):
 
 
 def build_fleet(period_activity, lookback_activity, roster_names, roster_vehicles,
-                centres, cost_center_map):
+                centres, cost_center_map, vehicle_centres=None):
     """
     normalized vehicle -> how it was placed in this cost center's fleet.
 
@@ -176,26 +186,46 @@ def build_fleet(period_activity, lookback_activity, roster_names, roster_vehicle
     discount the weak ones rather than discovering them later.
     """
     placed = {}
+    # An explicit vehicle -> cost center map wins outright. It is a statement
+    # of ownership, and every source below it is an inference from behaviour.
+    for name, centre in (vehicle_centres or {}).items():
+        if centre in centres:
+            placed[name] = "its cost center map entry says so"
+
     for name, days in period_activity.items():
+        if name in placed:
+            continue
         if any(centre in centres for day in days.values() for centre in day):
             placed[name] = "ran for it this period"
 
+    # A vehicle the map places at ANOTHER station is excluded outright, even
+    # if it ran legs here. That is the point of having the map: a truck that
+    # covered Boardman for a week belongs to wherever it belongs, and letting
+    # its behaviour override the map would put us back where we started.
+    elsewhere = {
+        name for name, centre in (vehicle_centres or {}).items()
+        if centre not in centres
+    }
+    for name in elsewhere:
+        placed.pop(name, None)
+
     for name, days in (lookback_activity or {}).items():
-        if name in placed:
+        if name in placed or name in elsewhere:
             continue
         if any(centre in centres for day in days.values() for centre in day):
             placed[name] = "ran for it before the period"
 
     for vehicle in roster_vehicles or []:
         name = VS.normalize_name(vehicle.get("name"))
-        if not name or name in placed:
+        if not name or name in placed or name in elsewhere:
             continue
         centre = cost_center_map.resolve(str(vehicle.get("shift_name") or "").strip())
         if centre in centres:
             placed[name] = "its live shift says so"
 
     for name in roster_names or ():
-        placed.setdefault(name, "named in the roster file")
+        if name not in elsewhere:
+            placed.setdefault(name, "named in the roster file")
     return placed
 
 
@@ -345,11 +375,20 @@ def print_report(centre_label, matched, how, days, covered_days, grid, names,
         print(f"   {reason:<34}{count:>9}")
     print(f"   {'':<34}{'-' * 9:>9}")
     print(f"   {'total':<34}{len(fleet):>9}")
+    inferred = {"ran for it this period", "ran for it before the period",
+                "its live shift says so"}
+    if any(r in inferred for r in fleet.values()):
+        print("\n   The sources above marked 'ran for' or 'live shift' all reduce")
+        print("   to the same chain -- shift profile, the crew who staffed it,")
+        print("   their cost center -- which says where a truck WORKED, not")
+        print("   where it belongs. build_vehicle_cost_centers.py turns Samsara's")
+        print("   vehicle tags into a map that states ownership instead; pass it")
+        print("   with --vehicle-cost-centers.")
     if not any(r == "named in the roster file" for r in fleet.values()):
-        print("\n   No roster file. A truck that sat idle for the whole period ran")
-        print("   no legs in it, so it can only be here via the lookback or its")
-        print("   live shift -- and if it has neither, it is missing from the")
-        print("   not-assigned list entirely. --roster is the fix.")
+        print("\n   No roster file either. A truck that sat idle for the whole")
+        print("   period ran no legs in it, so without a map or a roster it can")
+        print("   only be here via its live shift -- and if it has none, it is")
+        print("   missing from the not-assigned list entirely.")
 
     print(f"\n3. BY DAY")
     print("   " + "-" * 66)
@@ -446,6 +485,12 @@ def main(argv=None):
                         help='JSON list of this station\'s vehicle names, or '
                              '{"vehicles": [...]}. The only source that catches '
                              "a truck which has not moved in months.")
+    parser.add_argument("--vehicle-cost-centers",
+                        nargs="?", const="state/vehicle_cost_centers.json",
+                        help="A vehicle -> cost center map, built from Samsara "
+                             "tags by build_vehicle_cost_centers.py. The only "
+                             "source that says where a truck belongs rather "
+                             "than where it worked.")
     parser.add_argument("--cost-center-map", default="state/shift_cost_center_map.json")
     parser.add_argument("--list-cost-centers", action="store_true",
                         help="Print every cost center the period's legs resolve "
@@ -505,8 +550,18 @@ def main(argv=None):
     lookback_activity, _, _ = legs_by_vehicle_day(
         lookback_legs, centres, cost_center_map)
 
+    vehicle_centres = {}
+    if args.vehicle_cost_centers:
+        import build_vehicle_cost_centers as BV
+        vehicle_centres = BV.load_vehicle_cost_centers(args.vehicle_cost_centers)
+        if not vehicle_centres:
+            log.warning("No vehicle -> cost center map at %s. Falling back to "
+                        "inferring each truck's station from the shift profiles "
+                        "it ran under.", args.vehicle_cost_centers)
+
     fleet = build_fleet(period_activity, lookback_activity, load_roster(args.roster),
-                        roster_vehicles, centres, cost_center_map)
+                        roster_vehicles, centres, cost_center_map,
+                        vehicle_centres=vehicle_centres)
     days = VS.days_in(start, end)
     grid = build_grid(fleet, period_activity, days, covered_days, centres)
     names = display_names(fleet, period_activity, lookback_activity,

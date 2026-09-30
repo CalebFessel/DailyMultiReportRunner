@@ -1,0 +1,37 @@
+{
+  "note": [
+    "vehicle name -> cost center. Normally generated, always hand-editable.",
+    "",
+    "    python probe_samsara_tags.py            # do the tags carry the station?",
+    "    python build_vehicle_cost_centers.py    # then build this",
+    "",
+    "Traumasoft puts no cost center on a vehicle, and none on a shift profile",
+    "either -- Lists/Schedule/ShiftProfiles returns id and name and nothing",
+    "else. Without this file every report infers a truck's station from the",
+    "shift profile it ran legs under, then the crew who staffed that profile,",
+    "then their employee cost_center_name. That answers where the truck",
+    "WORKED. It is read as where the truck BELONGS, and the two come apart",
+    "exactly when it matters: a unit covering a neighbouring station for a",
+    "week, or a truck that ran nothing at all.",
+    "",
+    "THE TAGS ARE CURRENT, NOT HISTORICAL. Using this for a past month assumes",
+    "no vehicle changed station since it was built. The generated file records",
+    "its build date so that can be judged.",
+    "",
+    "A vehicle the generator could not resolve is absent rather than guessed,",
+    "and callers fall back to inferring as before. Add those by hand -- either",
+    "shape below works, and rebuilding refuses to overwrite without",
+    "--overwrite.",
+    "",
+    "Copy to state/vehicle_cost_centers.json to put it in effect."
+  ],
+  "vehicles": {
+    "A-101": {
+      "vehicle_name": "A-101",
+      "cost_center": "Boardman",
+      "source": "exact name: Boardman"
+    },
+    "WC-21": "Boardman",
+    "A-205": "Cincinnati"
+  }
+}

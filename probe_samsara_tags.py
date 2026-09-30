@@ -253,7 +253,38 @@ def report_join(ts_vehicles, sam_vehicles, out):
     print(f"   {len(ts_names)} Traumasoft unit(s), {len(sam_vehicles)} Samsara vehicle(s).")
     print(f"   Matched {len(matched)}   unmatched {len(unmatched)}   "
           f"ambiguous {len(ambiguous)}   "
-          f"({pct(len(matched), len(ts_names)).strip()} joined)\n")
+          f"({pct(len(matched), len(ts_names)).strip()} joined)")
+
+    # That percentage is over the RAW list, which on this tenant is mostly
+    # iPads and retired trucks -- it reads far worse than the join really is.
+    # The number that matters is the join across the roster the fleet sheets
+    # actually see, so it is computed here rather than left to be inferred
+    # from section 9.
+    try:
+        import traumasoft_reports as R
+        exclusions = R.VehicleExclusions()
+        live = [
+            v for v in ts_vehicles
+            if not (R._is_truthy_flag(v.get("deleted"))
+                    or R._is_truthy_flag(v.get("disabled")))
+            and v.get("vehicle_status") not in R.NON_FLEET_STATUSES
+            and not exclusions.excludes(v)
+        ]
+        live_names = sorted({str(v.get("name") or "").strip() for v in live} - {""})
+        live_matched = [n for n in live_names if n in matched]
+        print(f"\n   Across the {len(live_names)} unit(s) that reach the fleet sheets "
+              f"(section 9):")
+        print(f"   Matched {len(live_matched)}   unmatched "
+              f"{len(live_names) - len(live_matched)}   "
+              f"({pct(len(live_matched), len(live_names)).strip()} joined)")
+        missing = [n for n in live_names if n not in matched]
+        if missing:
+            print(f"   These are the ones that actually matter:")
+            print("      " + ", ".join(missing)[:220])
+    except Exception as exc:  # noqa: BLE001 -- the raw figure above still stands
+        log.info("Could not scope the join to the fleet sheets (%s).", exc)
+        live_names, live_matched = [], []
+    print()
 
     if unmatched:
         print(f"   No Samsara vehicle ({len(unmatched)}):")
@@ -268,6 +299,8 @@ def report_join(ts_vehicles, sam_vehicles, out):
         print(f"\n   Fix in {SR.VEHICLE_OVERRIDES_FILE}")
 
     out["join"] = {
+        "fleet_sheet_units": len(live_names),
+        "fleet_sheet_matched": len(live_matched),
         "traumasoft_units": len(ts_names),
         "samsara_vehicles": len(sam_vehicles),
         "matched": {k: v.get("name") for k, v in matched.items()},
@@ -277,19 +310,52 @@ def report_join(ts_vehicles, sam_vehicles, out):
     return matched
 
 
-def report_tags_per_unit(ts_vehicles, matched, out):
+def station_matches(tag, centre):
     """
-    The table the whole probe exists for: each unit, its status, its tags.
+    Whether a tag names this cost center.
 
-    Ordered by Traumasoft name so a naming convention -- if the tags follow
+    Exact, then ignoring the legal-entity wrapper. NO substring pass: on this
+    tenant that would have `Indiana` claim `Indianapolis`, and `Columbus`
+    claim two states. The near-misses this tenant actually has --
+    Ellicott/Ellicott City, Newburgh/Newburg, Parma Heights/Parma -- are
+    deliberately left to state/tag_cost_center_map.json, because each is a
+    decision about which station a tag means and a substring rule would make
+    the same call for a pair that is genuinely two places.
+    """
+    tag, centre = str(tag or "").strip(), str(centre or "").strip()
+    if not tag or not centre:
+        return False
+    if tag.lower() == centre.lower():
+        return True
+    return normalize(tag) == normalize(centre) and bool(normalize(tag))
+
+
+def report_tags_per_unit(ts_vehicles, matched, out, centres=None):
+    """
+    The table the whole probe exists for: each unit and the station its tags name.
+
+    The first version of this printed the raw tag list truncated to fit, and
+    that hid the answer. Samsara returns tags alphabetically and this tenant
+    tags almost everything `In Service (TraumaSoft)`, so any station later in
+    the alphabet -- Massillon, Ohio, Parma, Sandusky, Shelby, Toledo -- was
+    pushed off the end of the line. Half the fleet read as having no station
+    tag when it had one all along.
+
+    So the station is resolved into its own column, by the same rule
+    build_vehicle_cost_centers uses, and the remaining tags follow. A unit
+    whose tags name two stations says so rather than showing the first one
+    that fits.
+
+    Ordered by Traumasoft name, so a naming convention -- if the tags follow
     one -- is visible down the column rather than having to be inferred.
     """
     print("\n5. TAGS PER TRAUMASOFT UNIT")
     print("   " + "-" * 66)
-    print(f"   {'Traumasoft unit':<22}{'status':<20}{'Samsara tags'}")
-    print("   " + "-" * 72)
+    print(f"   {'Traumasoft unit':<22}{'status':<18}{'station from tags':<20}{'other tags'}")
+    print("   " + "-" * 78)
 
-    rows = []
+    centres = sorted(centres or ())
+    rows, resolved_count, ambiguous, unstationed = [], 0, [], []
     for vehicle in sorted(ts_vehicles, key=lambda v: str(v.get("name") or "")):
         name = str(vehicle.get("name") or "").strip()
         if not name:
@@ -297,35 +363,55 @@ def report_tags_per_unit(ts_vehicles, matched, out):
         status = str(vehicle.get("vehicle_status") or "-")
         sam = matched.get(name)
         if sam is None:
-            tags_text = "-- no Samsara match --"
-            tags = None
+            print(f"   {name[:21]:<22}{status[:17]:<18}{'-- no Samsara match --':<20}")
+            rows.append({"name": name, "vehicle_status": vehicle.get("vehicle_status"),
+                         "samsara_name": None, "tags": None, "station": None})
+            continue
+
+        tags = [t for t, _ in tag_entries(sam)]
+        hits = sorted({c for c in centres for t in tags if station_matches(t, c)})
+        if len(hits) == 1:
+            station, resolved_count = hits[0], resolved_count + 1
+        elif hits:
+            station = "AMBIGUOUS: " + "/".join(hits)
+            ambiguous.append((name, hits))
         else:
-            tags = [t for t, _ in tag_entries(sam)]
-            tags_text = ", ".join(tags) if tags else "(none)"
-        print(f"   {name[:21]:<22}{status[:19]:<20}{tags_text[:34]}")
-        rows.append({
-            "name": name,
-            "vehicle_status": vehicle.get("vehicle_status"),
-            "samsara_name": sam.get("name") if sam else None,
-            "tags": tags,
-        })
+            station = "-- none --"
+            unstationed.append(name)
+        others = [t for t in tags
+                  if not any(station_matches(t, c) for c in centres)]
+        print(f"   {name[:21]:<22}{status[:17]:<18}{station[:19]:<20}"
+              f"{', '.join(others)[:28]}")
+        rows.append({"name": name, "vehicle_status": vehicle.get("vehicle_status"),
+                     "samsara_name": sam.get("name"), "tags": tags,
+                     "station": hits[0] if len(hits) == 1 else None,
+                     "station_candidates": hits})
+
+    print(f"\n   Resolved to exactly one station: {resolved_count}")
+    if ambiguous:
+        print(f"   Tags name more than one ({len(ambiguous)}) -- these cannot be")
+        print("   placed without a decision:")
+        for name, hits in ambiguous:
+            print(f"      {name[:22]:<24}{'/'.join(hits)}")
+    if unstationed:
+        print(f"   Matched in Samsara but no station tag ({len(unstationed)}):")
+        print("      " + ", ".join(unstationed[:25])[:220])
+
     out["units"] = rows
+    out["station_summary"] = {
+        "resolved": resolved_count,
+        "ambiguous": {name: hits for name, hits in ambiguous},
+        "no_station_tag": unstationed,
+    }
 
 
-def report_tags_vs_cost_centers(api, tag_counts, out):
+def fetch_cost_centers(api):
     """
-    Whether the tag vocabulary can be mapped onto Traumasoft's cost centers.
+    Every cost center name Traumasoft knows, from where they actually live.
 
-    The cost center names come from the employee roster, which is where they
-    actually live -- there is no vehicle-side source, which is the whole
-    reason for this probe. The matching here is deliberately crude: it exists
-    to show whether a mapping is plausible, not to be the mapping. That file
-    should be written by hand, the way the region and override files are,
-    because a tag quietly claiming the wrong station is the failure mode.
+    Hoisted out of section 6 so section 5 can resolve a station too: without
+    it that table could only print raw tags, which is what hid the answer.
     """
-    print("\n6. TAGS vs TRAUMASOFT COST CENTERS")
-    print("   " + "-" * 66)
-
     centres = set()
     try:
         for employee in api.list_employees():
@@ -344,7 +430,24 @@ def report_tags_vs_cost_centers(api, tag_counts, out):
                 centres.add(str(name).strip())
     except (TraumasoftAPIError, AttributeError) as exc:
         log.info("Cost center list unavailable (%s); employee roster only.", exc)
+    return centres
 
+
+def report_tags_vs_cost_centers(api, tag_counts, out, centres=None):
+    """
+    Whether the tag vocabulary can be mapped onto Traumasoft's cost centers.
+
+    The cost center names come from the employee roster, which is where they
+    actually live -- there is no vehicle-side source, which is the whole
+    reason for this probe. The matching here is deliberately crude: it exists
+    to show whether a mapping is plausible, not to be the mapping. That file
+    should be written by hand, the way the region and override files are,
+    because a tag quietly claiming the wrong station is the failure mode.
+    """
+    print("\n6. TAGS vs TRAUMASOFT COST CENTERS")
+    print("   " + "-" * 66)
+
+    centres = set(centres or ()) or fetch_cost_centers(api)
     if not centres:
         print("   No cost center names available to compare against.")
         out["cost_centers"] = []
@@ -359,19 +462,37 @@ def report_tags_vs_cost_centers(api, tag_counts, out):
         out["cost_centers"] = sorted(centres)
         return
 
-    print(f"\n   {'cost center':<34}{'candidate tag(s)'}")
-    print("   " + "-" * 66)
-    pairs = {}
+    # A tag that matches outright is usable as it stands. A tag that only
+    # matches loosely is a DECISION -- which station does `Parma` mean, is
+    # `Newburg` the same place as `Newburgh` -- and those go in a
+    # hand-written map, so they are separated here rather than presented as
+    # equally good candidates.
+    print(f"\n   {'cost center':<26}{'matches outright':<20}{'near miss -- needs a rule'}")
+    print("   " + "-" * 74)
+    pairs, near = {}, {}
     for centre in sorted(centres):
         key = normalize(centre)
-        hits = [
+        exact = [tag for tag in tag_counts if station_matches(tag, centre)]
+        loose = [
             tag for tag in tag_counts
-            if key and normalize(tag) and (
+            if tag not in exact and key and normalize(tag) and (
                 key in normalize(tag) or normalize(tag) in key
             )
         ]
-        pairs[centre] = hits
-        print(f"   {centre[:33]:<34}{', '.join(hits)[:32] if hits else '-- none --'}")
+        pairs[centre] = exact
+        if loose:
+            near[centre] = loose
+        print(f"   {centre[:25]:<26}{(', '.join(exact) or '--')[:19]:<20}"
+              f"{', '.join(loose)[:28]}")
+
+    if near:
+        print(f"\n   {len(near)} cost center(s) have only a near miss. Each needs a line")
+        print("   in state/tag_cost_center_map.json -- a substring rule would make")
+        print("   the same call for a pair that is genuinely two places:\n")
+        for centre, tags in sorted(near.items()):
+            for tag in tags:
+                print(f'      "{tag}": "{centre}"')
+    out["near_misses"] = near
 
     unclaimed = [t for t in tag_counts if not any(t in h for h in pairs.values())]
     if unclaimed:
@@ -702,8 +823,9 @@ def main(argv=None):
     tag_counts = report_tag_vocabulary(sam_vehicles, out)
     report_attributes(sam_vehicles, out)
     matched = report_join(ts_vehicles, sam_vehicles, out)
-    report_tags_per_unit(ts_vehicles, matched, out)
-    report_tags_vs_cost_centers(api, tag_counts or Counter(), out)
+    centres = fetch_cost_centers(api)
+    report_tags_per_unit(ts_vehicles, matched, out, centres=centres)
+    report_tags_vs_cost_centers(api, tag_counts or Counter(), out, centres=centres)
     report_vehicle_status(ts_vehicles, out)
     report_vin_join(ts_vehicles, sam_vehicles, out)
     report_traumasoft_roster(ts_vehicles, out)

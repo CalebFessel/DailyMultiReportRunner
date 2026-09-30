@@ -72,17 +72,27 @@ def tag_names(vehicle):
     return names
 
 
-def attribute_values(vehicle):
-    """
-    Samsara's other free-form slot, read the same way as tags.
+# Attribute names worth reading for a station. Some fleets put the station in
+# an attribute rather than a tag, and only looking at tags would report an
+# empty answer on a tenant that had the data all along.
+#
+# An ALLOWLIST rather than every attribute, because this tenant's attributes
+# are `Asset Status` (Active / Out of Service), `Unit Type` (Secure Car /
+# Wheelchair / BLS) and `Vehicle Status` (Retired). Feeding those values into
+# a cost-center matcher is asking for the day somebody names a station
+# something that collides with one of them.
+STATION_ATTRIBUTES = ("station", "location", "base", "cost center",
+                      "costcenter", "garage", "domicile", "market")
 
-    Some fleets put the station in an attribute rather than a tag, and a
-    script that only looked at tags would report an empty answer on a tenant
-    that had the data all along.
-    """
+
+def attribute_values(vehicle, attribute_names=STATION_ATTRIBUTES):
+    """Values from the attributes that plausibly name a station."""
     values = []
     for attr in vehicle.get("attributes") or []:
         if not isinstance(attr, dict):
+            continue
+        name = str(attr.get("name") or "").strip().lower()
+        if not any(marker in name for marker in attribute_names):
             continue
         for value in attr.get("stringValues") or []:
             text = str(value).strip()

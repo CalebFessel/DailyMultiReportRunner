@@ -482,3 +482,45 @@ def test_a_vehicle_no_longer_in_the_fleet_has_no_live_shift_to_fall_back_on():
     )
     assert rows[0]["vehicle_name"] == "A-999"
     assert rows[0]["cost_center"] == "UNKNOWN"
+
+
+# =============================
+# RECORDS THE SERVER SHOULD NOT HAVE SENT
+# =============================
+def test_a_deleted_record_does_not_become_a_second_row_for_one_truck():
+    """
+    The list call asks the server to omit deleted records and the server does
+    not honour it -- 31 came back on this tenant. Left in, A-101 arrives twice
+    and the fleet is counted twice.
+    """
+    live = vehicle("A-101")
+    ghost = vehicle("A-101")
+    ghost["deleted"] = True
+    snapshots = snapshot((1, []))
+    rows, _, _ = S.build_rows(
+        snapshots, [live, ghost], [], FakeMap({}), *JULY,
+        S.parse_class_patterns("AMB=a-"),
+    )
+    assert len(rows) == 1
+
+
+def test_a_disabled_record_is_dropped_too():
+    disabled = vehicle("A-101")
+    disabled["disabled"] = "1"
+    rows, _, _ = S.build_rows(
+        snapshot((1, [])), [disabled], [], FakeMap({}), *JULY,
+        S.parse_class_patterns("AMB=a-"),
+    )
+    assert rows == []
+
+
+def test_which_live_record_wins_is_deterministic():
+    """Whichever way round, the same period has to read the same from one run
+    to the next."""
+    first = vehicle("A-101", status="In Service")
+    second = vehicle("A-101", status="Out of Service")
+    snapshots = snapshot((1, []))
+    rules = S.parse_class_patterns("AMB=a-")
+    a, _, _ = S.build_rows(snapshots, [first, second], [], FakeMap({}), *JULY, rules)
+    b, _, _ = S.build_rows(snapshots, [first, second], [], FakeMap({}), *JULY, rules)
+    assert len(a) == 1 and a[0]["current_status"] == b[0]["current_status"]

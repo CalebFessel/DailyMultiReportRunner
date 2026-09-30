@@ -598,15 +598,32 @@ def build_rows(ts_vehicles, legs, shifts, stats_rows, sam_index, window_start,
     # not a row to drop silently.
     seen_crew_names = set()
 
-    rows = []
+    rows, collisions = [], defaultdict(list)
     for vehicle in ts_vehicles:
         status = str(vehicle.get("vehicle_status") or "").strip()
         if not include_non_fleet and status in NON_FLEET_STATUSES:
+            continue
+        # The list call asks the server to omit deleted and disabled records
+        # and the server does not honour it -- probe_samsara_tags measured 31
+        # deleted records coming back on this tenant despite
+        # include_deleted=false. Left in, each one became a second row for a
+        # truck that already had one: A-101 appearing as both In Service and
+        # Out of Service, counted twice, one of them non-productive. Same
+        # filter chain as traumasoft_reports._fleet_partition.
+        if _is_truthy_flag(vehicle.get("deleted")) \
+                or _is_truthy_flag(vehicle.get("disabled")):
             continue
 
         ts_id = str(vehicle.get("id"))
         name = vehicle.get("name")
         norm = normalize_name(name)
+        if norm in collisions:
+            # Two live records for one unit name. The filter above resolves
+            # every case this tenant has, so reaching here means a new one --
+            # reported rather than silently doubling the fleet.
+            collisions[norm].append(name)
+            continue
+        collisions[norm].append(name)
         seen_crew_names.add(norm)
 
         crew_entry = crew.get(norm, {"crew": 0, "punched": 0, "shifts": 0})
@@ -666,6 +683,14 @@ def build_rows(ts_vehicles, legs, shifts, stats_rows, sam_index, window_start,
         })
 
     orphan_crew = sorted(set(crew) - seen_crew_names)
+    duplicated = {k: v for k, v in collisions.items() if len(v) > 1}
+    if duplicated:
+        log.warning(
+            "%s unit name(s) had more than one live vehicle record; the first "
+            "was kept and the rest dropped: %s",
+            len(duplicated),
+            ", ".join(sorted(duplicated)),
+        )
     return rows, orphan_crew
 
 

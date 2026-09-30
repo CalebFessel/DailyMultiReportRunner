@@ -687,3 +687,32 @@ def test_a_narrower_x_window_shortens_the_window_only():
     )
     assert end - start == timedelta(hours=12)
     assert V.parse_ts(fetch_from) == start - timedelta(hours=24)
+
+
+def test_a_deleted_record_does_not_double_count_a_truck():
+    """
+    The server returns deleted records despite include_deleted=false -- 31 on
+    this tenant. Left in, A-101 arrived as both In Service and Out of Service
+    and was counted twice, one of them non-productive.
+    """
+    live = vehicle(7, "A-101")
+    ghost = vehicle(8, "A-101")
+    ghost["deleted"] = True
+    rows, _ = V.build_rows(
+        [live, ghost], [], [],
+        stats_rows=[], sam_index={}, window_start=DAY_START, window_end=DAY_END,
+        zone=EASTERN, day=DAY_START.date(),
+    )
+    assert len(rows) == 1
+    assert rows[0]["out_of_service"] is False
+
+
+def test_a_disabled_record_is_dropped_not_marked_out_of_service():
+    disabled = vehicle(7, "A-101")
+    disabled["disabled"] = "1"
+    rows, _ = V.build_rows(
+        [disabled], [], [],
+        stats_rows=[], sam_index={}, window_start=DAY_START, window_end=DAY_END,
+        zone=EASTERN, day=DAY_START.date(),
+    )
+    assert rows == []

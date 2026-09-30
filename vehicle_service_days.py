@@ -220,6 +220,22 @@ def normalize_name(value):
     return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
 
 
+def _is_truthy_flag(value):
+    """
+    Whether an API boolean is set.
+
+    These come back as real booleans on some endpoints and as "0"/"1" or
+    "true"/"false" strings on others, so a bare truth test would treat the
+    string "0" as set. Same rule as traumasoft_reports._is_truthy_flag;
+    defined here so this module stays importable without pandas.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "y")
+
+
 # =============================
 # COST CENTRE
 # =============================
@@ -281,9 +297,20 @@ def build_rows(snapshots, roster, legs, cost_center_map, start, end, class_rules
         status = str(vehicle.get("vehicle_status") or "").strip()
         if not include_non_fleet and status in NON_FLEET_STATUSES:
             continue
+        # The server returns deleted records despite include_deleted=false --
+        # 31 of them on this tenant, measured by probe_samsara_tags. Left in,
+        # one of them could win the name and hand the whole period the wrong
+        # current status. Same filter chain as
+        # traumasoft_reports._fleet_partition.
+        if _is_truthy_flag(vehicle.get("deleted")) \
+                or _is_truthy_flag(vehicle.get("disabled")):
+            continue
         name = normalize_name(vehicle.get("name"))
         if name:
-            by_name[name] = vehicle
+            # First live record wins rather than last: whichever way round,
+            # the choice has to be deterministic, or the same period reads
+            # differently from one run to the next.
+            by_name.setdefault(name, vehicle)
 
     # Vehicles the archive saw that the roster no longer carries.
     archived_only = {}

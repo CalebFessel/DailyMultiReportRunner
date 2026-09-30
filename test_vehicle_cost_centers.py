@@ -346,3 +346,45 @@ def test_a_bare_tag_map_ignores_non_string_values(tmp_path):
     path = tmp_path / "bare.json"
     path.write_text(json.dumps({"note": ["prose"], "YO-1": "Boardman"}))
     assert BV.load_tag_map(str(path)) == {"yo-1": "Boardman"}
+
+
+def test_an_unrelated_attribute_is_not_fed_to_the_station_matcher():
+    """
+    This tenant's attributes are Asset Status, Unit Type and Vehicle Status.
+    Feeding 'Active' or 'Secure Car' into a cost-center matcher is asking for
+    the day a station is named something that collides with one of them.
+    """
+    vehicle = {"attributes": [
+        {"name": "Asset Status", "stringValues": ["Out of Service"]},
+        {"name": "Unit Type", "stringValues": ["Secure Car"]},
+        {"name": "Vehicle Status", "stringValues": ["Retired"]},
+    ]}
+    assert BV.attribute_values(vehicle) == []
+
+
+def test_a_station_shaped_attribute_is_still_read():
+    for label in ("Station", "Home Base", "Cost Center", "Primary Location"):
+        vehicle = {"attributes": [{"name": label, "stringValues": ["Boardman"]}]}
+        assert BV.attribute_values(vehicle) == ["Boardman"], label
+
+
+def test_the_real_near_misses_on_this_fleet_resolve_through_the_tag_map():
+    """
+    Ellicott City / Ellicott, Newburg / Newburgh, Parma / Parma Heights are
+    what probe_samsara_tags section 6 actually found. None of them matches on
+    name, and none of them should be reached by a substring rule.
+    """
+    centres = ["Ellicott", "Newburgh", "Parma Heights"]
+    for tag in ("Ellicott City", "Newburg", "Parma"):
+        assert BV.resolve_label(tag, centres, {})[0] is None, tag
+    tag_map = BV.load_tag_map("state/tag_cost_center_map.example.json")
+    for tag, expected in (("Ellicott City", "Ellicott"),
+                          ("Newburg", "Newburgh"),
+                          ("Parma", "Parma Heights")):
+        assert BV.resolve_label(tag, centres, tag_map) == (expected, "tag map")
+
+
+def test_a_state_tag_does_not_claim_a_station_inside_it():
+    """'Indiana' must not resolve to 'Indianapolis'."""
+    assert BV.resolve_label("Indiana", ["Indianapolis"], {})[0] is None
+    assert BV.resolve_label("Ohio", ["Boardman", "Cincinnati"], {})[0] is None

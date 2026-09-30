@@ -125,6 +125,48 @@ changed station since. That is a far safer assumption for ownership than for
 behaviour, but it is still one, and the generated file records its build date so
 a reader can judge it.
 
+### What the tags actually say on this fleet (30 September 2026)
+
+`probe_samsara_tags.py` has now been run. The tags **do** carry the station:
+24 of 25 Traumasoft cost centers have a matching tag, and 0 of 125 Samsara
+vehicles carry no tags at all. The tag tree even has state parents — Ohio,
+West Virginia, Indiana, Maryland, Colorado — with the stations beneath them.
+
+**But Boardman has exactly one tagged vehicle: `M-121`, a secure car.**
+
+Every other Ohio station is populated — Cincinnati 20, Massillon 18,
+Columbus 11, Dayton 8, Sandusky 7, Parma 6, Toledo 4, Shelby 4 — and the Ohio
+station tags sum to 79 against an `Ohio` tag of 78, so it is not that
+Boardman's trucks are tagged only at state level. Samsara's answer is that
+Boardman runs one unit.
+
+That is a question for operations before any report is built on it, not a bug
+to code around. Either Boardman really is one secure car in Samsara, its
+vehicles are not in Samsara at all, or their tags were never applied.
+
+Three near misses need a rule, and they are shipped in
+`state/tag_cost_center_map.example.json`:
+
+| Tag | Cost center |
+| --- | --- |
+| `Ellicott City` | `Ellicott` |
+| `Newburg` | `Newburgh` |
+| `Parma` | `Parma Heights` |
+
+Left unmapped deliberately: the state tags, the class tags (`BLS`,
+`Secure Car`, `Wheelchair`), `ALL`, and `In Service (TraumaSoft)`. None names a
+station. `Johnstown` is a tag with no matching cost center — add a line if it
+is a real station.
+
+Three vehicles carry **two** station tags (`A-410` Charles Town + Charleston,
+`A-415` Beckley + Clarksburg, `WC-406` Berkeley Springs + Charles Town). Those
+are left unset, as designed.
+
+A useful by-product: Samsara's `Unit Type` attribute and its `BLS` /
+`Secure Car` / `Wheelchair` tags are a **real** class field, which is a better
+source for the AMB / MH / WC split than the name-prefix convention
+`docs/VEHICLE_SERVICE_DAYS.md` currently relies on.
+
 ### The source ladder
 
 Sources, best first, each labelled per row in `in_fleet_because`:

@@ -132,17 +132,26 @@ a reader can judge it.
 vehicles carry no tags at all. The tag tree even has state parents — Ohio,
 West Virginia, Indiana, Maryland, Colorado — with the stations beneath them.
 
-**But Boardman has exactly one tagged vehicle: `M-121`, a secure car.**
+**But exactly one vehicle carries the `Boardman` tag: `M-121`, a secure car,
+In Service.**
 
 Every other Ohio station is populated — Cincinnati 20, Massillon 18,
-Columbus 11, Dayton 8, Sandusky 7, Parma 6, Toledo 4, Shelby 4 — and the Ohio
-station tags sum to 79 against an `Ohio` tag of 78, so it is not that
-Boardman's trucks are tagged only at state level. Samsara's answer is that
-Boardman runs one unit.
+Columbus 11, Dayton 8, Sandusky 7, Parma 6, Toledo 4, Shelby 4 — against
+Boardman's 1.
 
-That is a question for operations before any report is built on it, not a bug
-to code around. Either Boardman really is one secure car in Samsara, its
-vehicles are not in Samsara at all, or their tags were never applied.
+What that one tag count does NOT settle is why. Three explanations fit it
+equally well: Boardman genuinely runs one Samsara-tracked unit, its other
+trucks carry only the `Ohio` parent tag, or they are not in Samsara at all.
+Tag counts cannot separate those, because the `Ohio` count (78) and the
+station counts are over overlapping sets and neither bounds the other.
+
+Section 5 of the probe settles it directly. Its `Matched in Samsara but no
+station tag (N)` line is the number that decides: if it is near zero, almost
+every truck has a station tag and Boardman really is one unit; if it is large,
+the station tags are incomplete and Boardman's are among the missing.
+
+Either way it is a question for operations before a report is built on it,
+not a bug to code around.
 
 Three near misses need a rule, and they are shipped in
 `state/tag_cost_center_map.example.json`:
@@ -162,10 +171,18 @@ Three vehicles carry **two** station tags (`A-410` Charles Town + Charleston,
 `A-415` Beckley + Clarksburg, `WC-406` Berkeley Springs + Charles Town). Those
 are left unset, as designed.
 
-A useful by-product: Samsara's `Unit Type` attribute and its `BLS` /
-`Secure Car` / `Wheelchair` tags are a **real** class field, which is a better
-source for the AMB / MH / WC split than the name-prefix convention
-`docs/VEHICLE_SERVICE_DAYS.md` currently relies on.
+Two useful by-products:
+
+- Samsara's `Unit Type` attribute and its `BLS` / `Secure Car` / `Wheelchair`
+  tags are a **real** class field, which is a better source for the
+  AMB / MH / WC split than the name-prefix convention
+  `docs/VEHICLE_SERVICE_DAYS.md` currently relies on. It also settles whether
+  this tenant's `M-` means Medicar or secure car with data rather than a
+  guess — `M-121` is tagged `Secure Car`.
+- The `notes` field, populated on 4% of vehicles, carries lines like
+  `Primary Base: Newburgh`. That is a station statement, on about five trucks.
+  Too thin to build on, but worth reading as a last-resort fallback if those
+  five are ones nothing else places.
 
 ### The source ladder
 

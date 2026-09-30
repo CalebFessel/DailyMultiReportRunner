@@ -198,6 +198,7 @@ def report_tag_vocabulary(vehicles, out):
               f"{', '.join(blanket)}")
 
     out["tags"] = dict(per_tag)
+    out["tag_parents"] = {name: parents.get(name) for name in per_tag}
     out["untagged_vehicles"] = untagged
     return per_tag
 
@@ -433,7 +434,25 @@ def fetch_cost_centers(api):
     return centres
 
 
-def report_tags_vs_cost_centers(api, tag_counts, out, centres=None):
+def is_child_tag(tag, parents):
+    """
+    Whether a tag sits under another tag in Samsara's hierarchy.
+
+    This is what separates a station from a state. On this tenant the
+    top-level tags are ALL, Ohio, West Virginia, Indiana, Maryland, Colorado,
+    BLS, Secure Car, Wheelchair and In Service (TraumaSoft) -- none of which
+    names a station -- while every station tag hangs off a state.
+
+    It matters because a state name can be a substring of a station inside it.
+    `Indiana` is a parent of Indianapolis, Salem, Sellersburg and Newburg, and
+    a near-miss rule mapping `Indiana` to `Indianapolis` would hand Salem's
+    and Sellersburg's trucks to Indianapolis. The hierarchy rules that out
+    where a string comparison cannot.
+    """
+    return bool((parents or {}).get(tag))
+
+
+def report_tags_vs_cost_centers(api, tag_counts, out, centres=None, parents=None):
     """
     Whether the tag vocabulary can be mapped onto Traumasoft's cost centers.
 
@@ -469,7 +488,7 @@ def report_tags_vs_cost_centers(api, tag_counts, out, centres=None):
     # equally good candidates.
     print(f"\n   {'cost center':<26}{'matches outright':<20}{'near miss -- needs a rule'}")
     print("   " + "-" * 74)
-    pairs, near = {}, {}
+    pairs, near, rejected = {}, {}, {}
     for centre in sorted(centres):
         key = normalize(centre)
         exact = [tag for tag in tag_counts if station_matches(tag, centre)]
@@ -479,9 +498,18 @@ def report_tags_vs_cost_centers(api, tag_counts, out, centres=None):
                 key in normalize(tag) or normalize(tag) in key
             )
         ]
+        # A top-level tag is never a near miss for a station beneath it. This
+        # caught `Indiana` being offered as a rule for `Indianapolis`, which
+        # would have handed Salem's and Sellersburg's trucks to Indianapolis
+        # -- the exact mistake the no-substring rule exists to prevent, made
+        # by the thing suggesting the rules.
+        suggestable = [t for t in loose if is_child_tag(t, parents)]
+        parent_level = [t for t in loose if t not in suggestable]
         pairs[centre] = exact
-        if loose:
-            near[centre] = loose
+        if suggestable:
+            near[centre] = suggestable
+        if parent_level:
+            rejected[centre] = parent_level
         print(f"   {centre[:25]:<26}{(', '.join(exact) or '--')[:19]:<20}"
               f"{', '.join(loose)[:28]}")
 
@@ -492,11 +520,34 @@ def report_tags_vs_cost_centers(api, tag_counts, out, centres=None):
         for centre, tags in sorted(near.items()):
             for tag in tags:
                 print(f'      "{tag}": "{centre}"')
+    if rejected:
+        print(f"\n   NOT offered as rules, though the names overlap: these are")
+        print("   top-level tags, and a station sits beneath them rather than")
+        print("   being them:")
+        for centre, tags in sorted(rejected.items()):
+            for tag in tags:
+                children = sorted(
+                    t for t, p in (parents or {}).items()
+                    if p and p == (parents or {}).get(tag)
+                ) or "its children"
+                print(f"      {tag} -> {centre}   would also claim every other")
+                print(f"         station under {tag}")
     out["near_misses"] = near
+    out["rejected_near_misses"] = rejected
 
-    unclaimed = [t for t in tag_counts if not any(t in h for h in pairs.values())]
+    # Tags a near-miss rule reaches are not unclaimed -- they just need the
+    # line above pasting in. Listing them together read as though four more
+    # stations had no tag at all.
+    suggested = {t for tags in near.values() for t in tags}
+    unclaimed = [
+        t for t in tag_counts
+        if not any(t in h for h in pairs.values()) and t not in suggested
+    ]
+    if suggested:
+        print(f"\n   Reachable once the rules above are in place "
+              f"({len(suggested)}): {', '.join(sorted(suggested))}")
     if unclaimed:
-        print(f"\n   Tags matching no cost center ({len(unclaimed)}): "
+        print(f"\n   Tags naming no cost center at all ({len(unclaimed)}): "
               f"{', '.join(sorted(unclaimed))[:200]}")
 
     out["cost_centers"] = sorted(centres)
@@ -825,7 +876,8 @@ def main(argv=None):
     matched = report_join(ts_vehicles, sam_vehicles, out)
     centres = fetch_cost_centers(api)
     report_tags_per_unit(ts_vehicles, matched, out, centres=centres)
-    report_tags_vs_cost_centers(api, tag_counts or Counter(), out, centres=centres)
+    report_tags_vs_cost_centers(api, tag_counts or Counter(), out, centres=centres,
+                                parents=out.get("tag_parents"))
     report_vehicle_status(ts_vehicles, out)
     report_vin_join(ts_vehicles, sam_vehicles, out)
     report_traumasoft_roster(ts_vehicles, out)

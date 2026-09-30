@@ -127,34 +127,40 @@ a reader can judge it.
 
 ### What the tags actually say on this fleet (30 September 2026)
 
-`probe_samsara_tags.py` has now been run. The tags **do** carry the station:
-24 of 25 Traumasoft cost centers have a matching tag, and 0 of 125 Samsara
-vehicles carry no tags at all. The tag tree even has state parents — Ohio,
-West Virginia, Indiana, Maryland, Colorado — with the stations beneath them.
+`probe_samsara_tags.py` has been run. **The tags carry the station and the
+join holds.**
 
-**But exactly one vehicle carries the `Boardman` tag: `M-121`, a secure car,
-In Service.**
+| | |
+| --- | --- |
+| Fleet-sheet units joined to Samsara | **123 of 125 (98.4%)** |
+| Not joined | `A-108`, `Fleet Supplies` |
+| Resolved to exactly one station | 110 |
+| Tags name two stations | 11 |
+| Matched but no station tag | 12 |
 
-Every other Ohio station is populated — Cincinnati 20, Massillon 18,
-Columbus 11, Dayton 8, Sandusky 7, Parma 6, Toledo 4, Shelby 4 — against
-Boardman's 1.
+The raw figure the probe also prints, 68.3%, is over all 186 Traumasoft
+records — mostly iPads and retired trucks. The 98.4% is the one that matters.
+The only real gap is `A-108`; `Fleet Supplies` is not a vehicle.
 
-What that one tag count does NOT settle is why. Three explanations fit it
-equally well: Boardman genuinely runs one Samsara-tracked unit, its other
-trucks carry only the `Ohio` parent tag, or they are not in Samsara at all.
-Tag counts cannot separate those, because the `Ohio` count (78) and the
-station counts are over overlapping sets and neither bounds the other.
+### Boardman is one vehicle, and that is now settled
 
-Section 5 of the probe settles it directly. Its `Matched in Samsara but no
-station tag (N)` line is the number that decides: if it is near zero, almost
-every truck has a station tag and Boardman really is one unit; if it is large,
-the station tags are incomplete and Boardman's are among the missing.
+`M-121` — In Service, tagged `Secure Car`. Nothing else carries the
+`Boardman` tag.
 
-Either way it is a question for operations before a report is built on it,
-not a bug to code around.
+The no-station-tag list is the only place Boardman's other trucks could
+hide, and it is 12 long. Four of those resolve once the map rules below are
+in (`A-301`–`A-304` are Ellicott City, `A-149` is Parma), and `A-500` is
+Colorado, which has no cost center. That leaves six Ohio-tagged units with no
+station at all — `A-116`, `A-118`, `A-211`, `M-109`, `M-123`, `WC-107`.
 
-Three near misses need a rule, and they are shipped in
-`state/tag_cost_center_map.example.json`:
+**So Boardman is between 1 and 7 vehicles, and 1 is the only number the data
+positively supports.** Worth confirming with operations, and worth asking
+whether those six Ohio units belong to Boardman before anyone reads a
+Boardman report.
+
+### The rules this fleet needs
+
+Three go in `state/tag_cost_center_map.json` (shipped in the `.example`):
 
 | Tag | Cost center |
 | --- | --- |
@@ -162,27 +168,46 @@ Three near misses need a rule, and they are shipped in
 | `Newburg` | `Newburgh` |
 | `Parma` | `Parma Heights` |
 
-Left unmapped deliberately: the state tags, the class tags (`BLS`,
-`Secure Car`, `Wheelchair`), `ALL`, and `In Service (TraumaSoft)`. None names a
-station. `Johnstown` is a tag with no matching cost center — add a line if it
-is a real station.
+A fourth, `"Indiana": "Indianapolis"`, **must not be added.** The probe
+offered it because one name contains the other, and it was wrong to: `Indiana`
+is the top-level tag over Indianapolis, Salem, Sellersburg *and* Newburg, so
+that line would hand Salem's and Sellersburg's trucks to Indianapolis. The
+probe now uses Samsara's tag hierarchy to refuse a suggestion for any
+top-level tag, and says why. (The resolver was never at risk — it requires an
+exact or wrapper-normalised match, and `Indiana` never matched
+`Indianapolis`. Only the suggestion was wrong.)
 
-Three vehicles carry **two** station tags (`A-410` Charles Town + Charleston,
-`A-415` Beckley + Clarksburg, `WC-406` Berkeley Springs + Charles Town). Those
-are left unset, as designed.
+`Admin - Non Providers`, `CPR` and `McDowell` have no tag and are unlikely to
+be vehicle-owning cost centers. `Johnstown` is a tag with no cost center.
 
-Two useful by-products:
+### Eleven vehicles carry two station tags
 
-- Samsara's `Unit Type` attribute and its `BLS` / `Secure Car` / `Wheelchair`
-  tags are a **real** class field, which is a better source for the
-  AMB / MH / WC split than the name-prefix convention
-  `docs/VEHICLE_SERVICE_DAYS.md` currently relies on. It also settles whether
-  this tenant's `M-` means Medicar or secure car with data rather than a
-  guess — `M-121` is tagged `Secure Car`.
-- The `notes` field, populated on 4% of vehicles, carries lines like
-  `Primary Base: Newburgh`. That is a station statement, on about five trucks.
-  Too thin to build on, but worth reading as a last-resort fallback if those
-  five are ones nothing else places.
+Left unset by design, and they fall back to behaviour-derived attribution:
+
+| Vehicles | Tagged |
+| --- | --- |
+| `A-204`, `A-206`, `M-200`, `M-201`, `WC-201` | Salem / Sellersburg |
+| `A-410` | Charles Town / Charleston |
+| `A-411` | Charleston / Morgantown |
+| `A-415` | Beckley / Clarksburg |
+| `WC-406` | Berkeley Springs / Charles Town |
+| `WC-409` | Beckley / Parkersburg |
+| `M-111` | Massillon / Toledo |
+
+Five of the eleven are Salem/Sellersburg, which looks systematic rather than
+accidental — those two may share a pool, or the tags were applied loosely.
+None of the eleven touches Boardman, so none of it affects that report.
+
+### Two by-products
+
+- Samsara's `Unit Type` attribute and the `BLS` / `Secure Car` / `Wheelchair`
+  tags are a **real** class field, better than the name-prefix convention
+  `docs/VEHICLE_SERVICE_DAYS.md` leans on. It also settles the MH question
+  with data: `M-121` is tagged `Secure Car`, so on this tenant `M-` is secure
+  car, not Medicar.
+- The `notes` field, on 4% of vehicles, carries lines like
+  `Primary Base: Newburgh`. About five trucks. Too thin to build on, worth
+  knowing about for any of the six unplaced units it happens to cover.
 
 ### The source ladder
 

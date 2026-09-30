@@ -1,0 +1,11 @@
+# Test-only dependencies. The reporting machine does not need these to run the
+# reports -- requirements.txt is what it needs. Install these to run the suite:
+#
+#     .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+#     .venv\Scripts\python.exe -m pytest
+#
+# test_region_monthly.py also runs without pytest, so a machine that has only
+# Python can still verify a hand-copied file:
+#
+#     .venv\Scripts\python.exe test_region_monthly.py
+pytest>=7.0

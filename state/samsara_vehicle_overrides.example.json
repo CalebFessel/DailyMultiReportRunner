@@ -1,0 +1,29 @@
+{
+  "note": [
+    "Traumasoft vehicle name -> Samsara vehicle name, for units the shared unit",
+    "prefix cannot join on its own.",
+    "",
+    "push_samsara_routes.py normally matches by collapsing both names to their",
+    "unit designator: 'M-12 Ford E450' and 'M12 - Medic 12' both reduce to",
+    "'M12', so they join without any entry here. You only need a line when",
+    "that fails, and the dry-run plan tells you exactly which units those are:",
+    "",
+    "  - a unit listed as having no Samsara vehicle, because the two systems",
+    "    genuinely name it differently ('WC-3' in Traumasoft, 'Wheelchair 3'",
+    "    in Samsara), or because the name carries no letter+digit designator",
+    "  - a unit whose prefix matched several Samsara vehicles, which is",
+    "    dropped rather than guessed at",
+    "",
+    "The key is the Traumasoft vehicle_name, matched case-insensitively and",
+    "exactly. The value is the Samsara vehicle name, also matched exactly; if",
+    "no Samsara vehicle carries that name, its unit prefix is tried instead.",
+    "An override always wins over the prefix rule, being a decision rather",
+    "than a guess.",
+    "",
+    "Rename this file to samsara_vehicle_overrides.json to put it in effect."
+  ],
+  "overrides": {
+    "WC-3": "Wheelchair 3",
+    "SPARE 2": "M-99 Spare"
+  }
+}

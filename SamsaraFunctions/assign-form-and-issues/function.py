@@ -117,16 +117,37 @@ def load_users(token):
 
 
 def build_asset_tag_index(token):
-    """Map vehicle/asset ID -> set of tag names, from the org's tags."""
-    index = {}
-    for tag in _paginate(token, "/tags"):
+    """Read the org's tags once.
+
+    Returns (asset index, rank map): asset index maps vehicle/asset ID ->
+    set of tag names; rank map orders tag names by specificity — deeper in
+    the tag hierarchy first (a city under a state), then smaller membership
+    first — so a true cost center beats broad parents like a state or "ALL".
+    """
+    tags = list(_paginate(token, "/tags"))
+    parent_of = {str(t["id"]): str(t.get("parentTagId") or "") for t in tags}
+
+    def depth(tag):
+        d, cursor = 0, parent_of.get(str(tag["id"]), "")
+        while cursor and cursor in parent_of and d < 20:
+            d += 1
+            cursor = parent_of.get(cursor, "")
+        return d
+
+    index, ranks = {}, {}
+    for tag in tags:
         name = (tag.get("name") or "").strip()
         if not name:
             continue
+        size = sum(
+            len(tag.get(k) or [])
+            for k in ("vehicles", "assets", "drivers", "machines", "sensors", "addresses")
+        )
+        ranks[name.lower()] = (-depth(tag), size)
         for member_key in ("vehicles", "assets"):
             for member in tag.get(member_key) or []:
                 index.setdefault(str(member.get("id")), set()).add(name)
-    return index
+    return index, ranks
 
 
 def submitter_tag_names(token, users, submitted_by):
@@ -140,14 +161,14 @@ def submitter_tag_names(token, users, submitted_by):
     sid, stype = str(submitted_by.get("id")), submitted_by.get("type")
     if stype == "driver":
         driver = _request(token, "GET", f"/fleet/drivers/{sid}").get("data") or {}
-        return {t["name"] for t in driver.get("tags") or [] if t.get("name")}
+        return {t["name"].strip() for t in driver.get("tags") or [] if (t.get("name") or "").strip()}
     if stype == "user":
         for user in users:
             if str(user.get("id")) == sid:
                 return {
-                    (a.get("tag") or {}).get("name")
+                    ((a.get("tag") or {}).get("name") or "").strip()
                     for a in user.get("roles") or []
-                    if (a.get("tag") or {}).get("name")
+                    if ((a.get("tag") or {}).get("name") or "").strip()
                 }
     return set()
 
@@ -166,8 +187,8 @@ def managers_for_tags(users, role_name, tag_names_in_priority):
         hits = []
         for user in users:
             for assignment in user.get("roles") or []:
-                role_ok = ((assignment.get("role") or {}).get("name") or "").lower() == role_name
-                tag_ok = ((assignment.get("tag") or {}).get("name") or "").lower() == wanted
+                role_ok = ((assignment.get("role") or {}).get("name") or "").strip().lower() == role_name
+                tag_ok = ((assignment.get("tag") or {}).get("name") or "").strip().lower() == wanted
                 if role_ok and tag_ok and str(user["id"]) not in seen:
                     hits.append(user)
                     seen.add(str(user["id"]))
@@ -286,11 +307,18 @@ def assign_issue(token, issue_id, manager, due_at, dry_run):
 # Per-submission routing
 # ---------------------------------------------------------------------------
 
-def route_submission(token, submission, users, asset_tags, cfg):
+def route_submission(token, submission, users, asset_tags, tag_ranks, cfg):
     sub_id = submission["id"]
     asset_id = str((submission.get("asset") or {}).get("id") or "")
-    vehicle_tags = sorted(asset_tags.get(asset_id, set()))
-    worker_tags = sorted(submitter_tag_names(token, users, submission.get("submittedBy")))
+
+    # Most specific tag first: deepest in the hierarchy, then smallest
+    # membership, so a city cost center beats a state tag or "ALL"; name
+    # breaks remaining ties deterministically.
+    def by_specificity(names):
+        return sorted(names, key=lambda n: (*tag_ranks.get(n.lower(), (0, 0)), n))
+
+    vehicle_tags = by_specificity(asset_tags.get(asset_id, set()))
+    worker_tags = by_specificity(submitter_tag_names(token, users, submission.get("submittedBy")))
     print(f"Submission {sub_id}: vehicle tags {vehicle_tags}, submitter tags {worker_tags}")
 
     # Vehicle cost center wins when both match a manager; submitter is the
@@ -378,9 +406,9 @@ def main(event, _context):
         print(f"Found {len(submissions)} submitted form(s) in last {lookback_minutes}m")
 
     users = load_users(token)
-    asset_tags = build_asset_tag_index(token)
+    asset_tags, tag_ranks = build_asset_tag_index(token)
 
-    results = [route_submission(token, s, users, asset_tags, cfg) for s in submissions]
+    results = [route_submission(token, s, users, asset_tags, tag_ranks, cfg) for s in submissions]
 
     summary = {"dryRun": dry_run, "processed": len(results), "results": results}
     print(json.dumps(summary))

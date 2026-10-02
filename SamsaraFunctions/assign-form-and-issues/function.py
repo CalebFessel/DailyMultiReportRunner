@@ -29,6 +29,8 @@ Event parameters (all arrive as strings in the event dict):
                                   exact name**. Omit to only assign issues.
     DueInHours         (optional) Due time for the follow-up form and
                                   issues. Default "24".
+    ExcludeTags        (optional) Comma-separated tag names that are never
+                                  treated as cost centers. Default "ALL".
     DryRun             (optional) "true" logs what would happen without
                                   writing anything.
 
@@ -312,10 +314,12 @@ def route_submission(token, submission, users, asset_tags, tag_ranks, cfg):
     asset_id = str((submission.get("asset") or {}).get("id") or "")
 
     # Most specific tag first: deepest in the hierarchy, then smallest
-    # membership, so a city cost center beats a state tag or "ALL"; name
-    # breaks remaining ties deterministically.
+    # membership, so a city cost center beats a state tag; name breaks
+    # remaining ties deterministically. Excluded tags (e.g. "ALL") are
+    # never cost-center candidates.
     def by_specificity(names):
-        return sorted(names, key=lambda n: (*tag_ranks.get(n.lower(), (0, 0)), n))
+        kept = [n for n in names if n.strip().lower() not in cfg["exclude_tags"]]
+        return sorted(kept, key=lambda n: (*tag_ranks.get(n.lower(), (0, 0)), n))
 
     vehicle_tags = by_specificity(asset_tags.get(asset_id, set()))
     worker_tags = by_specificity(submitter_tag_names(token, users, submission.get("submittedBy")))
@@ -382,6 +386,9 @@ def main(event, _context):
     follow_up_template = event.get("FormTemplateId", "").strip()
     due_in_hours = float(event.get("DueInHours", "24"))
     dry_run = event.get("DryRun", "false").lower() == "true"
+    exclude_tags = {
+        s.strip().lower() for s in event.get("ExcludeTags", "ALL").split(",") if s.strip()
+    }
 
     token = get_secrets()["SamsaraApiToken"]
     templates = load_form_templates(token)
@@ -391,6 +398,7 @@ def main(event, _context):
         "due_at": _rfc3339(datetime.now(timezone.utc) + timedelta(hours=due_in_hours)),
         "dry_run": dry_run,
         "lookback_minutes": lookback_minutes,
+        "exclude_tags": exclude_tags,
         "template": resolve_form_template(templates, follow_up_template) if follow_up_template else None,
     }
     if cfg["template"]:

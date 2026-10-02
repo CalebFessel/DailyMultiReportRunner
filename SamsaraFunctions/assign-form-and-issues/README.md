@@ -55,6 +55,7 @@ In the Samsara dashboard (Settings → Functions → Create Function):
 | `TriggerTemplates` | no | `Truck Check, Wheelchair Van Check` | Poll mode: template **names** (or UUIDs) that trigger routing. Defaults to the six vehicle-check forms: Secure Car Truck Check - Ohio, Secure Car Vehicle Check, Truck Check, Truck Check - Ohio, Wheelchair Van Check, Wheelchair Van Check - Ohio |
 | `FormTemplateId` | no | `Corrective Action` | Follow-up form for the manager — UUID **or exact template name**; omit to only assign issues |
 | `DueInHours` | no | `24` | Due time for issues and the follow-up form |
+| `ExcludeTags` | no | `ALL, BLS` | Tags never treated as cost centers. Default `ALL` |
 | `DryRun` | no | `false` | `true` logs actions without writing |
 
 ### 3. Trigger it

@@ -1,14 +1,19 @@
-# Assign Form & Issues by Permission Profile + Tag
+# Route Forms & Issues to Operations Managers by Cost Center
 
-A [Samsara Function](https://developers.samsara.com/docs/functions) that:
+A [Samsara Function](https://developers.samsara.com/docs/functions) that, for
+each submitted form:
 
-1. Finds all dashboard **users** whose permission profile (role) matches
-   `RoleName` **scoped to the tag** `TagName`.
-2. Creates a **form submission** from `FormTemplateId` (latest revision) and
-   assigns one to each matched user, due in `DueInHours`.
-3. Assigns **issues** to those users (round-robin when more than one user
-   matches): either the explicit `IssueIds` you pass, or every *open,
-   unassigned* issue updated in the last `IssueLookbackDays` days.
+1. Works out the **cost center**: the tags on the vehicle/asset the form was
+   submitted for, falling back to the tags of the worker who submitted it
+   (driver tags, or a dashboard user's tag-scoped roles).
+2. Finds the user whose permission profile matches `RoleName` (default
+   **Operations Manager**) scoped to one of those tags. Vehicle tags take
+   priority over submitter tags; ties are broken by name so the pick is
+   deterministic.
+3. Assigns the submission's open, unassigned **issues** to that manager
+   (status `inProgress`, due in `DueInHours`).
+4. Optionally assigns the manager a **follow-up form** (`FormTemplateId`),
+   with a duplicate guard so overlapping scheduled runs don't double-assign.
 
 ## Files
 
@@ -23,7 +28,8 @@ A [Samsara Function](https://developers.samsara.com/docs/functions) that:
 
 Create an API token (Settings → API Tokens) with these scopes:
 
-- **Read Users** (Setup & Administration)
+- **Read Users**, **Read Tags** (Setup & Administration)
+- **Read Drivers** (Drivers)
 - **Read Form Submissions**, **Write Form Submissions**, **Read Issues**,
   **Write Issues** (Forms category)
 
@@ -32,7 +38,7 @@ Create an API token (Settings → API Tokens) with these scopes:
 Zip the two `.py` files (no folder inside the zip):
 
 ```bash
-zip assign-form-and-issues.zip function.py samsarafnsecrets.py
+zip route-forms-issues.zip function.py samsarafnsecrets.py
 ```
 
 In the Samsara dashboard (Settings → Functions → Create Function):
@@ -43,31 +49,46 @@ In the Samsara dashboard (Settings → Functions → Create Function):
 
 | Parameter | Required | Example | Notes |
 |-----------|----------|---------|-------|
-| `RoleName` | yes | `Field Supervisor` | Permission profile name, case-insensitive |
-| `TagName` | yes | `North Region` | Tag the role must be scoped to; `*` = org-wide role |
-| `FormTemplateId` | yes | `9e118726-41e2-…` | From the template's URL or `GET /form-templates` |
-| `DueInHours` | no | `24` | Due time for the form and issues |
-| `AssignIssues` | no | `true` | Set `false` to only assign the form |
-| `IssueIds` | no | `id1,id2` | Explicit issues; omit to auto-pick open unassigned ones |
-| `IssueLookbackDays` | no | `7` | Window for the auto-pick |
+| `RoleName` | no | `Operations Manager` | Permission profile to route to (the default) |
+| `FormSubmissionId` | no | `9e11…` | Process exactly this submission (workflow/API runs) |
+| `LookbackMinutes` | no | `60` | Poll mode: process forms submitted in the last N minutes |
+| `TriggerTemplateIds` | no | `uuid1,uuid2` | Poll mode: only react to these templates |
+| `FormTemplateId` | no | `Corrective Action` | Follow-up form for the manager — UUID **or exact template name**; omit to only assign issues |
+| `DueInHours` | no | `24` | Due time for issues and the follow-up form |
 | `DryRun` | no | `false` | `true` logs actions without writing |
 
 ### 3. Trigger it
 
-Run it manually from the dashboard, on a schedule, from an alert workflow, or
-via `POST /functions/{id}/runs` ([Start a Function run](https://developers.samsara.com/reference/startfunctionrun)).
-Per-run parameter overrides let you pass specific `IssueIds` from a workflow.
+Two ways to run it:
+
+- **Scheduled (poll mode):** schedule the Function every N minutes with
+  `LookbackMinutes = N`. It finds forms submitted in that window and routes
+  each one.
+- **Event-driven:** invoke it from an alert workflow or
+  [`POST /functions/{id}/runs`](https://developers.samsara.com/reference/startfunctionrun)
+  with a per-run `FormSubmissionId` parameter override.
+
+## Where to find a form template ID
+
+- **Dashboard:** open the template under **Forms → Templates** (or your
+  Connected Workflows forms page) and copy the UUID from the browser URL.
+- **API:** `GET https://api.samsara.com/form-templates` lists every template
+  with its `id`, `revisionId`, and `name`.
+- **Or skip it:** `FormTemplateId` and `TriggerTemplateIds`-adjacent lookups
+  in this function accept the template's **exact name** — e.g.
+  `FormTemplateId = Corrective Action` — and resolve the UUID at runtime.
 
 ## Behavior notes
 
-- A user matches when **any** of their role assignments has
-  `role.name == RoleName` **and** `tag.name == TagName`. A role assignment
-  with no tag is org-wide and only matches `TagName = *`.
-- Issue assignment sets `assignedTo` (type `user`), status `inProgress`, and
-  the same due date as the form. Edit `assign_issue()` if you want issues
-  left as `open`.
-- Multiple matched users each get their own form submission; issues are
-  distributed round-robin.
+- A manager matches when any of their role assignments has
+  `role.name == RoleName` **and** that assignment's tag is one of the
+  candidate cost-center tags. Org-wide role assignments (no tag) do not
+  match — scope the role to the cost-center tag in the dashboard.
+- Vehicle/asset tag membership comes from `GET /tags` (each tag lists its
+  member vehicles and assets), so untracked/manually-entered assets on a
+  form have no tags and fall through to the submitter's tags.
+- Issues are matched to the triggering form via their `source` reference
+  and only touched when still open and unassigned.
 - Test first with `DryRun = true` and check the run logs.
 
 ## Local testing
@@ -77,6 +98,5 @@ With the [`samsara-fn` CLI](https://pypi.org/project/samsara-fn/):
 ```bash
 pip install samsara-fn
 samsara-fn bundle function.py samsarafnsecrets.py
-samsara-fn run --param RoleName="Field Supervisor" --param TagName="North Region" \
-  --param FormTemplateId=<uuid> --param DryRun=true
+samsara-fn run --param DryRun=true --param LookbackMinutes=1440
 ```

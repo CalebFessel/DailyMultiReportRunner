@@ -19,9 +19,11 @@ Event parameters (all arrive as strings in the event dict):
                                   absent: process every form submitted in
                                   the last N minutes. Default "60". Run the
                                   Function on a matching schedule.
-    TriggerTemplateIds (optional) Comma-separated form template UUIDs that
-                                  should trigger routing in poll mode.
-                                  Omit to react to every template.
+    TriggerTemplates   (optional) Comma-separated form template names or
+                                  UUIDs that trigger routing in poll mode.
+                                  Defaults to the six vehicle-check forms
+                                  in DEFAULT_TRIGGER_TEMPLATES below.
+                                  (TriggerTemplateIds works as an alias.)
     FormTemplateId     (optional) Follow-up form to assign to the matched
                                   manager. Accepts a template UUID **or its
                                   exact name**. Omit to only assign issues.
@@ -47,6 +49,16 @@ from samsarafnsecrets import get_secrets
 
 API_BASE = "https://api.samsara.com"
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+# Vehicle-check forms that trigger routing when TriggerTemplates is not set.
+DEFAULT_TRIGGER_TEMPLATES = (
+    "Secure Car Truck Check - Ohio",
+    "Secure Car Vehicle Check",
+    "Truck Check",
+    "Truck Check - Ohio",
+    "Wheelchair Van Check",
+    "Wheelchair Van Check - Ohio",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -164,20 +176,23 @@ def managers_for_tags(users, role_name, tag_names_in_priority):
     return matched
 
 
-def resolve_form_template(token, id_or_name):
+def load_form_templates(token):
+    return list(_paginate(token, "/form-templates"))
+
+
+def resolve_form_template(templates, id_or_name):
     """Return (templateId, revisionId, name) from a UUID or an exact name."""
-    if UUID_RE.fullmatch(id_or_name.strip()):
-        res = _request(token, "GET", "/form-templates", {"ids": id_or_name.strip()})
-        templates = res.get("data") or []
-        if not templates:
-            raise RuntimeError(f"Form template {id_or_name} not found")
-        tpl = templates[0]
-        return tpl["id"], tpl["revisionId"], tpl.get("name", "")
-    wanted = id_or_name.strip().lower()
-    for tpl in _paginate(token, "/form-templates"):
-        if (tpl.get("name") or "").strip().lower() == wanted:
+    wanted = id_or_name.strip()
+    if UUID_RE.fullmatch(wanted):
+        for tpl in templates:
+            if tpl["id"] == wanted:
+                return tpl["id"], tpl["revisionId"], tpl.get("name", "")
+        raise RuntimeError(f"Form template {wanted} not found")
+    for tpl in templates:
+        if (tpl.get("name") or "").strip().lower() == wanted.lower():
             return tpl["id"], tpl["revisionId"], tpl.get("name", "")
-    raise RuntimeError(f"No form template named '{id_or_name}'")
+    known = ", ".join(sorted((t.get("name") or "?") for t in templates))
+    raise RuntimeError(f"No form template named '{wanted}'. Templates in this org: {known}")
 
 
 # ---------------------------------------------------------------------------
@@ -332,21 +347,23 @@ def main(event, _context):
     role_name = event.get("RoleName", "Operations Manager").strip() or "Operations Manager"
     submission_id = event.get("FormSubmissionId", "").strip()
     lookback_minutes = int(event.get("LookbackMinutes", "60"))
-    trigger_template_ids = [
-        s.strip() for s in event.get("TriggerTemplateIds", "").split(",") if s.strip()
-    ]
+    trigger_param = event.get("TriggerTemplates", "") or event.get("TriggerTemplateIds", "")
+    trigger_templates = [s.strip() for s in trigger_param.split(",") if s.strip()] or list(
+        DEFAULT_TRIGGER_TEMPLATES
+    )
     follow_up_template = event.get("FormTemplateId", "").strip()
     due_in_hours = float(event.get("DueInHours", "24"))
     dry_run = event.get("DryRun", "false").lower() == "true"
 
     token = get_secrets()["SamsaraApiToken"]
+    templates = load_form_templates(token)
 
     cfg = {
         "role_name": role_name,
         "due_at": _rfc3339(datetime.now(timezone.utc) + timedelta(hours=due_in_hours)),
         "dry_run": dry_run,
         "lookback_minutes": lookback_minutes,
-        "template": resolve_form_template(token, follow_up_template) if follow_up_template else None,
+        "template": resolve_form_template(templates, follow_up_template) if follow_up_template else None,
     }
     if cfg["template"]:
         print(f"Follow-up template '{cfg['template'][2]}' revision {cfg['template'][1]}")
@@ -354,7 +371,10 @@ def main(event, _context):
     if submission_id:
         submissions = [get_submission(token, submission_id)]
     else:
-        submissions = recent_submitted_forms(token, lookback_minutes, trigger_template_ids)
+        resolved = [resolve_form_template(templates, t) for t in trigger_templates]
+        trigger_ids = [tpl_id for tpl_id, _, _ in resolved]
+        print("Trigger templates: " + ", ".join(f"'{name}'" for _, _, name in resolved))
+        submissions = recent_submitted_forms(token, lookback_minutes, trigger_ids)
         print(f"Found {len(submissions)} submitted form(s) in last {lookback_minutes}m")
 
     users = load_users(token)

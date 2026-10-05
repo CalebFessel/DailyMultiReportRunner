@@ -203,18 +203,22 @@ def load_form_templates(token):
     return list(_paginate(token, "/form-templates"))
 
 
+def _template_title(tpl):
+    return (tpl.get("title") or tpl.get("name") or "").strip()
+
+
 def resolve_form_template(templates, id_or_name):
-    """Return (templateId, revisionId, name) from a UUID or an exact name."""
+    """Return (templateId, revisionId, title) from a UUID or an exact title."""
     wanted = id_or_name.strip()
     if UUID_RE.fullmatch(wanted):
         for tpl in templates:
             if tpl["id"] == wanted:
-                return tpl["id"], tpl["revisionId"], tpl.get("name", "")
+                return tpl["id"], tpl["revisionId"], _template_title(tpl)
         raise RuntimeError(f"Form template {wanted} not found")
     for tpl in templates:
-        if (tpl.get("name") or "").strip().lower() == wanted.lower():
-            return tpl["id"], tpl["revisionId"], tpl.get("name", "")
-    known = ", ".join(sorted((t.get("name") or "?") for t in templates))
+        if _template_title(tpl).lower() == wanted.lower():
+            return tpl["id"], tpl["revisionId"], _template_title(tpl)
+    known = ", ".join(sorted(_template_title(t) or "?" for t in templates))
     raise RuntimeError(f"No form template named '{wanted}'. Templates in this org: {known}")
 
 

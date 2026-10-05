@@ -49,7 +49,7 @@ In the Samsara dashboard (Settings → Functions → Create Function):
 
 | Parameter | Required | Example | Notes |
 |-----------|----------|---------|-------|
-| `RoleName` | no | `Operations Managers` | Permission profile to route to (the default) |
+| `RoleName` | no | `Operations Managers` | Permission profile(s), comma-separated. Defaults to `Operations Managers, Operations Manager Geofence and Asset Movement` |
 | `FormSubmissionId` | no | `9e11…` | Process exactly this submission (workflow/API runs) |
 | `LookbackMinutes` | no | `60` | Poll mode: process forms submitted in the last N minutes |
 | `TriggerTemplates` | no | `Truck Check, Wheelchair Van Check` | Poll mode: template **names** (or UUIDs) that trigger routing. Defaults to the six vehicle-check forms: Secure Car Truck Check - Ohio, Secure Car Vehicle Check, Truck Check, Truck Check - Ohio, Wheelchair Van Check, Wheelchair Vehicle Check - Ohio |

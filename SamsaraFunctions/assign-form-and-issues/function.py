@@ -12,7 +12,7 @@ Handler: function.main
 
 Event parameters (all arrive as strings in the event dict):
     RoleName           (optional) Permission profile name to route to.
-                                  Default: "Operations Manager".
+                                  Default: "Operations Managers".
     FormSubmissionId   (optional) Process exactly this submission (use when
                                   invoked from a workflow or the API).
     LookbackMinutes    (optional) Poll mode, used when FormSubmissionId is
@@ -400,7 +400,7 @@ def main(event, _context):
     def param(name, default=""):
         return str(lowered.get(name.lower(), default))
 
-    role_name = param("RoleName", "Operations Manager").strip() or "Operations Manager"
+    role_name = param("RoleName", "Operations Managers").strip() or "Operations Managers"
     submission_id = param("FormSubmissionId").strip()
     lookback_minutes = int(param("LookbackMinutes", "60"))
     trigger_param = param("TriggerTemplates") or param("TriggerTemplateIds")

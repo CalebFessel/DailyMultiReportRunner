@@ -52,7 +52,7 @@ In the Samsara dashboard (Settings → Functions → Create Function):
 | `RoleName` | no | `Operations Manager` | Permission profile to route to (the default) |
 | `FormSubmissionId` | no | `9e11…` | Process exactly this submission (workflow/API runs) |
 | `LookbackMinutes` | no | `60` | Poll mode: process forms submitted in the last N minutes |
-| `TriggerTemplates` | no | `Truck Check, Wheelchair Van Check` | Poll mode: template **names** (or UUIDs) that trigger routing. Defaults to the six vehicle-check forms: Secure Car Truck Check - Ohio, Secure Car Vehicle Check, Truck Check, Truck Check - Ohio, Wheelchair Van Check, Wheelchair Van Check - Ohio |
+| `TriggerTemplates` | no | `Truck Check, Wheelchair Van Check` | Poll mode: template **names** (or UUIDs) that trigger routing. Defaults to the six vehicle-check forms: Secure Car Truck Check - Ohio, Secure Car Vehicle Check, Truck Check, Truck Check - Ohio, Wheelchair Van Check, Wheelchair Vehicle Check - Ohio |
 | `FormTemplateId` | no | `Corrective Action` | Follow-up form for the manager — UUID **or exact template name**; omit to only assign issues |
 | `DueInHours` | no | `24` | Due time for issues and the follow-up form |
 | `ExcludeTags` | no | `ALL, BLS` | Tags never treated as cost centers. Default `ALL` |

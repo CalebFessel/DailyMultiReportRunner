@@ -59,7 +59,7 @@ DEFAULT_TRIGGER_TEMPLATES = (
     "Truck Check",
     "Truck Check - Ohio",
     "Wheelchair Van Check",
-    "Wheelchair Van Check - Ohio",
+    "Wheelchair Vehicle Check - Ohio",
 )
 
 

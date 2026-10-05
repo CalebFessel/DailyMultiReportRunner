@@ -390,7 +390,14 @@ def main(event, _context):
         s.strip().lower() for s in event.get("ExcludeTags", "ALL").split(",") if s.strip()
     }
 
-    token = get_secrets()["SamsaraApiToken"]
+    secrets = get_secrets()
+    if "SamsaraApiToken" not in secrets:
+        raise RuntimeError(
+            "Secret 'SamsaraApiToken' is not configured on this Function. "
+            f"Configured secrets: {sorted(secrets)}"
+        )
+    # Strip whitespace/newlines that sneak in when the token is pasted.
+    token = str(secrets["SamsaraApiToken"]).strip()
     templates = load_form_templates(token)
 
     cfg = {

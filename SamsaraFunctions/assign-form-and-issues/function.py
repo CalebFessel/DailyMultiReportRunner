@@ -243,6 +243,19 @@ def recent_submitted_forms(token, lookback_minutes, trigger_template_ids):
     return [s for s in subs if s.get("submittedAtTime")]
 
 
+def survey_window(token, lookback_minutes, templates):
+    """Diagnostic: count every form submission in the window by template/status."""
+    start = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+    titles = {t["id"]: (_template_title(t) or t["id"]) for t in templates}
+    tally = {}
+    for s in _paginate(token, "/form-submissions/stream", {"startTime": _rfc3339(start)}):
+        title = titles.get((s.get("formTemplate") or {}).get("id"), "unknown template")
+        status = s.get("status") or ("submitted" if s.get("submittedAtTime") else "unknown")
+        tally.setdefault(title, {}).setdefault(status, 0)
+        tally[title][status] += 1
+    return tally
+
+
 def issues_for_submission(token, submission):
     """Open, unassigned issues created from this form submission."""
     anchor = submission.get("submittedAtTime") or submission.get("createdAtTime")
@@ -423,6 +436,12 @@ def main(event, _context):
         print("Trigger templates: " + ", ".join(f"'{name}'" for _, _, name in resolved))
         submissions = recent_submitted_forms(token, lookback_minutes, trigger_ids)
         print(f"Found {len(submissions)} submitted form(s) in last {lookback_minutes}m")
+        if not submissions:
+            tally = survey_window(token, lookback_minutes, templates)
+            print(
+                "Diagnostic - every form submission in the window, by template and status: "
+                + (json.dumps(tally, sort_keys=True) if tally else "none at all")
+            )
 
     users = load_users(token)
     asset_tags, tag_ranks = build_asset_tag_index(token)

@@ -436,6 +436,8 @@ def main(event, _context):
     if cfg["template"]:
         print(f"Follow-up template '{cfg['template'][2]}' revision {cfg['template'][1]}")
 
+    diagnostic = None
+
     if submission_id:
         submissions = [get_submission(token, submission_id)]
     else:
@@ -450,6 +452,11 @@ def main(event, _context):
                 "Diagnostic - every form submission in the window, by template and status: "
                 + (json.dumps(tally, sort_keys=True) if tally else "none at all")
             )
+            diagnostic = {
+                "lookbackMinutes": lookback_minutes,
+                "triggerTemplates": [name for _, _, name in resolved],
+                "allSubmissionsInWindow": tally or "none at all",
+            }
 
     users = load_users(token)
     asset_tags, tag_ranks = build_asset_tag_index(token)
@@ -457,5 +464,7 @@ def main(event, _context):
     results = [route_submission(token, s, users, asset_tags, tag_ranks, cfg) for s in submissions]
 
     summary = {"dryRun": dry_run, "processed": len(results), "results": results}
+    if not results and diagnostic:
+        summary["diagnostic"] = diagnostic
     print(json.dumps(summary))
     return summary

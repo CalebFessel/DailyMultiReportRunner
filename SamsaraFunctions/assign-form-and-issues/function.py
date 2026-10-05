@@ -461,10 +461,33 @@ def main(event, _context):
     users = load_users(token)
     asset_tags, tag_ranks = build_asset_tag_index(token)
 
+    # Who actually holds the target role, and with what tag scope? Logged on
+    # every run so a "no matching manager" result explains itself.
+    holders = []
+    for u in users:
+        scopes = [
+            ((a.get("tag") or {}).get("name") or "").strip() or "(org-wide)"
+            for a in u.get("roles") or []
+            if ((a.get("role") or {}).get("name") or "").strip().lower() == role_name.lower()
+        ]
+        if scopes:
+            holders.append({"name": u.get("name"), "tagScopes": scopes})
+    role_diag = {"roleName": role_name, "holders": holders}
+    if not holders:
+        role_diag["allRoleNamesInOrg"] = sorted({
+            ((a.get("role") or {}).get("name") or "").strip()
+            for u in users for a in u.get("roles") or []
+            if (a.get("role") or {}).get("name")
+        })
+    print("Role diagnostic: " + json.dumps(role_diag))
+
     results = [route_submission(token, s, users, asset_tags, tag_ranks, cfg) for s in submissions]
 
     summary = {"dryRun": dry_run, "processed": len(results), "results": results}
     if not results and diagnostic:
         summary["diagnostic"] = diagnostic
+    if results and not any(r.get("manager") for r in results):
+        summary["roleDiagnostic"] = role_diag
+        summary["results"] = results[:10] + [{"note": f"...{len(results) - 10} more skipped"}]             if len(results) > 10 else results
     print(json.dumps(summary))
     return summary

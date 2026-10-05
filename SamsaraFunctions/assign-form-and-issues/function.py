@@ -11,8 +11,10 @@ form.
 Handler: function.main
 
 Event parameters (all arrive as strings in the event dict):
-    RoleName           (optional) Permission profile name to route to.
-                                  Default: "Operations Managers".
+    RoleName           (optional) Permission profile name(s) to route to,
+                                  comma-separated. Default: "Operations
+                                  Managers, Operations Manager Geofence
+                                  and Asset Movement".
     FormSubmissionId   (optional) Process exactly this submission (use when
                                   invoked from a workflow or the API).
     LookbackMinutes    (optional) Poll mode, used when FormSubmissionId is
@@ -175,13 +177,13 @@ def submitter_tag_names(token, users, submitted_by):
     return set()
 
 
-def managers_for_tags(users, role_name, tag_names_in_priority):
-    """Users holding `role_name` scoped to one of the candidate tags.
+def managers_for_tags(users, role_names, tag_names_in_priority):
+    """Users holding any of `role_names` scoped to one of the candidate tags.
 
     Candidate tags are tried in priority order; within a tag, users are
     ordered by name so the pick is deterministic.
     """
-    role_name = role_name.strip().lower()
+    wanted_roles = {r.strip().lower() for r in role_names}
     matched = []
     seen = set()
     for tag_name in tag_names_in_priority:
@@ -189,7 +191,7 @@ def managers_for_tags(users, role_name, tag_names_in_priority):
         hits = []
         for user in users:
             for assignment in user.get("roles") or []:
-                role_ok = ((assignment.get("role") or {}).get("name") or "").strip().lower() == role_name
+                role_ok = ((assignment.get("role") or {}).get("name") or "").strip().lower() in wanted_roles
                 tag_ok = ((assignment.get("tag") or {}).get("name") or "").strip().lower() == wanted
                 if role_ok and tag_ok and str(user["id"]) not in seen:
                     hits.append(user)
@@ -349,10 +351,10 @@ def route_submission(token, submission, users, asset_tags, tag_ranks, cfg):
         print(f"Submission {sub_id}: no tags found on vehicle or submitter; skipping")
         return {"submission": sub_id, "skipped": "no cost-center tags"}
 
-    managers = managers_for_tags(users, cfg["role_name"], candidates)
+    managers = managers_for_tags(users, cfg["role_names"], candidates)
     if not managers:
         print(
-            f"Submission {sub_id}: no '{cfg['role_name']}' scoped to any of {candidates}; skipping"
+            f"Submission {sub_id}: no {cfg['role_names']} scoped to any of {candidates}; skipping"
         )
         return {"submission": sub_id, "skipped": "no matching manager"}
     manager = managers[0]
@@ -400,7 +402,9 @@ def main(event, _context):
     def param(name, default=""):
         return str(lowered.get(name.lower(), default))
 
-    role_name = param("RoleName", "Operations Managers").strip() or "Operations Managers"
+    default_roles = "Operations Managers, Operations Manager Geofence and Asset Movement"
+    role_names = [r.strip() for r in param("RoleName", default_roles).split(",") if r.strip()] \
+        or [r.strip() for r in default_roles.split(",")]
     submission_id = param("FormSubmissionId").strip()
     lookback_minutes = int(param("LookbackMinutes", "60"))
     trigger_param = param("TriggerTemplates") or param("TriggerTemplateIds")
@@ -413,7 +417,7 @@ def main(event, _context):
     exclude_tags = {
         s.strip().lower() for s in param("ExcludeTags", "ALL").split(",") if s.strip()
     }
-    print(f"Config: lookback {lookback_minutes}m, dryRun {dry_run}, role '{role_name}'")
+    print(f"Config: lookback {lookback_minutes}m, dryRun {dry_run}, roles {role_names}")
 
     secrets = get_secrets()
     if "SamsaraApiToken" not in secrets:
@@ -426,7 +430,7 @@ def main(event, _context):
     templates = load_form_templates(token)
 
     cfg = {
-        "role_name": role_name,
+        "role_names": role_names,
         "due_at": _rfc3339(datetime.now(timezone.utc) + timedelta(hours=due_in_hours)),
         "dry_run": dry_run,
         "lookback_minutes": lookback_minutes,
@@ -463,16 +467,17 @@ def main(event, _context):
 
     # Who actually holds the target role, and with what tag scope? Logged on
     # every run so a "no matching manager" result explains itself.
+    wanted_roles = {r.lower() for r in role_names}
     holders = []
     for u in users:
         scopes = [
             ((a.get("tag") or {}).get("name") or "").strip() or "(org-wide)"
             for a in u.get("roles") or []
-            if ((a.get("role") or {}).get("name") or "").strip().lower() == role_name.lower()
+            if ((a.get("role") or {}).get("name") or "").strip().lower() in wanted_roles
         ]
         if scopes:
             holders.append({"name": u.get("name"), "tagScopes": scopes})
-    role_diag = {"roleName": role_name, "holders": holders}
+    role_diag = {"roleNames": role_names, "holders": holders}
     if not holders:
         role_diag["allRoleNamesInOrg"] = sorted({
             ((a.get("role") or {}).get("name") or "").strip()

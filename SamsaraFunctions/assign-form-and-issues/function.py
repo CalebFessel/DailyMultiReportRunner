@@ -393,19 +393,27 @@ def main(event, _context):
         "correlationId": event.get("SamsaraFunctionCorrelationId"),
     })
 
-    role_name = event.get("RoleName", "Operations Manager").strip() or "Operations Manager"
-    submission_id = event.get("FormSubmissionId", "").strip()
-    lookback_minutes = int(event.get("LookbackMinutes", "60"))
-    trigger_param = event.get("TriggerTemplates", "") or event.get("TriggerTemplateIds", "")
+    # Parameter names are matched case-insensitively ("LookBackMinutes"
+    # works as well as "LookbackMinutes").
+    lowered = {k.lower(): v for k, v in event.items()}
+
+    def param(name, default=""):
+        return str(lowered.get(name.lower(), default))
+
+    role_name = param("RoleName", "Operations Manager").strip() or "Operations Manager"
+    submission_id = param("FormSubmissionId").strip()
+    lookback_minutes = int(param("LookbackMinutes", "60"))
+    trigger_param = param("TriggerTemplates") or param("TriggerTemplateIds")
     trigger_templates = [s.strip() for s in trigger_param.split(",") if s.strip()] or list(
         DEFAULT_TRIGGER_TEMPLATES
     )
-    follow_up_template = event.get("FormTemplateId", "").strip()
-    due_in_hours = float(event.get("DueInHours", "24"))
-    dry_run = event.get("DryRun", "false").lower() == "true"
+    follow_up_template = param("FormTemplateId").strip()
+    due_in_hours = float(param("DueInHours", "24"))
+    dry_run = param("DryRun", "false").lower() == "true"
     exclude_tags = {
-        s.strip().lower() for s in event.get("ExcludeTags", "ALL").split(",") if s.strip()
+        s.strip().lower() for s in param("ExcludeTags", "ALL").split(",") if s.strip()
     }
+    print(f"Config: lookback {lookback_minutes}m, dryRun {dry_run}, role '{role_name}'")
 
     secrets = get_secrets()
     if "SamsaraApiToken" not in secrets:

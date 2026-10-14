@@ -4,7 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -89,7 +89,7 @@ class RecordAndPayloadTests(unittest.TestCase):
 
     def test_row_to_record(self):
         r = self.rec
-        self.assertEqual(r.ts_id, 123)
+        self.assertEqual(r.ts_id, "123")
         self.assertEqual(r.vehicle_name, "M-12")
         self.assertEqual(r.status, "In Progress")
         self.assertEqual(r.priority, "High")
@@ -148,9 +148,13 @@ class VehicleIndexTests(unittest.TestCase):
         rec = sync.row_to_record(make_row(), sync.resolve_column_map(make_row().keys()))
         self.assertEqual(idx.resolve(rec, "name"), "1")
         self.assertEqual(idx.resolve(rec, "externalId"), "1")
+        self.assertEqual(idx.resolve(rec), "1")  # default vin mode falls back to name
         rec.extra["vehicle_vin"] = "2def"
         self.assertEqual(idx.resolve(rec, "vin"), "2")
         rec.vehicle_name = "M-99"
+        self.assertEqual(idx.resolve(rec, "name"), "2")  # falls back to the VIN set above
+        rec.extra["vehicle_vin"] = None
+        rec.vehicle_id = 999
         self.assertIsNone(idx.resolve(rec, "name"))
 
 
@@ -170,9 +174,9 @@ class SyncLoopTests(unittest.TestCase):
         rec = sync.row_to_record(make_row(), self.colmap)
 
         r1 = sync.sync_records([rec], client, self.idx, self.ledger)
-        self.assertEqual(r1.created, [(123, "WO-9")])
+        self.assertEqual(r1.created, [("123", "WO-9")])
         self.assertEqual(client.create_work_order.call_args[0][0]["assetId"], "A1")
-        self.assertEqual(self.ledger.get(123)["samsara_id"], "WO-9")
+        self.assertEqual(self.ledger.get("123")["samsara_id"], "WO-9")
 
         r2 = sync.sync_records([rec], client, self.idx, self.ledger)
         self.assertEqual(r2.unchanged, 1)
@@ -180,7 +184,7 @@ class SyncLoopTests(unittest.TestCase):
 
         rec2 = sync.row_to_record(make_row(status="completed", date_completed=datetime(2026, 10, 3)), self.colmap)
         r3 = sync.sync_records([rec2], client, self.idx, self.ledger)
-        self.assertEqual(r3.updated, [(123, "WO-9")])
+        self.assertEqual(r3.updated, [("123", "WO-9")])
         client.update_work_order.assert_called_once()
         self.assertEqual(client.update_work_order.call_args[0][0], "WO-9")
         self.assertEqual(client.update_work_order.call_args[0][1]["status"], "Completed")
@@ -194,13 +198,13 @@ class SyncLoopTests(unittest.TestCase):
         client = mock.Mock()
         rec = sync.row_to_record(make_row(vehicle_name="Unknown"), self.colmap)
         r = sync.sync_records([rec], client, self.idx, self.ledger)
-        self.assertEqual(r.skipped_no_vehicle, [(123, "Unknown")])
+        self.assertEqual(r.skipped_no_vehicle, [("123", "Unknown")])
         client.create_work_order.assert_not_called()
 
     def test_dry_run_writes_nothing(self):
         rec = sync.row_to_record(make_row(), self.colmap)
         r = sync.sync_records([rec], None, self.idx, self.ledger, dry_run=True)
-        self.assertEqual(r.created, [(123, "(dry-run)")])
+        self.assertEqual(r.created, [("123", "(dry-run)")])
         self.assertIsNone(self.ledger.get(123))
 
     def test_create_falls_back_when_initial_status_rejected(self):
@@ -208,7 +212,7 @@ class SyncLoopTests(unittest.TestCase):
         client.create_work_order.side_effect = [SamsaraApiError(400, "status not allowed"), {"id": "WO-2"}]
         rec = sync.row_to_record(make_row(), self.colmap)
         r = sync.sync_records([rec], client, self.idx, self.ledger)
-        self.assertEqual(r.created, [(123, "WO-2")])
+        self.assertEqual(r.created, [("123", "WO-2")])
         self.assertNotIn("status", client.create_work_order.call_args_list[1][0][0])
         client.update_work_order.assert_called_once_with("WO-2", mock.ANY)
 
@@ -217,8 +221,8 @@ class SyncLoopTests(unittest.TestCase):
         client.create_work_order.side_effect = [SamsaraApiError(500, "boom"), {"id": "WO-3"}]
         recs = [sync.row_to_record(make_row(id=1), self.colmap), sync.row_to_record(make_row(id=2), self.colmap)]
         r = sync.sync_records(recs, client, self.idx, self.ledger)
-        self.assertEqual([f[0] for f in r.failed], [1])
-        self.assertEqual(r.created, [(2, "WO-3")])
+        self.assertEqual([f[0] for f in r.failed], ["1"])
+        self.assertEqual(r.created, [("2", "WO-3")])
 
     def test_rebuild_ledger_from_tags(self):
         client = mock.Mock()
@@ -316,13 +320,13 @@ class SqlLedgerTests(unittest.TestCase):
 
         rows = self.conn.execute("SELECT ts_wo_id, samsara_wo_id, samsara_status, fingerprint, last_action, vehicle_name "
                                  "FROM samsara_workorder_map ORDER BY ts_wo_id").fetchall()
-        self.assertEqual(rows, [(123, "WO-9", "Completed", "fp2", "update", "M-12"),
-                                (124, "WO-10", "In Progress", None, "create", "M-13")])
+        self.assertEqual(rows, [("123", "WO-9", "Completed", "fp2", "update", "M-12"),
+                                ("124", "WO-10", "In Progress", None, "create", "M-13")])
 
         fresh = sync.SqlLedger(self.conn, "samsara_workorder_map", "sqlite")
         self.assertEqual(fresh.get(123)["samsara_id"], "WO-9")
         self.assertEqual(fresh.get(123)["status"], "Completed")
-        self.assertEqual(fresh.open_ts_ids(), [124])
+        self.assertEqual(fresh.open_ts_ids(), ["124"])
         self.assertEqual(fresh.max_ts_id(), 124)
         self.assertEqual(fresh.describe(), "sql:sqlite:samsara_workorder_map")
 
@@ -335,7 +339,7 @@ class SqlLedgerTests(unittest.TestCase):
         rec = sync.row_to_record(make_row(), colmap)
 
         r1 = sync.sync_records([rec], client, idx, self.ledger)
-        self.assertEqual(r1.created, [(123, "WO-1")])
+        self.assertEqual(r1.created, [("123", "WO-1")])
         r2 = sync.sync_records([rec], client, idx, self.ledger)
         self.assertEqual(r2.unchanged, 1)
         row = self.conn.execute("SELECT samsara_wo_id, samsara_asset_id, ts_vehicle_id, last_action "
@@ -390,7 +394,7 @@ class ApiAndCsvSourceTests(unittest.TestCase):
         self.assertEqual(rows[0]["vehicle_name"], "M-12")
         self.assertEqual(rows[0]["cost_center_name"], "Station 4")
         rec = sync.row_to_record(rows[0], colmap)
-        self.assertEqual((rec.ts_id, rec.vehicle_name, rec.status, rec.priority), (501, "M-12", "Open", "High"))
+        self.assertEqual((rec.ts_id, rec.vehicle_name, rec.status, rec.priority), ("501", "M-12", "Open", "High"))
 
     def test_api_source_keeps_open_ledger_ids_outside_window(self):
         rows, _ = sync.load_rows_from_api(FakeTraumasoftAPI(), datetime(2026, 10, 1), extra_ids=[400])
@@ -409,7 +413,7 @@ class ApiAndCsvSourceTests(unittest.TestCase):
             self.assertEqual([r["id"] for r in rows], ["9"])
             self.assertEqual(rows[0]["vehicle_name"], "M-12")
             rec = sync.row_to_record(rows[0], colmap)
-            self.assertEqual((rec.ts_id, rec.vehicle_name, rec.cost_center_name, rec.status), (9, "M-12", "Station 4", "Open"))
+            self.assertEqual((rec.ts_id, rec.vehicle_name, rec.cost_center_name, rec.status), ("9", "M-12", "Station 4", "Open"))
         finally:
             os.unlink(tmp.name)
 
@@ -419,7 +423,7 @@ class ApiAndCsvSourceTests(unittest.TestCase):
             self.assertEqual(sync.resolve_source(None), "csv")
         with mock.patch.object(sync, "TS_WO_CSV_FILE", ""), mock.patch.object(sync, "DB_DSN", ""), \
              mock.patch.object(sync, "TS_WO_SOURCE", ""), mock.patch.dict(os.environ, {"TS_API_BASE_URL": "https://x"}):
-            self.assertEqual(sync.resolve_source(None), "api")
+            self.assertEqual(sync.resolve_source(None), "vehicles")
         with mock.patch.object(sync, "TS_WO_CSV_FILE", ""), mock.patch.object(sync, "DB_DSN", ""), \
              mock.patch.object(sync, "TS_WO_SOURCE", ""), mock.patch.dict(os.environ, {"TS_API_BASE_URL": "", "TS_API_KEY": ""}):
             with self.assertRaises(SystemExit):
@@ -434,3 +438,101 @@ class ApiAndCsvSourceTests(unittest.TestCase):
         self.assertIn("ThirdParty/Data/Nope", out)
         self.assertIn("ThirdParty/Data/WorkOrders", out)
         self.assertIn("OK rows=2", out)
+
+
+class FakeFleetAPI:
+    """TraumaSoft client stand-in for the vehicles source (Fleet/Vehicles + Fleet/CustomStatus)."""
+    def __init__(self):
+        self.vehicles = [
+            {"id": 55, "name": "M-12", "vehicle_status": "In Service", "vin": "1ABC", "odometer": 120000, "disabled": False, "deleted": False},
+            {"id": 56, "name": "M-13", "vehicle_status": "Out of Service", "vin": "2DEF", "odometer": 88000, "disabled": False, "deleted": False},
+            {"id": 57, "name": "M-14", "vehicle_status": "Out of Service", "vin": "3GHI", "odometer": 5, "disabled": False, "deleted": True},
+        ]
+    def list_vehicles(self, include_deleted=False, include_disabled=False, fields=None):
+        return list(self.vehicles)
+    def list_custom_statuses(self, include_deleted=False):
+        return {"custom_statuses": [{"id": 1, "name": "In Service", "notify_group": "vehicles"},
+                                    {"id": 2, "name": "Out of Service", "notify_group": "vehicles"},
+                                    {"id": 3, "name": "In Shop", "notify_group": "vehicles"}]}
+
+
+class VehicleEpisodeSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_path = os.path.join(self.tmp.name, "state.json")
+        self.api = FakeFleetAPI()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_is_oos_status(self):
+        self.assertTrue(sync.is_oos_status("Out of Service"))
+        self.assertTrue(sync.is_oos_status("In Shop - Mechanical"))
+        self.assertFalse(sync.is_oos_status("In Service"))
+        self.assertTrue(sync.is_oos_status("Down", oos_statuses=["down"]))
+        self.assertFalse(sync.is_oos_status("Out of Service", oos_statuses=["In Shop"]))
+
+    def test_episode_lifecycle_open_then_completed(self):
+        t0 = datetime(2026, 10, 14, 9, 0)
+        state = sync.VehicleStatusState(self.state_path)
+        rows, colmap = sync.load_rows_from_vehicles(self.api, state, now=t0)
+        self.assertEqual([r["id"] for r in rows], ["V56-202610140900"])  # deleted M-14 ignored, M-12 in service
+        self.assertEqual(rows[0]["status"], "Open")
+        self.assertEqual(rows[0]["vehicle_vin"], "2DEF")
+        rec = sync.row_to_record(rows[0], colmap)
+        self.assertEqual((rec.ts_id, rec.vehicle_name, rec.status, rec.category), ("V56-202610140900", "M-13", "Open", "Corrective"))
+        self.assertEqual(rec.odometer_meters, int(round(88000 * 1609.344)))
+        self.assertTrue(os.path.exists(self.state_path))
+
+        # same status next run: same episode id, still open, status history unchanged
+        state = sync.VehicleStatusState(self.state_path)
+        rows, _ = sync.load_rows_from_vehicles(self.api, state, now=t0 + timedelta(hours=1))
+        self.assertEqual([r["id"] for r in rows], ["V56-202610140900"])
+
+        # moves to another OOS status: still the same episode, history grows
+        self.api.vehicles[1]["vehicle_status"] = "In Shop"
+        rows, _ = sync.load_rows_from_vehicles(self.api, state, now=t0 + timedelta(hours=2))
+        self.assertIn("Out of Service -> In Shop", rows[0]["description"])
+
+        # back in service: episode completed, emitted once more with Completed
+        self.api.vehicles[1]["vehicle_status"] = "In Service"
+        t3 = t0 + timedelta(days=1)
+        rows, colmap = sync.load_rows_from_vehicles(self.api, state, now=t3)
+        self.assertEqual([(r["id"], r["status"]) for r in rows], [("V56-202610140900", "Completed")])
+        rec = sync.row_to_record(rows[0], colmap)
+        self.assertEqual(rec.status, "Completed")
+        self.assertEqual(rec.completed_at.replace(tzinfo=None), t3)
+
+        # OOS again later => a new episode; the old one is still emitted within retention
+        self.api.vehicles[1]["vehicle_status"] = "Out of Service"
+        rows, _ = sync.load_rows_from_vehicles(self.api, state, now=t3 + timedelta(days=2))
+        self.assertEqual(sorted(r["id"] for r in rows), ["V56-202610140900", "V56-202610170900"])
+        # ...and dropped after retention
+        rows, _ = sync.load_rows_from_vehicles(self.api, state, now=t3 + timedelta(days=40))
+        self.assertEqual([r["id"] for r in rows], ["V56-202610170900"])
+
+    def test_dry_run_does_not_persist_state(self):
+        state = sync.VehicleStatusState(self.state_path)
+        sync.load_rows_from_vehicles(self.api, state, now=datetime(2026, 10, 14, 9, 0), persist=False)
+        self.assertFalse(os.path.exists(self.state_path))
+
+    def test_end_to_end_episode_to_samsara(self):
+        state = sync.VehicleStatusState(self.state_path)
+        rows, colmap = sync.load_rows_from_vehicles(self.api, state, now=datetime(2026, 10, 14, 9, 0))
+        recs = [sync.row_to_record(r, colmap) for r in rows]
+        idx = sync.VehicleIndex([{"id": "A2", "name": "Medic 13", "vin": "2def"}])  # name differs, VIN matches
+        client = mock.Mock(); client.create_work_order.return_value = {"id": "WO-77"}
+        ledger = sync.Ledger(os.path.join(self.tmp.name, "ledger.json"))
+        res = sync.sync_records(recs, client, idx, ledger)
+        self.assertEqual(res.created, [("V56-202610140900", "WO-77")])
+        payload = client.create_work_order.call_args[0][0]
+        self.assertEqual(payload["assetId"], "A2")
+        self.assertTrue(payload["description"].startswith("[TS-WO:V56-202610140900] Vehicle M-13 marked 'Out of Service'"))
+        self.assertNotIn("status", payload)
+        self.assertEqual(sync.TS_TAG_RE.search(payload["description"]).group(1), "V56-202610140900")
+
+    def test_resolve_source_prefers_vehicles_for_api_credentials(self):
+        with mock.patch.object(sync, "TS_WO_CSV_FILE", ""), mock.patch.object(sync, "DB_DSN", ""), \
+             mock.patch.object(sync, "TS_WO_SOURCE", ""), mock.patch.dict(os.environ, {"TS_API_KEY": "k"}):
+            self.assertEqual(sync.resolve_source(None), "vehicles")
+        self.assertEqual(sync.resolve_source("api"), "api")

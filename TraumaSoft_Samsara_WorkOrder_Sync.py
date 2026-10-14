@@ -101,6 +101,15 @@ TS_WO_SOURCE = os.getenv("TS_WO_SOURCE", "").strip().lower()
 TS_WO_API_PATH = os.getenv("TS_WO_API_PATH", "ThirdParty/Data/WorkOrders")
 TS_WO_API_PARAMS = _env_json("TS_WO_API_PARAMS", {})
 TS_WO_CSV_FILE = os.getenv("TS_WO_CSV_FILE", "")
+# `vehicles` source: TraumaSoft has no work-order endpoint, so an out-of-service vehicle status
+# (GET ThirdParty/Data/Fleet/Vehicles -> vehicle_status) opens a Samsara work order and the return
+# to service completes it.  Which statuses count as out of service: TS_OOS_STATUSES (JSON list of
+# exact names) or, when unset, any status containing one of TS_OOS_KEYWORDS.
+TS_VEHICLE_STATE_FILE = os.getenv("TS_VEHICLE_STATE_FILE", os.path.join(STATE_DIR, "ts_vehicle_status_state.json"))
+TS_OOS_STATUSES = _env_json("TS_OOS_STATUSES", [])
+TS_OOS_KEYWORDS = _env_json("TS_OOS_KEYWORDS", ["out of service", "oos", "shop", "mechanical", "maintenance", "repair", "down", "broke"])
+TS_VEHICLE_ODOMETER_UNIT = os.getenv("TS_VEHICLE_ODOMETER_UNIT", "miles")
+TS_VEHICLE_CLOSED_RETENTION_DAYS = int(os.getenv("TS_VEHICLE_CLOSED_RETENTION_DAYS", "30"))
 TS_TIMEZONE = os.getenv("TS_TIMEZONE", "America/New_York")
 TS_WO_TABLE = os.getenv("TS_WO_TABLE", "vm_work_orders")
 TS_WO_SQL_FILE = os.getenv("TS_WO_SQL_FILE")  # optional: full override of the source query
@@ -114,7 +123,7 @@ SAMSARA_BASE_URL = os.getenv("SAMSARA_BASE_URL", DEFAULT_BASE_URL)
 SAMSARA_DEFAULT_PRIORITY = os.getenv("SAMSARA_DEFAULT_PRIORITY", "Medium")
 SAMSARA_SEND_INITIAL_STATUS = _env_bool("SAMSARA_SEND_INITIAL_STATUS", True)
 # How to match a TraumaSoft vehicle to a Samsara vehicle: name | externalId | vin
-SAMSARA_VEHICLE_MATCH = os.getenv("SAMSARA_VEHICLE_MATCH", "name").strip()
+SAMSARA_VEHICLE_MATCH = os.getenv("SAMSARA_VEHICLE_MATCH", "vin").strip()  # tried first; the other modes are fallbacks
 SAMSARA_VEHICLE_EXTERNAL_ID_KEY = os.getenv("SAMSARA_VEHICLE_EXTERNAL_ID_KEY", "traumasoftVehicleId")
 
 TEST_MODE = _env_bool("TEST_MODE", False)
@@ -123,7 +132,7 @@ STATUS_EMAIL_RECIPIENT = os.getenv("STATUS_EMAIL_RECIPIENT") or os.getenv("REPOR
 PROD_RECIPIENTS = [r.strip() for r in os.getenv("SYNC_RECIPIENTS", "").split(",") if r.strip()]
 EMAIL_SUBJECT = "TraumaSoft -> Samsara Work Order Sync - {date}{test_suffix}"
 
-TS_TAG_RE = re.compile(r"\[TS-WO:(\d+)\]")
+TS_TAG_RE = re.compile(r"\[TS-WO:([A-Za-z0-9_.:-]+)\]")
 
 # Candidate column names for each logical field, first match wins.  Override or
 # extend with TS_WO_COLUMN_MAP='{"description": ["complaint"], ...}'.
@@ -188,7 +197,7 @@ TERMINAL_STATUSES = {"Completed", "Closed", "Cancelled"}
 # =============================
 @dataclass
 class WorkOrderRecord:
-    ts_id: int
+    ts_id: str                      # TraumaSoft work order id, or a vehicle OOS episode id (V<vehicle>-<yyyymmddHHMM>)
     vehicle_id: Optional[int]
     vehicle_name: Optional[str]
     description: str
@@ -418,8 +427,7 @@ class VehicleIndex:
             if vin:
                 self.by_vin[str(vin).strip().upper()] = vid
 
-    def resolve(self, rec: WorkOrderRecord, mode: str = "name") -> Optional[str]:
-        mode = (mode or "name").lower()
+    def _resolve_one(self, rec: WorkOrderRecord, mode: str) -> Optional[str]:
         if mode == "externalid":
             return self.by_external.get(str(rec.vehicle_id)) if rec.vehicle_id is not None else None
         if mode == "vin":
@@ -431,6 +439,16 @@ class VehicleIndex:
         if key in self.duplicates:
             logging.warning("Samsara has multiple vehicles named like %r; using first match", rec.vehicle_name)
         return self.by_name.get(key)
+
+    def resolve(self, rec: WorkOrderRecord, mode: str = "vin", fallback: bool = True) -> Optional[str]:
+        """Try `mode` first (vin | name | externalId); with fallback, try the other modes too."""
+        mode = (mode or "vin").lower()
+        order = [mode] + ([m for m in ("vin", "name", "externalid") if m != mode] if fallback else [])
+        for m in order:
+            hit = self._resolve_one(rec, m)
+            if hit:
+                return hit
+        return None
 
 
 def row_to_record(row: Dict[str, Any], colmap: Dict[str, Optional[str]], maps: Optional[Dict[str, Dict[str, str]]] = None,
@@ -467,7 +485,7 @@ def row_to_record(row: Dict[str, Any], colmap: Dict[str, Optional[str]], maps: O
         vehicle_id = None
 
     return WorkOrderRecord(
-        ts_id=int(get("id")),
+        ts_id=str(get("id")).strip(),
         vehicle_id=vehicle_id,
         vehicle_name=row.get("vehicle_name") or get("vehicle_name"),
         description=str(get("description") or "").strip(),
@@ -514,10 +532,10 @@ class Ledger:
     def work_orders(self) -> Dict[str, Dict[str, Any]]:
         return self.data["work_orders"]
 
-    def get(self, ts_id: int) -> Optional[Dict[str, Any]]:
+    def get(self, ts_id) -> Optional[Dict[str, Any]]:
         return self.work_orders.get(str(ts_id))
 
-    def put(self, ts_id: int, samsara_id: str, fp: Optional[str], status: str, asset_id: Optional[str],
+    def put(self, ts_id, samsara_id: str, fp: Optional[str], status: str, asset_id: Optional[str],
             vehicle_id: Optional[int] = None, vehicle_name: Optional[str] = None, action: Optional[str] = None) -> None:
         now = datetime.now().isoformat(timespec="seconds")
         entry = self.work_orders.setdefault(str(ts_id), {"created_at": now})
@@ -525,11 +543,11 @@ class Ledger:
                       "asset_id": asset_id, "vehicle_id": vehicle_id, "vehicle_name": vehicle_name,
                       "last_action": action, "updated_at": now})
 
-    def open_ts_ids(self) -> List[int]:
-        return [int(k) for k, v in self.work_orders.items() if v.get("status") not in TERMINAL_STATUSES]
+    def open_ts_ids(self) -> List[str]:
+        return [k for k, v in self.work_orders.items() if v.get("status") not in TERMINAL_STATUSES]
 
     def max_ts_id(self) -> int:
-        return max((int(k) for k in self.work_orders), default=0)
+        return max((int(k) for k in self.work_orders if str(k).isdigit()), default=0)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -596,10 +614,10 @@ class SqlLedger:
             }
         cur.close()
 
-    def get(self, ts_id: int) -> Optional[Dict[str, Any]]:
+    def get(self, ts_id) -> Optional[Dict[str, Any]]:
         return self.work_orders.get(str(ts_id))
 
-    def put(self, ts_id: int, samsara_id: str, fp: Optional[str], status: str, asset_id: Optional[str],
+    def put(self, ts_id, samsara_id: str, fp: Optional[str], status: str, asset_id: Optional[str],
             vehicle_id: Optional[int] = None, vehicle_name: Optional[str] = None, action: Optional[str] = None) -> None:
         now = datetime.now().replace(microsecond=0)
         existing = self.get(ts_id)
@@ -608,14 +626,14 @@ class SqlLedger:
             cur.execute(
                 f"UPDATE {self.table} SET samsara_wo_id=?, samsara_asset_id=?, ts_vehicle_id=?, vehicle_name=?, "
                 f"samsara_status=?, fingerprint=?, last_action=?, last_synced_at=? WHERE ts_wo_id=?",
-                (str(samsara_id), asset_id, vehicle_id, vehicle_name, status, fp, action, now, int(ts_id)),
+                (str(samsara_id), asset_id, vehicle_id, vehicle_name, status, fp, action, now, str(ts_id)),
             )
             if cur.rowcount == 0:
                 existing = None
         if not existing:
             cur.execute(
                 f"INSERT INTO {self.table} ({', '.join(LEDGER_COLUMNS)}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (int(ts_id), str(samsara_id), asset_id, vehicle_id, vehicle_name, status, fp, action, now, now),
+                (str(ts_id), str(samsara_id), asset_id, vehicle_id, vehicle_name, status, fp, action, now, now),
             )
         cur.close()
         entry = self.work_orders.setdefault(str(ts_id), {"created_at": now.isoformat()})
@@ -623,11 +641,11 @@ class SqlLedger:
                       "vehicle_id": vehicle_id, "vehicle_name": vehicle_name, "last_action": action,
                       "updated_at": now.isoformat()})
 
-    def open_ts_ids(self) -> List[int]:
-        return [int(k) for k, v in self.work_orders.items() if v.get("status") not in TERMINAL_STATUSES]
+    def open_ts_ids(self) -> List[str]:
+        return [k for k, v in self.work_orders.items() if v.get("status") not in TERMINAL_STATUSES]
 
     def max_ts_id(self) -> int:
-        return max((int(k) for k in self.work_orders), default=0)
+        return max((int(k) for k in self.work_orders if str(k).isdigit()), default=0)
 
     def save(self) -> None:
         self.conn.commit()
@@ -718,7 +736,7 @@ def fetch_work_orders(conn, colmap: Dict[str, Optional[str]], since: datetime, e
     rows = _rows(cur)
     seen = {r.get(colmap.get("id") or "id") for r in rows}
 
-    missing = [i for i in extra_ids if i not in seen]
+    missing = [int(i) for i in extra_ids if str(i).isdigit() and int(i) not in seen and str(i) not in {str(x) for x in seen}]
     if missing and sql_by_ids:
         for i in range(0, len(missing), 500):
             chunk = missing[i:i + 500]
@@ -886,17 +904,193 @@ def load_rows_from_csv(path: str, since: datetime, column_overrides: Optional[Di
     return recent, colmap
 
 
+# =============================
+# TRAUMASOFT SOURCE: VEHICLE STATUS EPISODES
+# =============================
+VEHICLE_FIELDS = ["id", "name", "vehicle_status", "vin", "odometer", "disabled", "deleted"]
+
+
+def is_oos_status(name: Any, oos_statuses: Optional[List[str]] = None, keywords: Optional[List[str]] = None) -> bool:
+    """Does this TraumaSoft vehicle status mean the unit is out of service / needs a work order?"""
+    n = _norm_key(name or "")
+    if not n:
+        return False
+    if oos_statuses:
+        return any(_norm_key(x) == n for x in oos_statuses)
+    return any(_norm_key(k) in n for k in (keywords if keywords is not None else TS_OOS_KEYWORDS))
+
+
+def ts_api_vehicles(api) -> List[Dict[str, Any]]:
+    try:
+        rows = api.list_vehicles(include_deleted=False, include_disabled=True, fields=VEHICLE_FIELDS)
+    except TypeError:
+        rows = api.list_vehicles()
+    if isinstance(rows, dict):
+        rows = rows.get("rows") or rows.get("data") or []
+    return [r for r in rows or [] if isinstance(r, dict)]
+
+
+def ts_api_custom_statuses(api) -> List[Dict[str, Any]]:
+    try:
+        rows = api.list_custom_statuses()
+    except Exception as e:
+        logging.warning("Could not list TraumaSoft custom statuses: %s", e)
+        return []
+    if isinstance(rows, dict):
+        rows = rows.get("custom_statuses") or rows.get("rows") or []
+    return [r for r in rows or [] if isinstance(r, dict)]
+
+
+class VehicleStatusState:
+    """Per-vehicle status memory: the open out-of-service episode and recently closed ones."""
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self.data: Dict[str, Any] = {"version": 1, "vehicles": {}}
+        if self.path.exists():
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.data = json.load(f)
+            self.data.setdefault("vehicles", {})
+
+    @property
+    def vehicles(self) -> Dict[str, Dict[str, Any]]:
+        return self.data["vehicles"]
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix="vehstate_", suffix=".json", dir=str(self.path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, indent=2, sort_keys=True)
+        os.replace(tmp, self.path)
+
+
+def episode_row(vid: str, entry: Dict[str, Any], ep: Dict[str, Any], now: datetime, odometer_unit: str) -> Dict[str, Any]:
+    statuses = " -> ".join(ep.get("statuses") or [])
+    started = ep.get("started_at", "")[:16].replace("T", " ")
+    desc = f"Vehicle {entry.get('name')} marked '{ep.get('statuses', [''])[0]}' in TraumaSoft since {started}"
+    if len(ep.get("statuses") or []) > 1:
+        desc += f" (status history: {statuses})"
+    if ep.get("completed_at"):
+        desc += f"; returned to service as '{ep.get('end_status')}' on {ep['completed_at'][:16].replace('T', ' ')}"
+    return {
+        "id": ep["id"],
+        "vehicle_id": vid,
+        "vehicle_name": entry.get("name"),
+        "vehicle_vin": entry.get("vin"),
+        "description": desc,
+        "status": "Completed" if ep.get("completed_at") else "Open",
+        "ts_status": entry.get("status"),
+        "date_created": ep.get("started_at"),
+        "date_updated": ep.get("completed_at") or now.isoformat(timespec="seconds"),
+        "date_completed": ep.get("completed_at"),
+        "odometer": ep.get("odometer_start"),
+        "odometer_type": odometer_unit,
+        "category": "Corrective",
+    }
+
+
+def load_rows_from_vehicles(api, state: VehicleStatusState, now: Optional[datetime] = None, persist: bool = True,
+                            oos_statuses: Optional[List[str]] = None, keywords: Optional[List[str]] = None,
+                            odometer_unit: str = TS_VEHICLE_ODOMETER_UNIT,
+                            closed_retention_days: int = TS_VEHICLE_CLOSED_RETENTION_DAYS,
+                            column_overrides: Optional[Dict[str, List[str]]] = None
+                            ) -> Tuple[List[Dict[str, Any]], Dict[str, Optional[str]]]:
+    """
+    Turn TraumaSoft vehicle statuses into work-order-like rows.  A vehicle entering an
+    out-of-service status starts an episode (id V<vehicle_id>-<yyyymmddHHMM>); leaving it
+    completes the episode.  Open episodes and episodes closed within the retention window are
+    returned so Samsara can be created / updated / completed.
+    """
+    now = now or datetime.now()
+    now_s = now.isoformat(timespec="seconds")
+    vehicles = ts_api_vehicles(api)
+    logging.info("TraumaSoft vehicles fetched: %s", len(vehicles))
+    rows: List[Dict[str, Any]] = []
+    cutoff = now - timedelta(days=closed_retention_days)
+    seen_ids = set()
+    for v in vehicles:
+        vid = _first(v, "id", "Id", "ID")
+        if vid is None or _is_truthy(v.get("deleted")):
+            continue
+        vid = str(vid)
+        seen_ids.add(vid)
+        status = str(_first(v, "vehicle_status", "status", "Status") or "").strip()
+        oos = is_oos_status(status, oos_statuses if oos_statuses is not None else TS_OOS_STATUSES, keywords) and not _is_truthy(v.get("disabled"))
+        entry = state.vehicles.setdefault(vid, {"closed": []})
+        entry.update({"name": _first(v, "name", "Name"), "vin": _first(v, "vin", "VIN"), "status": status, "last_seen": now_s})
+        odo = _first(v, "odometer", "Odometer")
+        ep = entry.get("episode")
+        if oos and not ep:
+            ep = {"id": f"V{vid}-{now:%Y%m%d%H%M}", "started_at": now_s, "statuses": [status], "odometer_start": odo}
+            entry["episode"] = ep
+            logging.info("OOS start: vehicle %s (%s) status %r -> episode %s", entry.get("name"), vid, status, ep["id"])
+        elif oos and ep:
+            if status and status not in ep["statuses"]:
+                ep["statuses"].append(status)
+        elif not oos and ep:
+            ep["completed_at"] = now_s
+            ep["end_status"] = status
+            ep["odometer_end"] = odo
+            entry.setdefault("closed", []).append(ep)
+            entry["episode"] = None
+            logging.info("OOS end: vehicle %s (%s) back to %r -> episode %s completed", entry.get("name"), vid, status, ep["id"])
+            ep = None
+        if entry.get("episode"):
+            rows.append(episode_row(vid, entry, entry["episode"], now, odometer_unit))
+        kept = []
+        for c in entry.get("closed", []):
+            done = c.get("completed_at")
+            if done and datetime.fromisoformat(done) >= cutoff:
+                kept.append(c)
+                rows.append(episode_row(vid, entry, c, now, odometer_unit))
+        entry["closed"] = kept
+    # vehicles that vanished from the API while an episode was open: leave the episode open (nothing to say)
+    if persist:
+        state.save()
+    cols = sorted({k for r in rows for k in r.keys()}) or ["id", "vehicle_id", "vehicle_name", "description", "status"]
+    colmap = resolve_column_map(cols, column_overrides)
+    logging.info("Vehicle status episodes: %s rows (%s open)", len(rows), sum(1 for r in rows if r["status"] == "Open"))
+    return rows, colmap
+
+
+def _is_truthy(v: Any) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "y") if v is not None else False
+
+
+def discover_vehicles(api, state: VehicleStatusState, now: Optional[datetime] = None) -> None:
+    statuses = ts_api_custom_statuses(api)
+    print(f"\n== TraumaSoft custom statuses ({len(statuses)}) ==  [* = treated as out of service]")
+    for st in sorted(statuses, key=lambda x: (str(x.get("notify_group")), str(x.get("name")))):
+        flag = "*" if is_oos_status(st.get("name"), TS_OOS_STATUSES) else " "
+        print(f"  {flag} id={st.get('id')!s:6} group={st.get('notify_group')!s:12} name={st.get('name')!r}")
+    vehicles = ts_api_vehicles(api)
+    counts: Dict[str, int] = {}
+    for v in vehicles:
+        counts[str(_first(v, "vehicle_status", "status") or "")] = counts.get(str(_first(v, "vehicle_status", "status") or ""), 0) + 1
+    print(f"\n== vehicles by vehicle_status ({len(vehicles)} vehicles) ==")
+    for name, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        flag = "*" if is_oos_status(name, TS_OOS_STATUSES) else " "
+        print(f"  {flag} {name!r}: {n}")
+    print("\n== sample vehicle rows ==")
+    for v in vehicles[:3]:
+        print(json.dumps(v, default=str, indent=2))
+    print("\nIf the wrong statuses are starred, set TS_OOS_STATUSES to a JSON list of the exact names, e.g.")
+    print('  TS_OOS_STATUSES=["Out of Service", "In Shop"]')
+    rows, colmap = load_rows_from_vehicles(api, state, now=now, persist=False)
+    discover_rows(rows, colmap, "work-order episodes that would be synced")
+
+
 def resolve_source(explicit: Optional[str] = None) -> str:
     src = (explicit or TS_WO_SOURCE or "").lower()
-    if src in ("db", "api", "csv"):
+    if src in ("db", "api", "csv", "vehicles"):
         return src
     if TS_WO_CSV_FILE:
         return "csv"
     if DB_DSN:
         return "db"
     if os.getenv("TS_API_BASE_URL") or os.getenv("TS_API_KEY"):
-        return "api"
-    raise SystemExit("No work order source configured: set DB_DSN (db), TS_API_BASE_URL/TS_API_KEY (api) or TS_WO_CSV_FILE (csv), or TS_WO_SOURCE.")
+        return "vehicles"  # the TraumaSoft API has no work-order endpoint; vehicle status is the signal
+    raise SystemExit("No work order source configured: set TS_API_BASE_URL/TS_API_KEY (vehicles/api), DB_DSN (db) or TS_WO_CSV_FILE (csv), or TS_WO_SOURCE.")
 
 
 def probe_api(api, extra_paths: Optional[List[str]] = None) -> None:
@@ -1039,7 +1233,7 @@ def rebuild_ledger(client: SamsaraClient, ledger) -> int:
         m = TS_TAG_RE.search(wo.get("description") or "")
         if not m:
             continue
-        ts_id = int(m.group(1))
+        ts_id = m.group(1)
         existing = ledger.get(ts_id)
         if existing and existing.get("samsara_id") == str(wo.get("id")):
             continue
@@ -1136,7 +1330,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Sync TraumaSoft work orders into Samsara.")
     p.add_argument("--dry-run", action="store_true", help="Read TraumaSoft and Samsara but write nothing to Samsara.")
     p.add_argument("--discover", action="store_true", help="Print the work order source's columns, samples and distinct statuses, then exit.")
-    p.add_argument("--source", choices=["db", "api", "csv"], help="Override TS_WO_SOURCE for this run.")
+    p.add_argument("--source", choices=["vehicles", "api", "db", "csv"], help="Override TS_WO_SOURCE for this run.")
     p.add_argument("--probe-api", action="store_true",
                    help="Try likely TraumaSoft API endpoints for work orders and report which respond, then exit.")
     p.add_argument("--probe-path", action="append", help="Extra endpoint path(s) to try with --probe-api (repeatable).")
@@ -1146,7 +1340,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--since", type=lambda s: datetime.strptime(s, "%Y-%m-%d"), help="Sync work orders changed since YYYY-MM-DD.")
     p.add_argument("--lookback-days", type=int, default=TS_WO_LOOKBACK_DAYS)
     p.add_argument("--limit", type=int, help="Process at most N work orders (useful for a first test).")
-    p.add_argument("--ts-id", type=int, action="append", help="Sync only these TraumaSoft work order ids (repeatable).")
+    p.add_argument("--ts-id", type=str, action="append", help="Sync only these TraumaSoft work order / episode ids (repeatable).")
     p.add_argument("--no-email", action="store_true")
     return p.parse_args(argv[1:])
 
@@ -1188,7 +1382,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 conn.close()
         else:
             far_past = datetime(1970, 1, 2)
-            if source == "api":
+            if source == "vehicles":
+                discover_vehicles(open_traumasoft_api(), VehicleStatusState(TS_VEHICLE_STATE_FILE), now=now_local.replace(tzinfo=None))
+            elif source == "api":
                 rows, colmap = load_rows_from_api(open_traumasoft_api(), far_past, column_overrides)
                 discover_rows(rows, colmap, f"TraumaSoft API {TS_WO_API_PATH}")
             else:
@@ -1228,6 +1424,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             rows = fetch_work_orders(conn, colmap, since, extra_ids, args.limit, ledger.max_ts_id())
         finally:
             conn.close()
+    elif source == "vehicles":
+        rows, colmap = load_rows_from_vehicles(open_traumasoft_api(), VehicleStatusState(TS_VEHICLE_STATE_FILE),
+                                               now=now_local.replace(tzinfo=None), persist=not args.dry_run,
+                                               column_overrides=column_overrides)
     elif source == "api":
         rows, colmap = load_rows_from_api(open_traumasoft_api(), since, column_overrides, extra_ids)
     else:
@@ -1254,7 +1454,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             continue
         if rec.vehicle_id in TS_WO_EXCLUDE_VEHICLE_IDS:
             continue
-        if args.ts_id and rec.ts_id not in args.ts_id:
+        if args.ts_id and str(rec.ts_id) not in {str(x) for x in args.ts_id}:
             continue
         records.append(rec)
 

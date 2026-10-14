@@ -2,7 +2,7 @@
 -- One row per TraumaSoft work order that has been pushed to Samsara.
 IF OBJECT_ID('dbo.samsara_workorder_map', 'U') IS NULL
 CREATE TABLE dbo.samsara_workorder_map (
-    ts_wo_id          INT           NOT NULL PRIMARY KEY,
+    ts_wo_id          VARCHAR(64)   NOT NULL PRIMARY KEY,
     samsara_wo_id     VARCHAR(64)   NOT NULL,
     samsara_asset_id  VARCHAR(64)   NULL,
     ts_vehicle_id     INT           NULL,

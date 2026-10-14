@@ -1,6 +1,6 @@
 -- SQLite flavour (used by the unit tests and for local experiments).
 CREATE TABLE IF NOT EXISTS samsara_workorder_map (
-    ts_wo_id          INTEGER PRIMARY KEY,
+    ts_wo_id          TEXT PRIMARY KEY,
     samsara_wo_id     TEXT NOT NULL UNIQUE,
     samsara_asset_id  TEXT,
     ts_vehicle_id     INTEGER,

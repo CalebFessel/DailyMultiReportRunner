@@ -1,7 +1,7 @@
 -- TraumaSoft -> Samsara work order mapping ("endpoint table"), MySQL / MariaDB.
--- One row per TraumaSoft work order that has been pushed to Samsara.
+-- One row per TraumaSoft work order (or vehicle out-of-service episode) pushed to Samsara.
 CREATE TABLE IF NOT EXISTS samsara_workorder_map (
-    ts_wo_id          INT          NOT NULL,
+    ts_wo_id          VARCHAR(64)  NOT NULL,
     samsara_wo_id     VARCHAR(64)  NOT NULL,
     samsara_asset_id  VARCHAR(64)  NULL,
     ts_vehicle_id     INT          NULL,

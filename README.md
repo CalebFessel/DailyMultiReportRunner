@@ -291,6 +291,42 @@ Other flags: `--since YYYY-MM-DD`, `--lookback-days N`, `--rebuild-ledger`, `--n
 
 If the default query doesn't fit, point `TS_WO_SQL_FILE` at a `.sql` file. It must take one `?` parameter (the lookback start timestamp) and return the work order columns plus `vehicle_name`, `cost_center_name` and optionally `vehicle_odometer_type` / `vehicle_vin`.
 
+### Endpoint table
+
+Every call the sync makes, in the order it makes them:
+
+| Step | Method | Samsara endpoint | Token scope | Samsara rate limit | What the sync does with it |
+|---|---|---|---|---|---|
+| 1 | `GET` | `/fleet/vehicles?limit=512` (paged via `pagination.endCursor`) | Read Vehicles | 25 req/sec | Builds the vehicle index used to turn a TraumaSoft vehicle into a Samsara `assetId` (by name, `externalIds`, or VIN) |
+| 2 | `POST` | `/maintenance/work-orders` | Write Work Orders | 100 req/min | Creates one Samsara work order per new TraumaSoft work order |
+| 3 | `PATCH` | `/maintenance/work-orders` (work order `id` in the body) | Write Work Orders | 100 req/min | Pushes status / description / priority / odometer / date changes for work orders already in the ledger |
+| – | `GET` | `/maintenance/work-orders` (paged) | Read Work Orders | 5 req/sec | Only with `--rebuild-ledger`: scans descriptions for `[TS-WO:<id>]` to rebuild the ledger |
+
+Base URL is `SAMSARA_BASE_URL` (default `https://api.samsara.com`). All requests send `Authorization: Bearer <SAMSARA_API_TOKEN>`.
+
+TraumaSoft side: one `SELECT` against `TS_WO_TABLE` (default `vm_work_orders`) joined to `sched_vehicles` and `cost_centers`, filtered to rows changed in the last `TS_WO_LOOKBACK_DAYS`, plus a second `SELECT ... WHERE id IN (...)` for ledger work orders that are still open.
+
+### Field mapping (TraumaSoft → Samsara)
+
+| Logical field | TraumaSoft column candidates (first match wins) | Samsara field | Transform |
+|---|---|---|---|
+| id | `id`, `work_order_id`, `wo_id` | `description` prefix | `[TS-WO:<id>]` tag, also the ledger key |
+| vehicle | `vehicle_id` → `sched_vehicles.name` | `assetId` | Name match (punctuation/case-insensitive), or `externalIds[SAMSARA_VEHICLE_EXTERNAL_ID_KEY]`, or VIN |
+| description | `description`, `complaint`, `notes`, `details`, `problem`, `work_description`, `summary`, `title`, `name` | `description` | Prefixed with the tag; trailer adds TraumaSoft WO#, station, raw status |
+| status | `status`, `status_name`, `state`, `wo_status`, else `status_id` | `status` | Text → Samsara enum via built-in map + `TS_WO_STATUS_MAP`; no status but a completed date → `Completed`; unknown → `Open` |
+| priority | `priority`, `priority_name`, `priority_id` | `priority` | Text/number → `Low/Medium/High/Urgent`; default `SAMSARA_DEFAULT_PRIORITY` |
+| category | `category`, `type`, `work_type`, `wo_type`, `service_type` | `category` | Text → `Annual/Corrective/Damage Repair/Preventive/Recall`; omitted if unknown |
+| odometer | `odometer_started`, `odometer`, `mileage`, `odometer_completed` (+ `odometer_type`) | `odometerMeters` | miles × 1609.344, or km × 1000 |
+| engine hours | `engine_hours`, `hours` | `engineHours` | integer |
+| due | `due_date`, `date_due`, `due_at` | `dueAtTime` | RFC 3339 in `TS_TIMEZONE` |
+| started | `date_started`, `started_at`, `start_date`, `date_start` | `startedAtTime` | create only; RFC 3339 |
+| completed | `date_completed`, `completed_at`, `completed`, `date_closed`, `closed_at`, `close_date`, `date_finished` | `completedAtTime` | only when status is Completed/Closed/Cancelled |
+| changed-since filter | `date_updated`, `updated_at`, `modified`, … then `date_created`, … | – | `COALESCE(updated, created, completed) >= lookback` |
+| soft delete | `deleted`, `is_deleted` | – | rows with a non-zero value are excluded |
+| cost center | `cost_center_id` → `cost_centers.name` | `description` trailer | `Station: <name>` |
+
+Run `--discover` to see which real columns were picked; anything that resolved to `None` can be pointed at the right column with `TS_WO_COLUMN_MAP`.
+
 ### Environment variables
 
 | Variable | Default | Purpose |

@@ -404,8 +404,8 @@ class ApiAndCsvSourceTests(unittest.TestCase):
         tmp.close()
         try:
             rows, colmap = sync.load_rows_from_csv(tmp.name, datetime(2026, 10, 1))
-            self.assertEqual(colmap["vehicle_name"], "vehicle")
-            self.assertEqual(colmap["cost_center_name"], "station")
+            self.assertEqual(colmap["vehicle_name"], "vehicle_name")  # enriched from the "vehicle" column
+            self.assertEqual(colmap["cost_center_name"], "cost_center_name")  # enriched from "station"
             self.assertEqual([r["id"] for r in rows], ["9"])
             self.assertEqual(rows[0]["vehicle_name"], "M-12")
             rec = sync.row_to_record(rows[0], colmap)

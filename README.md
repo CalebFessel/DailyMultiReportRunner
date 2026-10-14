@@ -268,6 +268,8 @@ Create an API token in Samsara (Settings → API Tokens) with these scopes: **Re
 
 The exact `vm_work_orders` columns are not identical across TraumaSoft installs, so the sync discovers them at runtime. Start with:
 
+On Windows, `Run-WorkOrderSync.ps1` finds Python for you (`PYTHON_EXE`, `.venv`, the `py` launcher, PATH, or the usual install folders) and passes arguments through, e.g. `.\Run-WorkOrderSync.ps1 -Install` then `.\Run-WorkOrderSync.ps1 --discover`. Note that Windows PowerShell 5.1 does not accept `&&`; put commands on separate lines or join them with `;`.
+
 ```bash
 # 1. See the real columns, sample rows and distinct status/priority values
 python TraumaSoft_Samsara_WorkOrder_Sync.py --discover

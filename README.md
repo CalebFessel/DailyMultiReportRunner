@@ -251,7 +251,15 @@ When modifying SQL, ensure parameter counts still match the number of `?` placeh
 
 ## TraumaSoft → Samsara Work Order Sync
 
-`TraumaSoft_Samsara_WorkOrder_Sync.py` mirrors vehicle maintenance work orders from the TraumaSoft reporting database (`vm_work_orders`, joined to `sched_vehicles` and `cost_centers`) into **Samsara Maintenance → Work Orders**.
+`TraumaSoft_Samsara_WorkOrder_Sync.py` mirrors TraumaSoft vehicle maintenance work orders into **Samsara Maintenance → Work Orders**. Work orders can come from any of three sources (`TS_WO_SOURCE`, auto-detected when unset):
+
+| Source | When it's used | Needs |
+|---|---|---|
+| `api` | `TS_API_BASE_URL` / `TS_API_KEY` are set (the same `.env` the API-based reports use) | the project's `traumasoft_api.py` next to the script; `TS_WO_API_PATH` pointing at the endpoint that returns work orders (find it with `--probe-api`) |
+| `db` | `DB_DSN` is set | an ODBC DSN to the TraumaSoft reporting DB; reads `vm_work_orders` joined to `sched_vehicles` / `cost_centers` |
+| `csv` | `TS_WO_CSV_FILE` is set | an export of the work order list with at least an id, a vehicle name/number and a description column |
+
+Rows from every source go through the same column resolution and mapping, so `--discover`, `TS_WO_COLUMN_MAP` and the status/priority maps work the same way for all of them.
 
 - New TraumaSoft work orders are created in Samsara (`POST /maintenance/work-orders`).
 - Changes to status, description, priority, odometer, due/completed dates are pushed as updates (`PATCH /maintenance/work-orders`).
@@ -259,6 +267,17 @@ When modifying SQL, ensure parameter counts still match the number of `?` placeh
 - Vehicles are matched to Samsara assets by **name** by default (case/punctuation-insensitive, so `M-12` matches `M 12`). Set `SAMSARA_VEHICLE_MATCH=externalId` (with `SAMSARA_VEHICLE_EXTERNAL_ID_KEY`) or `vin` to match differently. Work orders whose vehicle isn't found are skipped and listed in the summary email.
 - TraumaSoft statuses/priorities/categories are mapped to Samsara's enums (`Open`, `Assigned`, `In Progress`, `On Hold`, `Pending Parts`, `Pending Approval`, `Completed`, `Closed`, `Cancelled`; `Low/Medium/High/Urgent`; `Annual/Corrective/Damage Repair/Preventive/Recall`). Common text values map automatically; numeric ids or custom labels can be mapped with `TS_WO_STATUS_MAP`, `TS_WO_PRIORITY_MAP`, `TS_WO_CATEGORY_MAP` (JSON).
 - Odometers are converted from TraumaSoft miles (or km when `odometer_type` says so) to Samsara meters; timestamps are emitted as RFC 3339 in `TS_TIMEZONE` (default `America/New_York`).
+
+### Finding the TraumaSoft work-order endpoint
+
+TraumaSoft's third-party API paths look like `ThirdParty/Data/<Entity>`. The endpoint for work orders isn't documented publicly, so probe for it with the existing client and your `.env`:
+
+```bash
+python TraumaSoft_Samsara_WorkOrder_Sync.py --probe-api
+python TraumaSoft_Samsara_WorkOrder_Sync.py --probe-api --probe-path ThirdParty/Data/SomethingElse
+```
+
+It prints each candidate path with its HTTP status, and for any that answer, the row count and field names. Set `TS_WO_API_PATH` to the one that returns work orders (and `TS_WO_API_PARAMS` as JSON if it needs filters), then run `--discover`. If TraumaSoft confirms there is no work-order endpoint, use the `csv` source with a scheduled export, or the `db` source if Direct Database Access is available.
 
 ### Samsara API token
 
@@ -268,7 +287,17 @@ Create an API token in Samsara (Settings → API Tokens) with these scopes: **Re
 
 The exact `vm_work_orders` columns are not identical across TraumaSoft installs, so the sync discovers them at runtime. Start with:
 
-On Windows, `Run-WorkOrderSync.ps1` finds Python for you (`PYTHON_EXE`, `.venv`, the `py` launcher, PATH, or the usual install folders) and passes arguments through, e.g. `.\Run-WorkOrderSync.ps1 -Install` then `.\Run-WorkOrderSync.ps1 --discover`. Note that Windows PowerShell 5.1 does not accept `&&`; put commands on separate lines or join them with `;`.
+On Windows, drop `TraumaSoft_Samsara_WorkOrder_Sync.py`, `samsara_workorders_api.py`, `Run-WorkOrderSync.ps1` and the `sql/` folder into the Reports project folder (the one that holds `traumasoft_api.py` and `.env`). If the project's `.venv` is broken (its `python.exe` points at a Python that was uninstalled), recreate it:
+
+```powershell
+winget install --id Python.Python.3.13 -e        # or the python.org installer with "Add to PATH"
+cd "<Reports project folder>"
+Remove-Item -Recurse -Force .venv
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+`Run-WorkOrderSync.ps1` finds Python for you (`PYTHON_EXE`, `.venv`, the `py` launcher, PATH, or the usual install folders) and passes arguments through, e.g. `.\Run-WorkOrderSync.ps1 -Install` then `.\Run-WorkOrderSync.ps1 --discover`. Note that Windows PowerShell 5.1 does not accept `&&`; put commands on separate lines or join them with `;`.
 
 ```bash
 # 1. See the real columns, sample rows and distinct status/priority values
@@ -289,7 +318,7 @@ python TraumaSoft_Samsara_WorkOrder_Sync.py --ts-id 12345
 python TraumaSoft_Samsara_WorkOrder_Sync.py
 ```
 
-Other flags: `--since YYYY-MM-DD`, `--lookback-days N`, `--rebuild-ledger`, `--init-ledger-table`, `--no-email`.
+Other flags: `--source api|db|csv`, `--probe-api`, `--since YYYY-MM-DD`, `--lookback-days N`, `--rebuild-ledger`, `--init-ledger-table`, `--no-email`.
 
 If the default query doesn't fit, point `TS_WO_SQL_FILE` at a `.sql` file. It must take one `?` parameter (the lookback start timestamp) and return the work order columns plus `vehicle_name`, `cost_center_name` and optionally `vehicle_odometer_type` / `vehicle_vin`.
 
@@ -368,7 +397,10 @@ The table is loaded into memory at start-up and every create/update is written t
 | `SAMSARA_VEHICLE_EXTERNAL_ID_KEY` | `traumasoftVehicleId` | externalIds key holding the TraumaSoft `sched_vehicles.id` |
 | `SAMSARA_DEFAULT_PRIORITY` | `Medium` | Used when TraumaSoft has no priority |
 | `SAMSARA_SEND_INITIAL_STATUS` | `true` | Send status/started/completed on create; falls back to create-then-PATCH if rejected |
-| `TS_WO_TABLE` | `vm_work_orders` | Source table |
+| `TS_WO_SOURCE` | auto | `api`, `db` or `csv` (see table above) |
+| `TS_WO_API_PATH` / `TS_WO_API_PARAMS` | `ThirdParty/Data/WorkOrders` / – | TraumaSoft API endpoint and optional JSON query params for the `api` source |
+| `TS_WO_CSV_FILE` | – | Export file for the `csv` source |
+| `TS_WO_TABLE` | `vm_work_orders` | Source table for the `db` source |
 | `TS_WO_LOOKBACK_DAYS` | `30` | How far back to look for new/changed work orders |
 | `TS_WO_EXCLUDE_VEHICLE_IDS` | `1001,1002,1003` | Placeholder vehicles to ignore (same as the vehicle report) |
 | `TS_WO_COLUMN_MAP` / `TS_WO_STATUS_MAP` / `TS_WO_PRIORITY_MAP` / `TS_WO_CATEGORY_MAP` | – | JSON overrides |

@@ -10,7 +10,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import TraumaSoft_Samsara_WorkOrder_Sync as sync  # noqa: E402
-from samsara_api import SamsaraApiError, SamsaraClient  # noqa: E402
+from samsara_workorders_api import SamsaraApiError, SamsaraClient  # noqa: E402
 
 
 def make_row(**over):
@@ -261,7 +261,7 @@ class SamsaraClientTests(unittest.TestCase):
         self.assertEqual(s.request.call_args_list[1][1]["params"]["after"], "c1")
         self.assertEqual(s.headers["Authorization"], "Bearer tok")
 
-    @mock.patch("samsara_api.time.sleep")
+    @mock.patch("samsara_workorders_api.time.sleep")
     def test_retry_on_429_then_create(self, _sleep):
         c, s = self._client([
             FakeResponse(429, {"message": "slow down"}, {"Retry-After": "1"}),
@@ -341,3 +341,96 @@ class SqlLedgerTests(unittest.TestCase):
         row = self.conn.execute("SELECT samsara_wo_id, samsara_asset_id, ts_vehicle_id, last_action "
                                 "FROM samsara_workorder_map WHERE ts_wo_id=123").fetchone()
         self.assertEqual(row, ("WO-1", "A1", 55, "create"))
+
+
+class FakeTraumasoftAPI:
+    """Stand-in for the project's traumasoft_api.TraumasoftAPI."""
+    ROWS = [
+        {"Id": 501, "VehicleId": 55, "CostCenterId": 7, "Description": "Check engine light", "Status": "Open",
+         "Priority": "High", "DateCreated": "2026-10-10 08:00:00", "DateUpdated": "2026-10-11 09:00:00", "DateCompleted": None},
+        {"Id": 400, "VehicleId": 56, "CostCenterId": 7, "Description": "Old PM", "Status": "Completed",
+         "Priority": "Normal", "DateCreated": "2026-01-01 08:00:00", "DateUpdated": "2026-01-03 09:00:00", "DateCompleted": "2026-01-03 09:00:00"},
+    ]
+
+    def __init__(self):
+        self.calls = []
+
+    def paginate(self, path, params=None, page_size=100, max_pages=1000):
+        self.calls.append((path, params))
+        if path != "ThirdParty/Data/WorkOrders":
+            raise RuntimeError("404")
+        return list(self.ROWS)
+
+    def get(self, path, params=None, legacy_hmac=False):
+        if path == "ThirdParty/Data/WorkOrders":
+            return {"data": list(self.ROWS)}
+        raise RuntimeError(f"404 {path}")
+
+    @staticmethod
+    def extract_rows(payload):
+        return payload.get("data", [])
+
+    def list_vehicles(self, include_deleted=False, include_disabled=False, fields=None):
+        return [{"Id": 55, "Name": "M-12"}, {"Id": 56, "Name": "M-13"}]
+
+    def list_cost_centers(self):
+        return [{"Id": 7, "Name": "Station 4"}]
+
+
+class ApiAndCsvSourceTests(unittest.TestCase):
+    def test_api_source_resolves_columns_enriches_and_filters_by_since(self):
+        api = FakeTraumasoftAPI()
+        rows, colmap = sync.load_rows_from_api(api, datetime(2026, 10, 1))
+        self.assertEqual(colmap["id"], "Id")
+        self.assertEqual(colmap["vehicle_id"], "VehicleId")
+        self.assertEqual(colmap["description"], "Description")
+        self.assertEqual(colmap["status"], "Status")
+        self.assertEqual(colmap["updated_at"], "DateUpdated")
+        self.assertEqual([r["Id"] for r in rows], [501])
+        self.assertEqual(rows[0]["vehicle_name"], "M-12")
+        self.assertEqual(rows[0]["cost_center_name"], "Station 4")
+        rec = sync.row_to_record(rows[0], colmap)
+        self.assertEqual((rec.ts_id, rec.vehicle_name, rec.status, rec.priority), (501, "M-12", "Open", "High"))
+
+    def test_api_source_keeps_open_ledger_ids_outside_window(self):
+        rows, _ = sync.load_rows_from_api(FakeTraumasoftAPI(), datetime(2026, 10, 1), extra_ids=[400])
+        self.assertEqual(sorted(r["Id"] for r in rows), [400, 501])
+
+    def test_csv_source(self):
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, newline="")
+        tmp.write("id,vehicle,station,description,status,date_updated\n"
+                  "9,M-12,Station 4,Flat tire,open,2026-10-12 10:00\n"
+                  "8,M-13,,Old thing,closed,2026-01-01 10:00\n")
+        tmp.close()
+        try:
+            rows, colmap = sync.load_rows_from_csv(tmp.name, datetime(2026, 10, 1))
+            self.assertEqual(colmap["vehicle_name"], "vehicle")
+            self.assertEqual(colmap["cost_center_name"], "station")
+            self.assertEqual([r["id"] for r in rows], ["9"])
+            self.assertEqual(rows[0]["vehicle_name"], "M-12")
+            rec = sync.row_to_record(rows[0], colmap)
+            self.assertEqual((rec.ts_id, rec.vehicle_name, rec.cost_center_name, rec.status), (9, "M-12", "Station 4", "Open"))
+        finally:
+            os.unlink(tmp.name)
+
+    def test_resolve_source(self):
+        self.assertEqual(sync.resolve_source("api"), "api")
+        with mock.patch.object(sync, "TS_WO_CSV_FILE", "x.csv"), mock.patch.object(sync, "TS_WO_SOURCE", ""):
+            self.assertEqual(sync.resolve_source(None), "csv")
+        with mock.patch.object(sync, "TS_WO_CSV_FILE", ""), mock.patch.object(sync, "DB_DSN", ""), \
+             mock.patch.object(sync, "TS_WO_SOURCE", ""), mock.patch.dict(os.environ, {"TS_API_BASE_URL": "https://x"}):
+            self.assertEqual(sync.resolve_source(None), "api")
+        with mock.patch.object(sync, "TS_WO_CSV_FILE", ""), mock.patch.object(sync, "DB_DSN", ""), \
+             mock.patch.object(sync, "TS_WO_SOURCE", ""), mock.patch.dict(os.environ, {"TS_API_BASE_URL": "", "TS_API_KEY": ""}):
+            with self.assertRaises(SystemExit):
+                sync.resolve_source(None)
+
+    def test_probe_api_reports_hits_and_misses(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            sync.probe_api(FakeTraumasoftAPI(), ["ThirdParty/Data/Nope"])
+        out = buf.getvalue()
+        self.assertIn("ThirdParty/Data/Nope", out)
+        self.assertIn("ThirdParty/Data/WorkOrders", out)
+        self.assertIn("OK rows=2", out)

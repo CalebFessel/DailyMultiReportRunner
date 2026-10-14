@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from samsara_api import (
+from samsara_workorders_api import (
     DEFAULT_BASE_URL,
     SamsaraApiError,
     SamsaraClient,
@@ -94,7 +94,13 @@ LEDGER_DSN = os.getenv("SAMSARA_WO_LEDGER_DSN", "")
 LEDGER_TABLE = os.getenv("SAMSARA_WO_LEDGER_TABLE", "samsara_workorder_map")
 LEDGER_DIALECT = os.getenv("SAMSARA_WO_LEDGER_DIALECT", "mysql").strip().lower()  # mysql | mssql | sqlite
 
-DB_DSN = os.getenv("DB_DSN") or os.getenv("TS_DSN", "MyReportingDSN")
+DB_DSN = os.getenv("DB_DSN") or os.getenv("TS_DSN", "")
+# Where TraumaSoft work orders come from: db (ODBC DSN -> vm_work_orders), api (TraumaSoft
+# third-party REST API via traumasoft_api.py), or csv (an export file).  Auto-detected when unset.
+TS_WO_SOURCE = os.getenv("TS_WO_SOURCE", "").strip().lower()
+TS_WO_API_PATH = os.getenv("TS_WO_API_PATH", "ThirdParty/Data/WorkOrders")
+TS_WO_API_PARAMS = _env_json("TS_WO_API_PARAMS", {})
+TS_WO_CSV_FILE = os.getenv("TS_WO_CSV_FILE", "")
 TS_TIMEZONE = os.getenv("TS_TIMEZONE", "America/New_York")
 TS_WO_TABLE = os.getenv("TS_WO_TABLE", "vm_work_orders")
 TS_WO_SQL_FILE = os.getenv("TS_WO_SQL_FILE")  # optional: full override of the source query
@@ -122,12 +128,14 @@ TS_TAG_RE = re.compile(r"\[TS-WO:(\d+)\]")
 # Candidate column names for each logical field, first match wins.  Override or
 # extend with TS_WO_COLUMN_MAP='{"description": ["complaint"], ...}'.
 DEFAULT_COLUMN_CANDIDATES: Dict[str, List[str]] = {
-    "id": ["id", "work_order_id", "wo_id"],
-    "number": ["number", "wo_number", "work_order_number", "work_order_no"],
-    "vehicle_id": ["vehicle_id", "veh_id"],
-    "cost_center_id": ["cost_center_id"],
-    "description": ["description", "complaint", "notes", "details", "problem", "work_description", "summary", "title", "name"],
-    "status": ["status", "status_name", "state", "wo_status"],
+    "id": ["id", "work_order_id", "wo_id", "Id", "ID", "WorkOrderId", "WorkOrderID"],
+    "number": ["number", "wo_number", "work_order_number", "work_order_no", "WorkOrderNumber", "Number"],
+    "vehicle_id": ["vehicle_id", "veh_id", "vehicleId", "VehicleId", "VehicleID"],
+    "vehicle_name": ["vehicle_name", "vehicle", "unit", "unit_name", "vehicle_number", "VehicleName", "Vehicle", "Unit"],
+    "cost_center_id": ["cost_center_id", "costCenterId", "CostCenterId"],
+    "cost_center_name": ["cost_center_name", "cost_center", "station", "CostCenter", "Station"],
+    "description": ["description", "complaint", "notes", "details", "problem", "work_description", "summary", "title", "name", "Description", "Notes"],
+    "status": ["status", "status_name", "state", "wo_status", "Status", "StatusName"],
     "status_id": ["status_id"],
     "priority": ["priority", "priority_name", "priority_id"],
     "category": ["category", "type", "work_type", "wo_type", "service_type"],
@@ -208,7 +216,12 @@ class WorkOrderRecord:
 # =============================
 def resolve_column_map(columns: Iterable[str], overrides: Optional[Dict[str, List[str]]] = None) -> Dict[str, Optional[str]]:
     """Pick the actual column for each logical field from the available columns."""
-    available = {c.lower(): c for c in columns}
+    def norm(name: str) -> str:  # 'DateUpdated' == 'date_updated' == 'Date Updated'
+        return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+    available: Dict[str, str] = {}
+    for c in columns:
+        available.setdefault(norm(c), c)
     candidates = {k: list(v) for k, v in DEFAULT_COLUMN_CANDIDATES.items()}
     for key, names in (overrides or {}).items():
         if isinstance(names, str):
@@ -216,7 +229,7 @@ def resolve_column_map(columns: Iterable[str], overrides: Optional[Dict[str, Lis
         candidates[key] = list(names) + candidates.get(key, [])
     resolved: Dict[str, Optional[str]] = {}
     for key, names in candidates.items():
-        resolved[key] = next((available[n.lower()] for n in names if n.lower() in available), None)
+        resolved[key] = next((available[norm(n)] for n in names if norm(n) in available), None)
     return resolved
 
 
@@ -456,7 +469,7 @@ def row_to_record(row: Dict[str, Any], colmap: Dict[str, Optional[str]], maps: O
     return WorkOrderRecord(
         ts_id=int(get("id")),
         vehicle_id=vehicle_id,
-        vehicle_name=row.get("vehicle_name"),
+        vehicle_name=row.get("vehicle_name") or get("vehicle_name"),
         description=str(get("description") or "").strip(),
         status=status,
         priority=map_priority(get("priority"), default_priority, maps.get("priority")),
@@ -467,7 +480,7 @@ def row_to_record(row: Dict[str, Any], colmap: Dict[str, Optional[str]], maps: O
         due_at=as_dt(get("due_at")),
         odometer_meters=odometer_to_meters(get("odometer"), odo_type),
         engine_hours=engine_hours,
-        cost_center_name=row.get("cost_center_name"),
+        cost_center_name=row.get("cost_center_name") or get("cost_center_name"),
         ts_number=str(get("number")).strip() if get("number") not in (None, "") else None,
         raw_status=str(raw_status).strip() if raw_status not in (None, "") else None,
         extra={"vehicle_vin": row.get("vehicle_vin")},
@@ -718,6 +731,216 @@ def fetch_work_orders(conn, colmap: Dict[str, Optional[str]], since: datetime, e
 
 
 # =============================
+# TRAUMASOFT SOURCE: API / CSV
+# =============================
+TS_API_WO_PATH_CANDIDATES = [
+    "ThirdParty/Data/WorkOrders", "ThirdParty/Data/WorkOrder", "ThirdParty/Data/VehicleWorkOrders",
+    "ThirdParty/Data/Maintenance", "ThirdParty/Data/VehicleMaintenance", "ThirdParty/Data/FleetMaintenance",
+    "ThirdParty/Data/MaintenanceRecords", "ThirdParty/Data/VehicleService", "ThirdParty/Data/ServiceRecords",
+    "ThirdParty/Data/Repairs", "ThirdParty/Data/VehicleRepairs", "ThirdParty/Data/FleetWorkOrders",
+    "ThirdParty/Data/VehicleStatusLog", "ThirdParty/Data/VehicleStatuses",
+]
+
+
+def open_traumasoft_api():
+    """Instantiate the project's TraumasoftAPI client (traumasoft_api.py next to this script)."""
+    try:
+        from traumasoft_api import TraumasoftAPI  # the existing client in the Reports folder
+    except ImportError as e:
+        raise SystemExit(
+            "TS_WO_SOURCE=api needs traumasoft_api.py (the existing TraumaSoft client) importable "
+            f"from the same folder as this script: {e}"
+        )
+    return TraumasoftAPI()
+
+
+def _api_rows(api, path: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Pull every row from a TraumaSoft list endpoint using whatever the client offers."""
+    params = dict(params or {})
+    if hasattr(api, "paginate"):
+        return [r for r in api.paginate(path, params=params) if isinstance(r, dict)]
+    payload = api.get(path, params=params)
+    extract = getattr(api, "extract_rows", None)
+    rows = extract(payload) if extract else payload
+    if isinstance(rows, dict):
+        rows = rows.get("data") or rows.get("rows") or rows.get("items") or []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _first(d: Dict[str, Any], *keys: str) -> Any:
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return None
+
+
+def ts_api_vehicle_names(api) -> Dict[str, str]:
+    """TraumaSoft vehicle id -> name from the API's vehicle list."""
+    names: Dict[str, str] = {}
+    try:
+        vehicles = api.list_vehicles(include_deleted=True, include_disabled=True)
+    except TypeError:
+        vehicles = api.list_vehicles()
+    except Exception as e:
+        logging.warning("Could not list TraumaSoft vehicles via API: %s", e)
+        return names
+    for v in vehicles or []:
+        if not isinstance(v, dict):
+            continue
+        vid = _first(v, "id", "Id", "ID", "vehicle_id", "VehicleId")
+        name = _first(v, "name", "Name", "unit", "Unit", "vehicle_name", "VehicleName", "number", "Number")
+        if vid is not None and name:
+            names[str(vid)] = str(name)
+    return names
+
+
+def ts_api_cost_center_names(api) -> Dict[str, str]:
+    names: Dict[str, str] = {}
+    try:
+        for cc in api.list_cost_centers() or []:
+            if isinstance(cc, dict):
+                cid = _first(cc, "id", "Id", "ID", "cost_center_id")
+                name = _first(cc, "name", "Name")
+                if cid is not None and name:
+                    names[str(cid)] = str(name)
+    except Exception as e:
+        logging.warning("Could not list TraumaSoft cost centers via API: %s", e)
+    return names
+
+
+def enrich_rows(rows: List[Dict[str, Any]], colmap: Dict[str, Optional[str]],
+                vehicle_names: Dict[str, str], cost_center_names: Dict[str, str]) -> None:
+    """Fill vehicle_name / cost_center_name on API or CSV rows from id lookups."""
+    vcol, ccol = colmap.get("vehicle_id"), colmap.get("cost_center_id")
+    vname_col, ccname_col = colmap.get("vehicle_name"), colmap.get("cost_center_name")
+    for r in rows:
+        if not r.get("vehicle_name"):
+            name = r.get(vname_col) if vname_col else None
+            if not name and vcol and r.get(vcol) is not None:
+                name = vehicle_names.get(str(r.get(vcol)))
+            if name:
+                r["vehicle_name"] = name
+        if not r.get("cost_center_name"):
+            name = r.get(ccname_col) if ccname_col else None
+            if not name and ccol and r.get(ccol) is not None:
+                name = cost_center_names.get(str(r.get(ccol)))
+            if name:
+                r["cost_center_name"] = name
+
+
+def filter_rows_since(rows: List[Dict[str, Any]], colmap: Dict[str, Optional[str]], since: datetime) -> List[Dict[str, Any]]:
+    """Keep rows whose updated/created/completed date is on or after `since` (rows with no parseable date are kept)."""
+    date_cols = [c for c in (colmap.get("updated_at"), colmap.get("created_at"), colmap.get("completed_at")) if c]
+    if not date_cols:
+        return rows
+    since_s = to_rfc3339(since)
+    since_dt = datetime.fromisoformat(since_s) if since_s else None
+    out = []
+    for r in rows:
+        stamps = [to_rfc3339(r.get(c)) for c in date_cols]
+        stamps = [datetime.fromisoformat(x) for x in stamps if x]
+        if not stamps or since_dt is None or max(stamps) >= since_dt:
+            out.append(r)
+    return out
+
+
+def load_rows_from_api(api, since: datetime, column_overrides: Optional[Dict[str, List[str]]] = None,
+                       extra_ids: Optional[List[int]] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Optional[str]]]:
+    logging.info("Fetching TraumaSoft work orders via API %s params=%s", TS_WO_API_PATH, TS_WO_API_PARAMS)
+    rows = _api_rows(api, TS_WO_API_PATH, TS_WO_API_PARAMS)
+    cols = sorted({k for r in rows for k in r.keys()})
+    colmap = resolve_column_map(cols, column_overrides)
+    enrich_rows(rows, colmap, ts_api_vehicle_names(api), ts_api_cost_center_names(api))
+    colmap = resolve_column_map(sorted({k for r in rows for k in r.keys()}), column_overrides)
+    keep_ids = {str(i) for i in (extra_ids or [])}
+    idcol = colmap.get("id")
+    recent = filter_rows_since(rows, colmap, since)
+    if keep_ids and idcol:
+        seen = {str(r.get(idcol)) for r in recent}
+        recent += [r for r in rows if str(r.get(idcol)) in keep_ids and str(r.get(idcol)) not in seen]
+    logging.info("TraumaSoft API returned %s work orders, %s in window", len(rows), len(recent))
+    return recent, colmap
+
+
+def load_rows_from_csv(path: str, since: datetime, column_overrides: Optional[Dict[str, List[str]]] = None,
+                       extra_ids: Optional[List[int]] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Optional[str]]]:
+    import csv
+
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        rows = [dict(r) for r in csv.DictReader(f)]
+    for r in rows:  # treat blank cells as NULL
+        for k, v in list(r.items()):
+            if isinstance(v, str) and v.strip() == "":
+                r[k] = None
+    cols = list(rows[0].keys()) if rows else []
+    colmap = resolve_column_map(cols, column_overrides)
+    enrich_rows(rows, colmap, {}, {})
+    colmap = resolve_column_map(sorted({k for r in rows for k in r.keys()}), column_overrides)
+    keep_ids = {str(i) for i in (extra_ids or [])}
+    idcol = colmap.get("id")
+    recent = filter_rows_since(rows, colmap, since)
+    if keep_ids and idcol:
+        seen = {str(r.get(idcol)) for r in recent}
+        recent += [r for r in rows if str(r.get(idcol)) in keep_ids and str(r.get(idcol)) not in seen]
+    logging.info("CSV %s: %s rows, %s in window", path, len(rows), len(recent))
+    return recent, colmap
+
+
+def resolve_source(explicit: Optional[str] = None) -> str:
+    src = (explicit or TS_WO_SOURCE or "").lower()
+    if src in ("db", "api", "csv"):
+        return src
+    if TS_WO_CSV_FILE:
+        return "csv"
+    if DB_DSN:
+        return "db"
+    if os.getenv("TS_API_BASE_URL") or os.getenv("TS_API_KEY"):
+        return "api"
+    raise SystemExit("No work order source configured: set DB_DSN (db), TS_API_BASE_URL/TS_API_KEY (api) or TS_WO_CSV_FILE (csv), or TS_WO_SOURCE.")
+
+
+def probe_api(api, extra_paths: Optional[List[str]] = None) -> None:
+    """Try likely TraumaSoft work-order endpoints and report which ones answer."""
+    paths = list(extra_paths or []) + [p for p in TS_API_WO_PATH_CANDIDATES if p not in (extra_paths or [])]
+    print(f"\n== probing {len(paths)} candidate TraumaSoft endpoints ==")
+    for path in paths:
+        try:
+            payload = api.get(path, params={"limit": 1, "page_size": 1})
+        except Exception as e:  # TraumasoftAPIError carries status_code
+            code = getattr(e, "status_code", None)
+            print(f"  {path:45s} -> {code or type(e).__name__}: {str(e)[:120]}")
+            continue
+        extract = getattr(api, "extract_rows", None)
+        rows = extract(payload) if extract else payload
+        n = len(rows) if isinstance(rows, list) else "?"
+        keys = sorted(rows[0].keys()) if isinstance(rows, list) and rows and isinstance(rows[0], dict) else []
+        print(f"  {path:45s} -> OK rows={n} keys={keys[:25]}")
+    print("\nSet TS_WO_API_PATH to the endpoint that returned work orders, then run --discover.")
+
+
+def discover_rows(rows: List[Dict[str, Any]], colmap: Dict[str, Optional[str]], label: str) -> None:
+    cols = sorted({k for r in rows for k in r.keys()})
+    print(f"\n== {label}: {len(rows)} rows, {len(cols)} columns ==")
+    print(", ".join(cols))
+    print("\n== resolved logical fields ==")
+    for k, v in colmap.items():
+        print(f"  {k:17s} -> {v}")
+    print("\n== first 5 rows ==")
+    for r in rows[:5]:
+        print(json.dumps(r, default=str, indent=2))
+    for key in ("status", "status_id", "priority", "category"):
+        col = colmap.get(key)
+        if not col:
+            continue
+        counts: Dict[str, int] = {}
+        for r in rows:
+            counts[repr(r.get(col))] = counts.get(repr(r.get(col)), 0) + 1
+        print(f"\n== distinct {key} ({col}) ==")
+        for val, n in sorted(counts.items(), key=lambda kv: -kv[1])[:25]:
+            print(f"  {val}: {n}")
+
+
+# =============================
 # SYNC
 # =============================
 @dataclass
@@ -912,7 +1135,11 @@ def discover(conn) -> None:
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Sync TraumaSoft work orders into Samsara.")
     p.add_argument("--dry-run", action="store_true", help="Read TraumaSoft and Samsara but write nothing to Samsara.")
-    p.add_argument("--discover", action="store_true", help="Print vm_work_orders schema, samples and distinct statuses, then exit.")
+    p.add_argument("--discover", action="store_true", help="Print the work order source's columns, samples and distinct statuses, then exit.")
+    p.add_argument("--source", choices=["db", "api", "csv"], help="Override TS_WO_SOURCE for this run.")
+    p.add_argument("--probe-api", action="store_true",
+                   help="Try likely TraumaSoft API endpoints for work orders and report which respond, then exit.")
+    p.add_argument("--probe-path", action="append", help="Extra endpoint path(s) to try with --probe-api (repeatable).")
     p.add_argument("--rebuild-ledger", action="store_true", help="Rebuild the ledger from [TS-WO:id] tags in Samsara, then exit.")
     p.add_argument("--init-ledger-table", action="store_true",
                    help="Create the SQL mapping table (SAMSARA_WO_LEDGER_DSN / _TABLE / _DIALECT) from sql/ if missing, then exit.")
@@ -944,12 +1171,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.info("Ledger table ready: %s (%s rows)", ledger.describe(), len(ledger.work_orders))
         return 0
 
+    if args.probe_api:
+        probe_api(open_traumasoft_api(), args.probe_path)
+        return 0
+
+    source = resolve_source(args.source)
+    logging.info("Work order source: %s", source)
+    column_overrides = _env_json("TS_WO_COLUMN_MAP", {})
+
     if args.discover:
-        conn = get_db_connection()
-        try:
-            discover(conn)
-        finally:
-            conn.close()
+        if source == "db":
+            conn = get_db_connection()
+            try:
+                discover(conn)
+            finally:
+                conn.close()
+        else:
+            far_past = datetime(1970, 1, 2)
+            if source == "api":
+                rows, colmap = load_rows_from_api(open_traumasoft_api(), far_past, column_overrides)
+                discover_rows(rows, colmap, f"TraumaSoft API {TS_WO_API_PATH}")
+            else:
+                rows, colmap = load_rows_from_csv(TS_WO_CSV_FILE, far_past, column_overrides)
+                discover_rows(rows, colmap, f"CSV {TS_WO_CSV_FILE}")
         return 0
 
     client: Optional[SamsaraClient] = None
@@ -972,17 +1216,28 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # --- TraumaSoft work orders
     since = args.since or (now_local.replace(tzinfo=None) - timedelta(days=args.lookback_days))
-    conn = get_db_connection()
-    try:
-        cols = introspect_columns(conn, TS_WO_TABLE)
-        colmap = resolve_column_map(cols, _env_json("TS_WO_COLUMN_MAP", {}))
+    extra_ids = list(args.ts_id) if args.ts_id else ledger.open_ts_ids()
+    if source == "db":
+        conn = get_db_connection()
+        try:
+            cols = introspect_columns(conn, TS_WO_TABLE)
+            colmap = resolve_column_map(cols, column_overrides)
+            logging.info("Column map: %s", {k: v for k, v in colmap.items() if v})
+            if not colmap.get("id"):
+                raise SystemExit(f"Could not find an id column on {TS_WO_TABLE}; set TS_WO_COLUMN_MAP")
+            rows = fetch_work_orders(conn, colmap, since, extra_ids, args.limit, ledger.max_ts_id())
+        finally:
+            conn.close()
+    elif source == "api":
+        rows, colmap = load_rows_from_api(open_traumasoft_api(), since, column_overrides, extra_ids)
+    else:
+        rows, colmap = load_rows_from_csv(TS_WO_CSV_FILE, since, column_overrides, extra_ids)
+    if source != "db":
         logging.info("Column map: %s", {k: v for k, v in colmap.items() if v})
         if not colmap.get("id"):
-            raise SystemExit(f"Could not find an id column on {TS_WO_TABLE}; set TS_WO_COLUMN_MAP")
-        extra_ids = list(args.ts_id) if args.ts_id else ledger.open_ts_ids()
-        rows = fetch_work_orders(conn, colmap, since, extra_ids, args.limit, ledger.max_ts_id())
-    finally:
-        conn.close()
+            raise SystemExit("Could not find an id column in the work order rows; set TS_WO_COLUMN_MAP")
+        if args.limit:
+            rows = rows[:args.limit]
     logging.info("TraumaSoft work orders fetched: %s (since %s)", len(rows), since)
 
     maps = {

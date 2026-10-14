@@ -95,6 +95,15 @@ LEDGER_TABLE = os.getenv("SAMSARA_WO_LEDGER_TABLE", "samsara_workorder_map")
 LEDGER_DIALECT = os.getenv("SAMSARA_WO_LEDGER_DIALECT", "mysql").strip().lower()  # mysql | mssql | sqlite
 
 DB_DSN = os.getenv("DB_DSN") or os.getenv("TS_DSN", "")
+# Direct MySQL connection (no ODBC driver needed): used instead of DB_DSN when TS_DB_HOST is set.
+TS_DB_HOST = os.getenv("TS_DB_HOST", "")
+TS_DB_PORT = int(os.getenv("TS_DB_PORT", "3306"))
+TS_DB_NAME = os.getenv("TS_DB_NAME", "")
+TS_DB_USER = os.getenv("TS_DB_USER", "")
+TS_DB_PASSWORD = os.getenv("TS_DB_PASSWORD", "")
+TS_DB_SSL = _env_bool("TS_DB_SSL", True)
+# SQLite file for the mapping table (no database server needed); alternative to SAMSARA_WO_LEDGER_DSN.
+LEDGER_SQLITE = os.getenv("SAMSARA_WO_LEDGER_SQLITE", "")
 # Where TraumaSoft work orders come from: db (ODBC DSN -> vm_work_orders), api (TraumaSoft
 # third-party REST API via traumasoft_api.py), or csv (an export file).  Auto-detected when unset.
 TS_WO_SOURCE = os.getenv("TS_WO_SOURCE", "").strip().lower()
@@ -643,7 +652,19 @@ class SqlLedger:
 
 
 def open_ledger():
-    """SQL ledger when SAMSARA_WO_LEDGER_DSN is set, otherwise the JSON file."""
+    """
+    Mapping-table ledger: SQLite file (SAMSARA_WO_LEDGER_SQLITE), ODBC table (SAMSARA_WO_LEDGER_DSN),
+    or the JSON file (default).
+    """
+    if LEDGER_SQLITE:
+        import sqlite3
+
+        Path(LEDGER_SQLITE).parent.mkdir(parents=True, exist_ok=True)
+        logging.info("Ledger: SQLite table %s in %s", LEDGER_TABLE, LEDGER_SQLITE)
+        ledger = SqlLedger(sqlite3.connect(LEDGER_SQLITE), LEDGER_TABLE, "sqlite")
+        if not ledger.work_orders:
+            ledger.ensure_table()  # idempotent; creates the table on first use
+        return ledger
     if LEDGER_DSN:
         import pyodbc
 
@@ -655,7 +676,51 @@ def open_ledger():
 # =============================
 # TRAUMASOFT SOURCE
 # =============================
+class QmarkCursor:
+    """Cursor wrapper that lets `?`-style SQL run on a `%s`-style driver (PyMySQL)."""
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    @staticmethod
+    def convert(sql: str) -> str:
+        return sql.replace("%", "%%").replace("?", "%s")
+
+    def execute(self, sql, params=None):
+        return self._cur.execute(self.convert(sql), tuple(params) if params else None)
+
+    def __getattr__(self, name):  # description, fetchall, rowcount, close, ...
+        return getattr(self._cur, name)
+
+
+class QmarkConnection:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return QmarkCursor(self._conn.cursor())
+
+    def __getattr__(self, name):  # commit, rollback, close, ...
+        return getattr(self._conn, name)
+
+
 def get_db_connection():
+    """
+    TraumaSoft database connection.  Prefers a direct MySQL connection (TS_DB_HOST + TS_DB_NAME +
+    TS_DB_USER + TS_DB_PASSWORD, pure-Python PyMySQL, no ODBC driver) and falls back to the ODBC
+    DSN in DB_DSN.  Either way the rest of the code uses `?` placeholders.
+    """
+    if TS_DB_HOST:
+        import pymysql  # pure Python; imported lazily so unit tests can run without it
+
+        logging.info("Connecting to MySQL %s:%s/%s as %s (ssl=%s)", TS_DB_HOST, TS_DB_PORT, TS_DB_NAME, TS_DB_USER, TS_DB_SSL)
+        conn = pymysql.connect(
+            host=TS_DB_HOST, port=TS_DB_PORT, database=TS_DB_NAME, user=TS_DB_USER, password=TS_DB_PASSWORD,
+            ssl={"ssl": {}} if TS_DB_SSL else None, connect_timeout=30, read_timeout=300, autocommit=True,
+        )
+        return QmarkConnection(conn)
+    if not DB_DSN:
+        raise SystemExit("No TraumaSoft database configured: set TS_DB_HOST/TS_DB_NAME/TS_DB_USER/TS_DB_PASSWORD or DB_DSN.")
     import pyodbc  # imported lazily so unit tests can run without the ODBC driver
 
     conn_str = f"DSN={DB_DSN};"
@@ -901,7 +966,7 @@ def resolve_source(explicit: Optional[str] = None) -> str:
         return src
     if TS_WO_CSV_FILE:
         return "csv"
-    if DB_DSN:
+    if DB_DSN or TS_DB_HOST:
         return "db"
     if os.getenv("TS_API_BASE_URL") or os.getenv("TS_API_KEY"):
         return "api"
@@ -1169,12 +1234,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
     log_path = setup_logging(OUTPUT_DIR, run_date_str)
     logging.info("=== TraumaSoft -> Samsara Work Order Sync started ===")
-    logging.info("DB_DSN=%s | TEST_MODE=%s | DRY_RUN=%s | LEDGER=%s", DB_DSN, TEST_MODE, args.dry_run,
-                 f"sql:{LEDGER_DSN}/{LEDGER_TABLE}" if LEDGER_DSN else LEDGER_FILE)
+    logging.info("DB=%s | TEST_MODE=%s | DRY_RUN=%s | LEDGER=%s",
+                 f"mysql:{TS_DB_HOST}/{TS_DB_NAME}" if TS_DB_HOST else f"dsn:{DB_DSN}", TEST_MODE, args.dry_run,
+                 f"sqlite:{LEDGER_SQLITE}" if LEDGER_SQLITE else (f"sql:{LEDGER_DSN}/{LEDGER_TABLE}" if LEDGER_DSN else LEDGER_FILE))
 
     if args.init_ledger_table:
-        if not LEDGER_DSN:
-            raise SystemExit("--init-ledger-table needs SAMSARA_WO_LEDGER_DSN (and optionally _TABLE, _DIALECT)")
+        if not (LEDGER_DSN or LEDGER_SQLITE):
+            raise SystemExit("--init-ledger-table needs SAMSARA_WO_LEDGER_DSN (and optionally _TABLE, _DIALECT) or SAMSARA_WO_LEDGER_SQLITE")
         ledger = open_ledger()
         ledger.ensure_table()
         logging.info("Ledger table ready: %s (%s rows)", ledger.describe(), len(ledger.work_orders))

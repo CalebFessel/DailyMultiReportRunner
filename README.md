@@ -256,7 +256,7 @@ When modifying SQL, ensure parameter counts still match the number of `?` placeh
 | Source | When it's used | Needs |
 |---|---|---|
 | `api` | `TS_API_BASE_URL` / `TS_API_KEY` are set (the same `.env` the API-based reports use) | the project's `traumasoft_api.py` next to the script and `TS_WO_API_PATH` pointing at an endpoint that returns work-order rows. **TraumaSoft's third-party OpenAPI spec (94 paths) currently has no work-order or maintenance endpoint**; `--probe-api` checks candidate paths in case one is added. |
-| `db` | `DB_DSN` is set | an ODBC DSN to the TraumaSoft reporting DB; reads `vm_work_orders` joined to `sched_vehicles` / `cost_centers` |
+| `db` | `TS_DB_HOST` (direct MySQL, no ODBC) or `DB_DSN` (ODBC) is set | read access to the TraumaSoft reporting DB from an IP TraumaSoft has whitelisted; reads `vm_work_orders` joined to `sched_vehicles` / `cost_centers` |
 | `csv` | `TS_WO_CSV_FILE` is set | an export of the work order list with at least an id, a vehicle name/number and a description column |
 
 Rows from every source go through the same column resolution and mapping, so `--discover`, `TS_WO_COLUMN_MAP` and the status/priority maps work the same way for all of them.
@@ -267,6 +267,17 @@ Rows from every source go through the same column resolution and mapping, so `--
 - Vehicles are matched to Samsara assets by **VIN** first, then by name (case/punctuation-insensitive, so `M-12` matches `M 12`), then by `externalIds[SAMSARA_VEHICLE_EXTERNAL_ID_KEY]`. `SAMSARA_VEHICLE_MATCH` changes which is tried first. Work orders whose vehicle isn't found are skipped and listed in the summary email.
 - TraumaSoft statuses/priorities/categories are mapped to Samsara's enums (`Open`, `Assigned`, `In Progress`, `On Hold`, `Pending Parts`, `Pending Approval`, `Completed`, `Closed`, `Cancelled`; `Low/Medium/High/Urgent`; `Annual/Corrective/Damage Repair/Preventive/Recall`). Common text values map automatically; numeric ids or custom labels can be mapped with `TS_WO_STATUS_MAP`, `TS_WO_PRIORITY_MAP`, `TS_WO_CATEGORY_MAP` (JSON).
 - Odometers are converted from TraumaSoft miles (or km when `odometer_type` says so) to Samsara meters; timestamps are emitted as RFC 3339 in `TS_TIMEZONE` (default `America/New_York`).
+
+### Database connection (the `db` source)
+
+Two ways to reach the TraumaSoft MySQL database:
+
+| Setting | Use |
+|---|---|
+| `TS_DB_HOST`, `TS_DB_PORT` (3306), `TS_DB_NAME`, `TS_DB_USER`, `TS_DB_PASSWORD`, `TS_DB_SSL` (true) | Direct connection with the pure-Python `pymysql` driver. Works on Windows and Linux with no ODBC driver or DSN. Preferred. |
+| `DB_DSN` | An ODBC System DSN (needs the MySQL ODBC driver and `pyodbc`). Same variable the report runner uses. |
+
+TraumaSoft only accepts connections from whitelisted static IPs, so the job must run from one. See `RUNBOOK.md` and `deploy/azure/` for the small Azure VM that holds the whitelisted IP: `create-vm.ps1` builds it (no public IP, SSH locked to your address, then moves the existing static IP onto it without starting the old VM) and `setup-vm.sh` installs Python, the code, the `.env` template and an hourly cron job.
 
 ### Finding the TraumaSoft work-order endpoint
 
@@ -360,7 +371,7 @@ Run `--discover` to see which real columns were picked; anything that resolved t
 
 ### Mapping table (SQL ledger)
 
-Set `SAMSARA_WO_LEDGER_DSN` to keep the TraumaSoft ↔ Samsara mapping in a database table instead of the JSON file. The table is `samsara_workorder_map` (override with `SAMSARA_WO_LEDGER_TABLE`), one row per synced work order:
+Set `SAMSARA_WO_LEDGER_SQLITE=<file>` to keep the TraumaSoft ↔ Samsara mapping in a SQLite table (simplest, no server), or `SAMSARA_WO_LEDGER_DSN` to keep it in a MySQL / SQL Server database, instead of the JSON file. The table is `samsara_workorder_map` (override with `SAMSARA_WO_LEDGER_TABLE`), one row per synced work order:
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -406,7 +417,9 @@ The table is loaded into memory at start-up and every create/update is written t
 | `TS_WO_COLUMN_MAP` / `TS_WO_STATUS_MAP` / `TS_WO_PRIORITY_MAP` / `TS_WO_CATEGORY_MAP` | – | JSON overrides |
 | `TS_WO_SQL_FILE` | – | Full source-query override |
 | `SAMSARA_WO_LEDGER_FILE` | `OUTPUT_DIR/State/samsara_workorder_ledger.json` | Ledger location |
-| `SAMSARA_WO_LEDGER_DSN` / `SAMSARA_WO_LEDGER_TABLE` / `SAMSARA_WO_LEDGER_DIALECT` | – / `samsara_workorder_map` / `mysql` | Use a SQL mapping table as the ledger instead of the JSON file |
+| `SAMSARA_WO_LEDGER_SQLITE` | – | Keep the mapping table in a SQLite file (no database server needed); created automatically |
+| `SAMSARA_WO_LEDGER_DSN` / `SAMSARA_WO_LEDGER_TABLE` / `SAMSARA_WO_LEDGER_DIALECT` | – / `samsara_workorder_map` / `mysql` | Keep the mapping table in a MySQL / SQL Server database via ODBC |
+| `TS_DB_HOST` … `TS_DB_PASSWORD` | – | Direct MySQL connection to TraumaSoft (see **Database connection**) |
 | `SYNC_RECIPIENTS` | – | Comma-separated production recipients for the summary email |
 | `TEST_MODE`, `TEST_MODE_RECIPIENT`, `STATUS_EMAIL_RECIPIENT`, `SMTP_*`, `DB_DSN`, `OUTPUT_DIR` | | Shared with the report runner |
 

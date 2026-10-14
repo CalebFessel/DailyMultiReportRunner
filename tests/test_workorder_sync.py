@@ -439,3 +439,46 @@ class ApiAndCsvSourceTests(unittest.TestCase):
         self.assertIn("ThirdParty/Data/WorkOrders", out)
         self.assertIn("OK rows=2", out)
 
+
+
+class DirectMySqlConnectionTests(unittest.TestCase):
+    def test_qmark_conversion(self):
+        self.assertEqual(sync.QmarkCursor.convert("SELECT * FROM t WHERE id IN (?, ?) AND n LIKE '%x%'"),
+                         "SELECT * FROM t WHERE id IN (%s, %s) AND n LIKE '%%x%%'")
+
+    def test_get_db_connection_prefers_direct_mysql_and_wraps_cursor(self):
+        import types
+        calls = {}
+        fake_cursor = mock.Mock()
+        fake_conn = mock.Mock(); fake_conn.cursor.return_value = fake_cursor
+        fake_pymysql = types.ModuleType("pymysql")
+        def connect(**kw):
+            calls.update(kw); return fake_conn
+        fake_pymysql.connect = connect
+        with mock.patch.dict(sys.modules, {"pymysql": fake_pymysql}), \
+             mock.patch.object(sync, "TS_DB_HOST", "db.example.com"), mock.patch.object(sync, "TS_DB_NAME", "ts"), \
+             mock.patch.object(sync, "TS_DB_USER", "ro"), mock.patch.object(sync, "TS_DB_PASSWORD", "pw"):
+            conn = sync.get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM t WHERE a = ? AND b = ?", (1, 2))
+        self.assertEqual((calls["host"], calls["database"], calls["user"], calls["password"]), ("db.example.com", "ts", "ro", "pw"))
+        fake_cursor.execute.assert_called_once_with("SELECT 1 FROM t WHERE a = %s AND b = %s", (1, 2))
+        conn.commit(); fake_conn.commit.assert_called_once()
+
+    def test_get_db_connection_without_config_exits(self):
+        with mock.patch.object(sync, "TS_DB_HOST", ""), mock.patch.object(sync, "DB_DSN", ""):
+            with self.assertRaises(SystemExit):
+                sync.get_db_connection()
+
+    def test_sqlite_ledger_option_creates_table(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            path = os.path.join(tmp.name, "state", "map.db")
+            with mock.patch.object(sync, "LEDGER_SQLITE", path), mock.patch.object(sync, "LEDGER_DSN", ""):
+                ledger = sync.open_ledger()
+                self.assertEqual(ledger.describe(), "sql:sqlite:samsara_workorder_map")
+                ledger.put("1", "WO-1", None, "Open", "A1"); ledger.save()
+                again = sync.open_ledger()
+                self.assertEqual(again.get("1")["samsara_id"], "WO-1")
+        finally:
+            tmp.cleanup()

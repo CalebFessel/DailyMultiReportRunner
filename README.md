@@ -255,7 +255,7 @@ When modifying SQL, ensure parameter counts still match the number of `?` placeh
 
 - New TraumaSoft work orders are created in Samsara (`POST /maintenance/work-orders`).
 - Changes to status, description, priority, odometer, due/completed dates are pushed as updates (`PATCH /maintenance/work-orders`).
-- Every Samsara description starts with `[TS-WO:<id>]`; a local JSON ledger (`Reports/State/samsara_workorder_ledger.json`) maps TraumaSoft ids to Samsara ids so reruns are idempotent. If the ledger is lost, `--rebuild-ledger` reconstructs it from those tags.
+- Every Samsara description starts with `[TS-WO:<id>]`; a ledger maps TraumaSoft ids to Samsara ids so reruns are idempotent. The ledger is either a JSON file (`Reports/State/samsara_workorder_ledger.json`, the default) or a SQL mapping table (see **Mapping table** below). If the ledger is lost, `--rebuild-ledger` reconstructs it from those tags.
 - Vehicles are matched to Samsara assets by **name** by default (case/punctuation-insensitive, so `M-12` matches `M 12`). Set `SAMSARA_VEHICLE_MATCH=externalId` (with `SAMSARA_VEHICLE_EXTERNAL_ID_KEY`) or `vin` to match differently. Work orders whose vehicle isn't found are skipped and listed in the summary email.
 - TraumaSoft statuses/priorities/categories are mapped to Samsara's enums (`Open`, `Assigned`, `In Progress`, `On Hold`, `Pending Parts`, `Pending Approval`, `Completed`, `Closed`, `Cancelled`; `Low/Medium/High/Urgent`; `Annual/Corrective/Damage Repair/Preventive/Recall`). Common text values map automatically; numeric ids or custom labels can be mapped with `TS_WO_STATUS_MAP`, `TS_WO_PRIORITY_MAP`, `TS_WO_CATEGORY_MAP` (JSON).
 - Odometers are converted from TraumaSoft miles (or km when `odometer_type` says so) to Samsara meters; timestamps are emitted as RFC 3339 in `TS_TIMEZONE` (default `America/New_York`).
@@ -287,7 +287,7 @@ python TraumaSoft_Samsara_WorkOrder_Sync.py --ts-id 12345
 python TraumaSoft_Samsara_WorkOrder_Sync.py
 ```
 
-Other flags: `--since YYYY-MM-DD`, `--lookback-days N`, `--rebuild-ledger`, `--no-email`.
+Other flags: `--since YYYY-MM-DD`, `--lookback-days N`, `--rebuild-ledger`, `--init-ledger-table`, `--no-email`.
 
 If the default query doesn't fit, point `TS_WO_SQL_FILE` at a `.sql` file. It must take one `?` parameter (the lookback start timestamp) and return the work order columns plus `vehicle_name`, `cost_center_name` and optionally `vehicle_odometer_type` / `vehicle_vin`.
 
@@ -327,6 +327,35 @@ TraumaSoft side: one `SELECT` against `TS_WO_TABLE` (default `vm_work_orders`) j
 
 Run `--discover` to see which real columns were picked; anything that resolved to `None` can be pointed at the right column with `TS_WO_COLUMN_MAP`.
 
+### Mapping table (SQL ledger)
+
+Set `SAMSARA_WO_LEDGER_DSN` to keep the TraumaSoft ↔ Samsara mapping in a database table instead of the JSON file. The table is `samsara_workorder_map` (override with `SAMSARA_WO_LEDGER_TABLE`), one row per synced work order:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `ts_wo_id` | INT, primary key | TraumaSoft `vm_work_orders.id` |
+| `samsara_wo_id` | VARCHAR(64), unique | Samsara work order id |
+| `samsara_asset_id` | VARCHAR(64) | Samsara vehicle/asset id the work order was created against |
+| `ts_vehicle_id` | INT | TraumaSoft `sched_vehicles.id` |
+| `vehicle_name` | VARCHAR(100) | Vehicle name at sync time |
+| `samsara_status` | VARCHAR(32) | Last status pushed to Samsara |
+| `fingerprint` | CHAR(64) | SHA-256 of the last PATCH payload; unchanged ⇒ no call |
+| `last_action` | VARCHAR(16) | `create`, `update` or `rebuild` |
+| `first_synced_at` / `last_synced_at` | DATETIME | Audit timestamps |
+
+DDL is in `sql/samsara_workorder_map.mysql.sql` and `sql/samsara_workorder_map.mssql.sql`. Either run it yourself or let the script do it:
+
+```bash
+# .env
+SAMSARA_WO_LEDGER_DSN=MyStatusDSN          # any ODBC DSN the job may write to
+SAMSARA_WO_LEDGER_DIALECT=mysql            # mysql | mssql
+# SAMSARA_WO_LEDGER_TABLE=samsara_workorder_map
+
+python TraumaSoft_Samsara_WorkOrder_Sync.py --init-ledger-table   # creates the table if missing
+```
+
+The table is loaded into memory at start-up and every create/update is written through immediately (update-then-insert, committed per work order), so a crash mid-run never loses a Samsara id. Migrating from the JSON ledger: run `--rebuild-ledger` once with the DSN set and it will repopulate the table from the `[TS-WO:<id>]` tags in Samsara.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
@@ -343,6 +372,7 @@ Run `--discover` to see which real columns were picked; anything that resolved t
 | `TS_WO_COLUMN_MAP` / `TS_WO_STATUS_MAP` / `TS_WO_PRIORITY_MAP` / `TS_WO_CATEGORY_MAP` | – | JSON overrides |
 | `TS_WO_SQL_FILE` | – | Full source-query override |
 | `SAMSARA_WO_LEDGER_FILE` | `OUTPUT_DIR/State/samsara_workorder_ledger.json` | Ledger location |
+| `SAMSARA_WO_LEDGER_DSN` / `SAMSARA_WO_LEDGER_TABLE` / `SAMSARA_WO_LEDGER_DIALECT` | – / `samsara_workorder_map` / `mysql` | Use a SQL mapping table as the ledger instead of the JSON file |
 | `SYNC_RECIPIENTS` | – | Comma-separated production recipients for the summary email |
 | `TEST_MODE`, `TEST_MODE_RECIPIENT`, `STATUS_EMAIL_RECIPIENT`, `SMTP_*`, `DB_DSN`, `OUTPUT_DIR` | | Shared with the report runner |
 

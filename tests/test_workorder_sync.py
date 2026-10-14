@@ -286,3 +286,58 @@ class SamsaraClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SqlLedgerTests(unittest.TestCase):
+    """Exercises the SQL 'endpoint table' ledger against an in-memory SQLite DB."""
+
+    def setUp(self):
+        import sqlite3
+        self.conn = sqlite3.connect(":memory:")
+        self.ledger = sync.SqlLedger(self.conn, "samsara_workorder_map", "sqlite")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_missing_table_reads_as_empty_then_ensure_table_creates_it(self):
+        self.assertEqual(self.ledger.work_orders, {})
+        self.ledger.ensure_table()
+        cols = [r[1] for r in self.conn.execute("PRAGMA table_info(samsara_workorder_map)")]
+        self.assertEqual(tuple(cols), sync.LEDGER_COLUMNS)
+        self.ledger.ensure_table()  # idempotent
+
+    def test_put_inserts_then_updates_and_reloads(self):
+        self.ledger.ensure_table()
+        self.ledger.put(123, "WO-9", "fp1", "Open", "A1", 55, "M-12", "create")
+        self.ledger.save()
+        self.ledger.put(123, "WO-9", "fp2", "Completed", "A1", 55, "M-12", "update")
+        self.ledger.put(124, "WO-10", None, "In Progress", "A2", 56, "M-13", "create")
+        self.ledger.save()
+
+        rows = self.conn.execute("SELECT ts_wo_id, samsara_wo_id, samsara_status, fingerprint, last_action, vehicle_name "
+                                 "FROM samsara_workorder_map ORDER BY ts_wo_id").fetchall()
+        self.assertEqual(rows, [(123, "WO-9", "Completed", "fp2", "update", "M-12"),
+                                (124, "WO-10", "In Progress", None, "create", "M-13")])
+
+        fresh = sync.SqlLedger(self.conn, "samsara_workorder_map", "sqlite")
+        self.assertEqual(fresh.get(123)["samsara_id"], "WO-9")
+        self.assertEqual(fresh.get(123)["status"], "Completed")
+        self.assertEqual(fresh.open_ts_ids(), [124])
+        self.assertEqual(fresh.max_ts_id(), 124)
+        self.assertEqual(fresh.describe(), "sql:sqlite:samsara_workorder_map")
+
+    def test_sync_loop_with_sql_ledger(self):
+        self.ledger.ensure_table()
+        client = mock.Mock()
+        client.create_work_order.return_value = {"id": "WO-1"}
+        idx = sync.VehicleIndex([{"id": "A1", "name": "M-12"}])
+        colmap = sync.resolve_column_map(make_row().keys())
+        rec = sync.row_to_record(make_row(), colmap)
+
+        r1 = sync.sync_records([rec], client, idx, self.ledger)
+        self.assertEqual(r1.created, [(123, "WO-1")])
+        r2 = sync.sync_records([rec], client, idx, self.ledger)
+        self.assertEqual(r2.unchanged, 1)
+        row = self.conn.execute("SELECT samsara_wo_id, samsara_asset_id, ts_vehicle_id, last_action "
+                                "FROM samsara_workorder_map WHERE ts_wo_id=123").fetchone()
+        self.assertEqual(row, ("WO-1", "A1", 55, "create"))

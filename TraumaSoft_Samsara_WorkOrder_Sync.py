@@ -88,6 +88,11 @@ def _env_json(name: str, default: Any) -> Any:
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "Reports")
 STATE_DIR = os.getenv("SYNC_STATE_DIR", os.path.join(OUTPUT_DIR, "State"))
 LEDGER_FILE = os.getenv("SAMSARA_WO_LEDGER_FILE", os.path.join(STATE_DIR, "samsara_workorder_ledger.json"))
+# SQL ledger ("endpoint table"): when SAMSARA_WO_LEDGER_DSN is set the mapping lives in a
+# database table instead of the JSON file.  DDL for the table is in sql/.
+LEDGER_DSN = os.getenv("SAMSARA_WO_LEDGER_DSN", "")
+LEDGER_TABLE = os.getenv("SAMSARA_WO_LEDGER_TABLE", "samsara_workorder_map")
+LEDGER_DIALECT = os.getenv("SAMSARA_WO_LEDGER_DIALECT", "mysql").strip().lower()  # mysql | mssql | sqlite
 
 DB_DSN = os.getenv("DB_DSN") or os.getenv("TS_DSN", "MyReportingDSN")
 TS_TIMEZONE = os.getenv("TS_TIMEZONE", "America/New_York")
@@ -470,9 +475,17 @@ def row_to_record(row: Dict[str, Any], colmap: Dict[str, Optional[str]], maps: O
 
 
 # =============================
-# LEDGER
+# LEDGER  (JSON file or SQL "endpoint table")
 # =============================
+LEDGER_COLUMNS = (
+    "ts_wo_id", "samsara_wo_id", "samsara_asset_id", "ts_vehicle_id", "vehicle_name",
+    "samsara_status", "fingerprint", "last_action", "first_synced_at", "last_synced_at",
+)
+
+
 class Ledger:
+    """JSON-file ledger: {"version": 1, "work_orders": {"<ts_id>": {...}}}."""
+
     def __init__(self, path: str):
         self.path = Path(path)
         self.data: Dict[str, Any] = {"version": 1, "work_orders": {}}
@@ -481,6 +494,9 @@ class Ledger:
                 self.data = json.load(f)
             self.data.setdefault("work_orders", {})
 
+    def describe(self) -> str:
+        return f"json:{self.path}"
+
     @property
     def work_orders(self) -> Dict[str, Dict[str, Any]]:
         return self.data["work_orders"]
@@ -488,14 +504,19 @@ class Ledger:
     def get(self, ts_id: int) -> Optional[Dict[str, Any]]:
         return self.work_orders.get(str(ts_id))
 
-    def put(self, ts_id: int, samsara_id: str, fp: Optional[str], status: str, asset_id: Optional[str]) -> None:
+    def put(self, ts_id: int, samsara_id: str, fp: Optional[str], status: str, asset_id: Optional[str],
+            vehicle_id: Optional[int] = None, vehicle_name: Optional[str] = None, action: Optional[str] = None) -> None:
         now = datetime.now().isoformat(timespec="seconds")
         entry = self.work_orders.setdefault(str(ts_id), {"created_at": now})
         entry.update({"samsara_id": str(samsara_id), "fingerprint": fp, "status": status,
-                      "asset_id": asset_id, "updated_at": now})
+                      "asset_id": asset_id, "vehicle_id": vehicle_id, "vehicle_name": vehicle_name,
+                      "last_action": action, "updated_at": now})
 
     def open_ts_ids(self) -> List[int]:
         return [int(k) for k, v in self.work_orders.items() if v.get("status") not in TERMINAL_STATUSES]
+
+    def max_ts_id(self) -> int:
+        return max((int(k) for k in self.work_orders), default=0)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -503,6 +524,110 @@ class Ledger:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(self.data, f, indent=2, sort_keys=True)
         os.replace(tmp, self.path)
+
+
+class SqlLedger:
+    """
+    Database-backed ledger.  `conn` is any DB-API connection using `?` parameters
+    (pyodbc, sqlite3).  The whole table is cached in memory at start-up (it is
+    small: one row per synced work order) and every put() is written through
+    immediately with update-then-insert so it works on MySQL, SQL Server and SQLite.
+    """
+
+    def __init__(self, conn, table: str = LEDGER_TABLE, dialect: str = LEDGER_DIALECT):
+        self.conn = conn
+        self.table = table
+        self.dialect = dialect
+        self.work_orders: Dict[str, Dict[str, Any]] = {}
+        self._load()
+
+    def describe(self) -> str:
+        return f"sql:{self.dialect}:{self.table}"
+
+    @staticmethod
+    def ddl_path(dialect: str) -> Path:
+        return Path(__file__).resolve().parent / "sql" / f"samsara_workorder_map.{dialect}.sql"
+
+    def ensure_table(self) -> None:
+        """Create the mapping table if it does not exist, using sql/<dialect>.sql."""
+        ddl = self.ddl_path(self.dialect).read_text(encoding="utf-8").replace("samsara_workorder_map", self.table)
+        ddl = "\n".join(line for line in ddl.splitlines() if not line.strip().startswith("--"))
+        cur = self.conn.cursor()
+        for stmt in [x.strip() for x in ddl.split(";") if x.strip()]:
+            cur.execute(stmt)
+        self.conn.commit()
+        cur.close()
+        self._load()
+
+    def _load(self) -> None:
+        cur = self.conn.cursor()
+        try:
+            cur.execute(f"SELECT {', '.join(LEDGER_COLUMNS)} FROM {self.table}")
+        except Exception as e:  # table missing -> empty ledger; --init-ledger-table creates it
+            logging.warning("Ledger table %s not readable (%s); treating as empty", self.table, e)
+            self.work_orders = {}
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            return
+        self.work_orders = {}
+        for r in cur.fetchall():
+            row = dict(zip(LEDGER_COLUMNS, r))
+            self.work_orders[str(row["ts_wo_id"])] = {
+                "samsara_id": str(row["samsara_wo_id"]), "fingerprint": row["fingerprint"],
+                "status": row["samsara_status"], "asset_id": row["samsara_asset_id"],
+                "vehicle_id": row["ts_vehicle_id"], "vehicle_name": row["vehicle_name"],
+                "last_action": row["last_action"], "created_at": str(row["first_synced_at"]),
+                "updated_at": str(row["last_synced_at"]),
+            }
+        cur.close()
+
+    def get(self, ts_id: int) -> Optional[Dict[str, Any]]:
+        return self.work_orders.get(str(ts_id))
+
+    def put(self, ts_id: int, samsara_id: str, fp: Optional[str], status: str, asset_id: Optional[str],
+            vehicle_id: Optional[int] = None, vehicle_name: Optional[str] = None, action: Optional[str] = None) -> None:
+        now = datetime.now().replace(microsecond=0)
+        existing = self.get(ts_id)
+        cur = self.conn.cursor()
+        if existing:
+            cur.execute(
+                f"UPDATE {self.table} SET samsara_wo_id=?, samsara_asset_id=?, ts_vehicle_id=?, vehicle_name=?, "
+                f"samsara_status=?, fingerprint=?, last_action=?, last_synced_at=? WHERE ts_wo_id=?",
+                (str(samsara_id), asset_id, vehicle_id, vehicle_name, status, fp, action, now, int(ts_id)),
+            )
+            if cur.rowcount == 0:
+                existing = None
+        if not existing:
+            cur.execute(
+                f"INSERT INTO {self.table} ({', '.join(LEDGER_COLUMNS)}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (int(ts_id), str(samsara_id), asset_id, vehicle_id, vehicle_name, status, fp, action, now, now),
+            )
+        cur.close()
+        entry = self.work_orders.setdefault(str(ts_id), {"created_at": now.isoformat()})
+        entry.update({"samsara_id": str(samsara_id), "fingerprint": fp, "status": status, "asset_id": asset_id,
+                      "vehicle_id": vehicle_id, "vehicle_name": vehicle_name, "last_action": action,
+                      "updated_at": now.isoformat()})
+
+    def open_ts_ids(self) -> List[int]:
+        return [int(k) for k, v in self.work_orders.items() if v.get("status") not in TERMINAL_STATUSES]
+
+    def max_ts_id(self) -> int:
+        return max((int(k) for k in self.work_orders), default=0)
+
+    def save(self) -> None:
+        self.conn.commit()
+
+
+def open_ledger():
+    """SQL ledger when SAMSARA_WO_LEDGER_DSN is set, otherwise the JSON file."""
+    if LEDGER_DSN:
+        import pyodbc
+
+        logging.info("Ledger: SQL table %s via DSN=%s (%s)", LEDGER_TABLE, LEDGER_DSN, LEDGER_DIALECT)
+        return SqlLedger(pyodbc.connect(f"DSN={LEDGER_DSN};"), LEDGER_TABLE, LEDGER_DIALECT)
+    return Ledger(LEDGER_FILE)
 
 
 # =============================
@@ -628,7 +753,7 @@ class SyncResult:
 
 
 def sync_records(records: List[WorkOrderRecord], client: Optional[SamsaraClient], vehicles: VehicleIndex,
-                 ledger: Ledger, dry_run: bool = False, match_mode: str = SAMSARA_VEHICLE_MATCH,
+                 ledger, dry_run: bool = False, match_mode: str = SAMSARA_VEHICLE_MATCH,
                  send_initial_status: bool = SAMSARA_SEND_INITIAL_STATUS) -> SyncResult:
     result = SyncResult(dry_run=dry_run)
     for rec in records:
@@ -644,7 +769,8 @@ def sync_records(records: List[WorkOrderRecord], client: Optional[SamsaraClient]
                 logging.info("UPDATE %s -> Samsara WO %s (%s)", rec.tag, entry["samsara_id"], rec.status)
                 if not dry_run:
                     client.update_work_order(entry["samsara_id"], payload)
-                    ledger.put(rec.ts_id, entry["samsara_id"], fp, rec.status, entry.get("asset_id"))
+                    ledger.put(rec.ts_id, entry["samsara_id"], fp, rec.status, entry.get("asset_id"),
+                               rec.vehicle_id, rec.vehicle_name, "update")
                     ledger.save()
                 result.updated.append((rec.ts_id, entry["samsara_id"]))
                 continue
@@ -674,7 +800,7 @@ def sync_records(records: List[WorkOrderRecord], client: Optional[SamsaraClient]
                 else:
                     raise
             samsara_id = str(created["id"])
-            ledger.put(rec.ts_id, samsara_id, fp, rec.status, asset_id)
+            ledger.put(rec.ts_id, samsara_id, fp, rec.status, asset_id, rec.vehicle_id, rec.vehicle_name, "create")
             ledger.save()
             result.created.append((rec.ts_id, samsara_id))
         except Exception as e:  # keep going; one bad row must not stop the batch
@@ -683,7 +809,7 @@ def sync_records(records: List[WorkOrderRecord], client: Optional[SamsaraClient]
     return result
 
 
-def rebuild_ledger(client: SamsaraClient, ledger: Ledger) -> int:
+def rebuild_ledger(client: SamsaraClient, ledger) -> int:
     """Scan Samsara work orders for `[TS-WO:<id>]` tags and repopulate the ledger."""
     count = 0
     for wo in client.list_work_orders():
@@ -695,7 +821,7 @@ def rebuild_ledger(client: SamsaraClient, ledger: Ledger) -> int:
         if existing and existing.get("samsara_id") == str(wo.get("id")):
             continue
         # fingerprint=None forces one re-sync PATCH on the next run so TS wins.
-        ledger.put(ts_id, str(wo["id"]), None, wo.get("status") or "Open", wo.get("assetId"))
+        ledger.put(ts_id, str(wo["id"]), None, wo.get("status") or "Open", wo.get("assetId"), action="rebuild")
         count += 1
     ledger.save()
     return count
@@ -787,7 +913,9 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Sync TraumaSoft work orders into Samsara.")
     p.add_argument("--dry-run", action="store_true", help="Read TraumaSoft and Samsara but write nothing to Samsara.")
     p.add_argument("--discover", action="store_true", help="Print vm_work_orders schema, samples and distinct statuses, then exit.")
-    p.add_argument("--rebuild-ledger", action="store_true", help="Rebuild the local ledger from [TS-WO:id] tags in Samsara, then exit.")
+    p.add_argument("--rebuild-ledger", action="store_true", help="Rebuild the ledger from [TS-WO:id] tags in Samsara, then exit.")
+    p.add_argument("--init-ledger-table", action="store_true",
+                   help="Create the SQL mapping table (SAMSARA_WO_LEDGER_DSN / _TABLE / _DIALECT) from sql/ if missing, then exit.")
     p.add_argument("--since", type=lambda s: datetime.strptime(s, "%Y-%m-%d"), help="Sync work orders changed since YYYY-MM-DD.")
     p.add_argument("--lookback-days", type=int, default=TS_WO_LOOKBACK_DAYS)
     p.add_argument("--limit", type=int, help="Process at most N work orders (useful for a first test).")
@@ -805,7 +933,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
     log_path = setup_logging(OUTPUT_DIR, run_date_str)
     logging.info("=== TraumaSoft -> Samsara Work Order Sync started ===")
-    logging.info("DB_DSN=%s | TEST_MODE=%s | DRY_RUN=%s | LEDGER=%s", DB_DSN, TEST_MODE, args.dry_run, LEDGER_FILE)
+    logging.info("DB_DSN=%s | TEST_MODE=%s | DRY_RUN=%s | LEDGER=%s", DB_DSN, TEST_MODE, args.dry_run,
+                 f"sql:{LEDGER_DSN}/{LEDGER_TABLE}" if LEDGER_DSN else LEDGER_FILE)
+
+    if args.init_ledger_table:
+        if not LEDGER_DSN:
+            raise SystemExit("--init-ledger-table needs SAMSARA_WO_LEDGER_DSN (and optionally _TABLE, _DIALECT)")
+        ledger = open_ledger()
+        ledger.ensure_table()
+        logging.info("Ledger table ready: %s (%s rows)", ledger.describe(), len(ledger.work_orders))
+        return 0
 
     if args.discover:
         conn = get_db_connection()
@@ -818,11 +955,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     client: Optional[SamsaraClient] = None
     if not args.dry_run or SAMSARA_API_TOKEN:
         client = SamsaraClient(SAMSARA_API_TOKEN, base_url=SAMSARA_BASE_URL)
-    ledger = Ledger(LEDGER_FILE)
+    ledger = open_ledger()
 
     if args.rebuild_ledger:
         n = rebuild_ledger(client, ledger)
-        logging.info("Ledger rebuilt: %s work orders mapped from Samsara into %s", n, LEDGER_FILE)
+        logging.info("Ledger rebuilt: %s work orders mapped from Samsara into %s", n, ledger.describe())
         return 0
 
     # --- Samsara vehicles
@@ -843,8 +980,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not colmap.get("id"):
             raise SystemExit(f"Could not find an id column on {TS_WO_TABLE}; set TS_WO_COLUMN_MAP")
         extra_ids = list(args.ts_id) if args.ts_id else ledger.open_ts_ids()
-        ledger_max = max((int(k) for k in ledger.work_orders), default=0)
-        rows = fetch_work_orders(conn, colmap, since, extra_ids, args.limit, ledger_max)
+        rows = fetch_work_orders(conn, colmap, since, extra_ids, args.limit, ledger.max_ts_id())
     finally:
         conn.close()
     logging.info("TraumaSoft work orders fetched: %s (since %s)", len(rows), since)
@@ -871,7 +1007,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     lines = [
         f"TraumaSoft -> Samsara Work Order Sync - {run_date_str}",
-        f"Since: {since} | TraumaSoft rows: {len(rows)} | Ledger: {LEDGER_FILE}",
+        f"Since: {since} | TraumaSoft rows: {len(rows)} | Ledger: {ledger.describe()}",
         f"Log File: {log_path}",
         "",
     ] + result.summary_lines()

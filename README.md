@@ -251,12 +251,11 @@ When modifying SQL, ensure parameter counts still match the number of `?` placeh
 
 ## TraumaSoft → Samsara Work Order Sync
 
-`TraumaSoft_Samsara_WorkOrder_Sync.py` mirrors TraumaSoft vehicle maintenance work orders into **Samsara Maintenance → Work Orders**. Work orders can come from any of four sources (`TS_WO_SOURCE`, auto-detected when unset):
+`TraumaSoft_Samsara_WorkOrder_Sync.py` mirrors TraumaSoft vehicle maintenance work orders into **Samsara Maintenance → Work Orders**. Work orders can come from any of three sources (`TS_WO_SOURCE`, auto-detected when unset):
 
 | Source | When it's used | Needs |
 |---|---|---|
-| `vehicles` (default with API credentials) | `TS_API_BASE_URL` / `TS_API_KEY` are set (the same `.env` the API-based reports use) | the project's `traumasoft_api.py` next to the script. TraumaSoft's third-party API has **no work-order endpoint** (its OpenAPI spec lists 94 paths; Fleet has only Vehicles, Equipment, CustomStatus and GpsGeofence), so this source watches each vehicle's `vehicle_status`: entering an out-of-service status opens a Samsara work order, returning to service completes it. See **Vehicle status episodes** below. |
-| `api` | `TS_WO_SOURCE=api` | a TraumaSoft endpoint that returns work-order rows (`TS_WO_API_PATH`); only useful if TraumaSoft adds one. `--probe-api` checks candidate paths. |
+| `api` | `TS_API_BASE_URL` / `TS_API_KEY` are set (the same `.env` the API-based reports use) | the project's `traumasoft_api.py` next to the script and `TS_WO_API_PATH` pointing at an endpoint that returns work-order rows. **TraumaSoft's third-party OpenAPI spec (94 paths) currently has no work-order or maintenance endpoint**; `--probe-api` checks candidate paths in case one is added. |
 | `db` | `DB_DSN` is set | an ODBC DSN to the TraumaSoft reporting DB; reads `vm_work_orders` joined to `sched_vehicles` / `cost_centers` |
 | `csv` | `TS_WO_CSV_FILE` is set | an export of the work order list with at least an id, a vehicle name/number and a description column |
 
@@ -268,19 +267,6 @@ Rows from every source go through the same column resolution and mapping, so `--
 - Vehicles are matched to Samsara assets by **VIN** first, then by name (case/punctuation-insensitive, so `M-12` matches `M 12`), then by `externalIds[SAMSARA_VEHICLE_EXTERNAL_ID_KEY]`. `SAMSARA_VEHICLE_MATCH` changes which is tried first. Work orders whose vehicle isn't found are skipped and listed in the summary email.
 - TraumaSoft statuses/priorities/categories are mapped to Samsara's enums (`Open`, `Assigned`, `In Progress`, `On Hold`, `Pending Parts`, `Pending Approval`, `Completed`, `Closed`, `Cancelled`; `Low/Medium/High/Urgent`; `Annual/Corrective/Damage Repair/Preventive/Recall`). Common text values map automatically; numeric ids or custom labels can be mapped with `TS_WO_STATUS_MAP`, `TS_WO_PRIORITY_MAP`, `TS_WO_CATEGORY_MAP` (JSON).
 - Odometers are converted from TraumaSoft miles (or km when `odometer_type` says so) to Samsara meters; timestamps are emitted as RFC 3339 in `TS_TIMEZONE` (default `America/New_York`).
-
-### Vehicle status episodes (the `vehicles` source)
-
-Every run fetches `GET /ThirdParty/Data/Fleet/Vehicles` (`id`, `name`, `vehicle_status`, `vin`, `odometer`) and keeps a small state file (`TS_VEHICLE_STATE_FILE`, default `Reports/State/ts_vehicle_status_state.json`):
-
-- A vehicle whose status becomes out-of-service starts an **episode** with id `V<vehicle_id>-<yyyymmddHHMM>`. The episode is pushed to Samsara as an **Open** work order on that asset, category `Corrective`, odometer from TraumaSoft, description `[TS-WO:V56-202610140900] Vehicle M-13 marked 'Out of Service' in TraumaSoft since 2026-10-14 09:00`.
-- While the vehicle stays out of service, further status changes (e.g. `Out of Service -> In Shop`) are appended to the description.
-- When the vehicle returns to an in-service status, the episode is **Completed** in Samsara with `completedAtTime` set, and it keeps being checked for `TS_VEHICLE_CLOSED_RETENTION_DAYS` (30) so late edits still sync.
-- Vehicles are matched to Samsara assets by **VIN first**, then name, then `externalIds` (`SAMSARA_VEHICLE_MATCH` picks which to try first; the others are fallbacks).
-
-Which statuses count as out of service: by default any `vehicle_status` containing one of `TS_OOS_KEYWORDS` (`out of service`, `oos`, `shop`, `mechanical`, `maintenance`, `repair`, `down`, `broke`). To be exact, set `TS_OOS_STATUSES` to a JSON list of the status names, e.g. `TS_OOS_STATUSES=["Out of Service", "In Shop"]`. Run `--discover` first: it lists TraumaSoft's custom statuses and the current vehicle counts per status, starring the ones treated as out of service, and shows the episodes a real run would create. `--dry-run` does not write the state file, so the first real run starts the episodes.
-
-This also restores the out-of-service history (`oos_since`, days out) the vehicle report lost when the reports moved from the database to the API, since the state file records every episode.
 
 ### Finding the TraumaSoft work-order endpoint
 
@@ -317,8 +303,7 @@ py -3 -m venv .venv
 # 1. See the real columns, sample rows and distinct status/priority values
 python TraumaSoft_Samsara_WorkOrder_Sync.py --discover
 
-# 2. (If needed) tell the sync which statuses / columns to use in .env:
-#    TS_OOS_STATUSES=["Out of Service", "In Shop"]          # vehicles source
+# 2. (If needed) tell the sync which columns to use and how to map values in .env:
 #    TS_WO_COLUMN_MAP={"description": ["complaint"], "status": ["wo_status"]}
 #    TS_WO_STATUS_MAP={"1": "Open", "2": "In Progress", "3": "Completed"}
 
@@ -379,7 +364,7 @@ Set `SAMSARA_WO_LEDGER_DSN` to keep the TraumaSoft ↔ Samsara mapping in a data
 
 | Column | Type | Meaning |
 |---|---|---|
-| `ts_wo_id` | VARCHAR(64), primary key | TraumaSoft `vm_work_orders.id`, or a vehicle episode id `V<vehicle_id>-<yyyymmddHHMM>` |
+| `ts_wo_id` | VARCHAR(64), primary key | TraumaSoft work order id (stored as text) |
 | `samsara_wo_id` | VARCHAR(64), unique | Samsara work order id |
 | `samsara_asset_id` | VARCHAR(64) | Samsara vehicle/asset id the work order was created against |
 | `ts_vehicle_id` | INT | TraumaSoft `sched_vehicles.id` |
@@ -412,10 +397,7 @@ The table is loaded into memory at start-up and every create/update is written t
 | `SAMSARA_VEHICLE_EXTERNAL_ID_KEY` | `traumasoftVehicleId` | externalIds key holding the TraumaSoft `sched_vehicles.id` |
 | `SAMSARA_DEFAULT_PRIORITY` | `Medium` | Used when TraumaSoft has no priority |
 | `SAMSARA_SEND_INITIAL_STATUS` | `true` | Send status/started/completed on create; falls back to create-then-PATCH if rejected |
-| `TS_WO_SOURCE` | auto | `vehicles`, `api`, `db` or `csv` (see table above) |
-| `TS_OOS_STATUSES` / `TS_OOS_KEYWORDS` | – / built-in list | Which TraumaSoft vehicle statuses open a work order (`vehicles` source) |
-| `TS_VEHICLE_STATE_FILE` | `OUTPUT_DIR/State/ts_vehicle_status_state.json` | Episode state for the `vehicles` source |
-| `TS_VEHICLE_ODOMETER_UNIT` / `TS_VEHICLE_CLOSED_RETENTION_DAYS` | `miles` / `30` | Odometer unit on TraumaSoft vehicles; how long completed episodes keep syncing |
+| `TS_WO_SOURCE` | auto | `api`, `db` or `csv` (see table above) |
 | `TS_WO_API_PATH` / `TS_WO_API_PARAMS` | `ThirdParty/Data/WorkOrders` / – | TraumaSoft API endpoint and optional JSON query params for the `api` source |
 | `TS_WO_CSV_FILE` | – | Export file for the `csv` source |
 | `TS_WO_TABLE` | `vm_work_orders` | Source table for the `db` source |

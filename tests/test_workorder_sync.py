@@ -1,0 +1,288 @@
+"""Unit tests for the TraumaSoft -> Samsara work order sync (no DB / network needed)."""
+import json
+import os
+import sys
+import tempfile
+import unittest
+from datetime import datetime
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import TraumaSoft_Samsara_WorkOrder_Sync as sync  # noqa: E402
+from samsara_api import SamsaraApiError, SamsaraClient  # noqa: E402
+
+
+def make_row(**over):
+    row = {
+        "id": 123, "vehicle_id": 55, "cost_center_id": 7, "description": "Brake squeal front",
+        "status": "In Progress", "priority": "High", "category": "Repair",
+        "date_created": datetime(2026, 10, 1, 8, 30), "date_updated": datetime(2026, 10, 2, 9, 0),
+        "date_completed": None, "odometer_started": 120345, "odometer_type": "miles",
+        "vehicle_name": "M-12", "cost_center_name": "Station 4", "vehicle_odometer_type": "miles",
+    }
+    row.update(over)
+    return row
+
+
+class ColumnMapTests(unittest.TestCase):
+    def test_resolves_first_candidate_case_insensitively(self):
+        cm = sync.resolve_column_map(["ID", "Vehicle_Id", "complaint", "date_completed", "Status"])
+        self.assertEqual(cm["id"], "ID")
+        self.assertEqual(cm["vehicle_id"], "Vehicle_Id")
+        self.assertEqual(cm["description"], "complaint")
+        self.assertEqual(cm["completed_at"], "date_completed")
+        self.assertEqual(cm["status"], "Status")
+        self.assertIsNone(cm["priority"])
+
+    def test_override_takes_precedence(self):
+        cm = sync.resolve_column_map(["id", "description", "problem_text"], {"description": ["problem_text"]})
+        self.assertEqual(cm["description"], "problem_text")
+
+
+class MappingTests(unittest.TestCase):
+    def test_status_mapping(self):
+        self.assertEqual(sync.map_status("open"), "Open")
+        self.assertEqual(sync.map_status("IN PROGRESS"), "In Progress")
+        self.assertEqual(sync.map_status("Waiting for parts"), "Pending Parts")
+        self.assertEqual(sync.map_status("canceled"), "Cancelled")
+        self.assertEqual(sync.map_status("Completed"), "Completed")
+        self.assertEqual(sync.map_status(None, completed_at=datetime(2026, 1, 1)), "Completed")
+        self.assertEqual(sync.map_status(None), "Open")
+        self.assertEqual(sync.map_status("weird-status"), "Open")
+        self.assertEqual(sync.map_status(3, status_map={"3": "On Hold"}), "On Hold")
+
+    def test_priority_mapping(self):
+        self.assertEqual(sync.map_priority("normal"), "Medium")
+        self.assertEqual(sync.map_priority("EMERGENCY"), "Urgent")
+        self.assertEqual(sync.map_priority(None, default="Low"), "Low")
+        self.assertEqual(sync.map_priority("??", default="Bogus"), "Medium")
+
+    def test_category_mapping(self):
+        self.assertEqual(sync.map_category("PM"), "Preventive")
+        self.assertEqual(sync.map_category("Damage Repair"), "Damage Repair")
+        self.assertIsNone(sync.map_category("unknown"))
+        self.assertIsNone(sync.map_category(None))
+
+    def test_odometer_conversion(self):
+        self.assertEqual(sync.odometer_to_meters(100, "miles"), 160934)
+        self.assertEqual(sync.odometer_to_meters(100, "km"), 100000)
+        self.assertEqual(sync.odometer_to_meters("100.0", None), 160934)
+        self.assertIsNone(sync.odometer_to_meters(0))
+        self.assertIsNone(sync.odometer_to_meters("n/a"))
+
+    def test_rfc3339_uses_traumasoft_timezone(self):
+        self.assertEqual(sync.to_rfc3339(datetime(2026, 7, 4, 12, 0), "America/New_York"), "2026-07-04T12:00:00-04:00")
+        self.assertEqual(sync.to_rfc3339("2026-01-15 09:30:00", "America/New_York"), "2026-01-15T09:30:00-05:00")
+        self.assertIsNone(sync.to_rfc3339("0000-00-00 00:00:00"))
+        self.assertIsNone(sync.to_rfc3339(None))
+
+    def test_vehicle_name_normalisation(self):
+        self.assertEqual(sync.normalize_vehicle_name("M-12"), sync.normalize_vehicle_name("m 12"))
+        self.assertEqual(sync.normalize_vehicle_name("M-12"), sync.normalize_vehicle_name("M12"))
+
+
+class RecordAndPayloadTests(unittest.TestCase):
+    def setUp(self):
+        self.colmap = sync.resolve_column_map(make_row().keys())
+        self.rec = sync.row_to_record(make_row(), self.colmap)
+
+    def test_row_to_record(self):
+        r = self.rec
+        self.assertEqual(r.ts_id, 123)
+        self.assertEqual(r.vehicle_name, "M-12")
+        self.assertEqual(r.status, "In Progress")
+        self.assertEqual(r.priority, "High")
+        self.assertEqual(r.category, "Corrective")
+        self.assertEqual(r.odometer_meters, int(round(120345 * 1609.344)))
+        self.assertEqual(r.cost_center_name, "Station 4")
+
+    def test_completed_date_without_status_column_marks_completed(self):
+        row = make_row(date_completed=datetime(2026, 10, 3, 10, 0))
+        del row["status"]
+        cm = sync.resolve_column_map(row.keys())
+        self.assertEqual(sync.row_to_record(row, cm).status, "Completed")
+
+    def test_description_carries_ts_tag(self):
+        desc = sync.build_description(self.rec)
+        self.assertTrue(desc.startswith("[TS-WO:123] Brake squeal front"))
+        self.assertIn("Station: Station 4", desc)
+        self.assertEqual(sync.TS_TAG_RE.search(desc).group(1), "123")
+
+    def test_create_payload(self):
+        p = sync.build_create_payload(self.rec, "asset-1")
+        self.assertEqual(p["assetId"], "asset-1")
+        self.assertEqual(p["priority"], "High")
+        self.assertEqual(p["category"], "Corrective")
+        self.assertEqual(p["status"], "In Progress")
+        self.assertNotIn("completedAtTime", p)
+        self.assertNotIn("dueAtTime", p)
+        p2 = sync.build_create_payload(self.rec, "asset-1", send_initial_status=False)
+        self.assertNotIn("status", p2)
+
+    def test_create_payload_open_omits_status(self):
+        rec = sync.row_to_record(make_row(status="open"), self.colmap)
+        self.assertNotIn("status", sync.build_create_payload(rec, "a"))
+
+    def test_update_payload_completed(self):
+        rec = sync.row_to_record(make_row(status="completed", date_completed=datetime(2026, 10, 3, 10, 0)), self.colmap)
+        p = sync.build_update_payload(rec)
+        self.assertEqual(p["status"], "Completed")
+        self.assertEqual(p["completedAtTime"], "2026-10-03T10:00:00-04:00")
+
+    def test_fingerprint_changes_with_status(self):
+        a = sync.fingerprint(self.rec)
+        b = sync.fingerprint(sync.row_to_record(make_row(status="completed"), self.colmap))
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, sync.fingerprint(sync.row_to_record(make_row(), self.colmap)))
+
+
+class VehicleIndexTests(unittest.TestCase):
+    vehicles = [
+        {"id": "1", "name": "M-12", "vin": "1ABC", "externalIds": {"traumasoftVehicleId": "55"}},
+        {"id": "2", "name": "M 13", "vin": "2DEF"},
+    ]
+
+    def test_resolve_by_name_external_vin(self):
+        idx = sync.VehicleIndex(self.vehicles)
+        rec = sync.row_to_record(make_row(), sync.resolve_column_map(make_row().keys()))
+        self.assertEqual(idx.resolve(rec, "name"), "1")
+        self.assertEqual(idx.resolve(rec, "externalId"), "1")
+        rec.extra["vehicle_vin"] = "2def"
+        self.assertEqual(idx.resolve(rec, "vin"), "2")
+        rec.vehicle_name = "M-99"
+        self.assertIsNone(idx.resolve(rec, "name"))
+
+
+class SyncLoopTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ledger = sync.Ledger(os.path.join(self.tmp.name, "ledger.json"))
+        self.idx = sync.VehicleIndex([{"id": "A1", "name": "M-12"}])
+        self.colmap = sync.resolve_column_map(make_row().keys())
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_create_then_unchanged_then_update(self):
+        client = mock.Mock()
+        client.create_work_order.return_value = {"id": "WO-9"}
+        rec = sync.row_to_record(make_row(), self.colmap)
+
+        r1 = sync.sync_records([rec], client, self.idx, self.ledger)
+        self.assertEqual(r1.created, [(123, "WO-9")])
+        self.assertEqual(client.create_work_order.call_args[0][0]["assetId"], "A1")
+        self.assertEqual(self.ledger.get(123)["samsara_id"], "WO-9")
+
+        r2 = sync.sync_records([rec], client, self.idx, self.ledger)
+        self.assertEqual(r2.unchanged, 1)
+        client.update_work_order.assert_not_called()
+
+        rec2 = sync.row_to_record(make_row(status="completed", date_completed=datetime(2026, 10, 3)), self.colmap)
+        r3 = sync.sync_records([rec2], client, self.idx, self.ledger)
+        self.assertEqual(r3.updated, [(123, "WO-9")])
+        client.update_work_order.assert_called_once()
+        self.assertEqual(client.update_work_order.call_args[0][0], "WO-9")
+        self.assertEqual(client.update_work_order.call_args[0][1]["status"], "Completed")
+        self.assertEqual(self.ledger.get(123)["status"], "Completed")
+        self.assertEqual(self.ledger.open_ts_ids(), [])
+
+        with open(self.ledger.path) as f:
+            self.assertIn("WO-9", json.load(f)["work_orders"]["123"]["samsara_id"])
+
+    def test_vehicle_not_found_is_skipped(self):
+        client = mock.Mock()
+        rec = sync.row_to_record(make_row(vehicle_name="Unknown"), self.colmap)
+        r = sync.sync_records([rec], client, self.idx, self.ledger)
+        self.assertEqual(r.skipped_no_vehicle, [(123, "Unknown")])
+        client.create_work_order.assert_not_called()
+
+    def test_dry_run_writes_nothing(self):
+        rec = sync.row_to_record(make_row(), self.colmap)
+        r = sync.sync_records([rec], None, self.idx, self.ledger, dry_run=True)
+        self.assertEqual(r.created, [(123, "(dry-run)")])
+        self.assertIsNone(self.ledger.get(123))
+
+    def test_create_falls_back_when_initial_status_rejected(self):
+        client = mock.Mock()
+        client.create_work_order.side_effect = [SamsaraApiError(400, "status not allowed"), {"id": "WO-2"}]
+        rec = sync.row_to_record(make_row(), self.colmap)
+        r = sync.sync_records([rec], client, self.idx, self.ledger)
+        self.assertEqual(r.created, [(123, "WO-2")])
+        self.assertNotIn("status", client.create_work_order.call_args_list[1][0][0])
+        client.update_work_order.assert_called_once_with("WO-2", mock.ANY)
+
+    def test_failure_does_not_stop_batch(self):
+        client = mock.Mock()
+        client.create_work_order.side_effect = [SamsaraApiError(500, "boom"), {"id": "WO-3"}]
+        recs = [sync.row_to_record(make_row(id=1), self.colmap), sync.row_to_record(make_row(id=2), self.colmap)]
+        r = sync.sync_records(recs, client, self.idx, self.ledger)
+        self.assertEqual([f[0] for f in r.failed], [1])
+        self.assertEqual(r.created, [(2, "WO-3")])
+
+    def test_rebuild_ledger_from_tags(self):
+        client = mock.Mock()
+        client.list_work_orders.return_value = [
+            {"id": "WO-1", "description": "[TS-WO:10] thing", "status": "Open", "assetId": "A1"},
+            {"id": "WO-2", "description": "no tag", "status": "Open"},
+        ]
+        n = sync.rebuild_ledger(client, self.ledger)
+        self.assertEqual(n, 1)
+        self.assertEqual(self.ledger.get(10)["samsara_id"], "WO-1")
+        self.assertIsNone(self.ledger.get(10)["fingerprint"])
+
+
+class FakeResponse:
+    def __init__(self, status, body=None, headers=None):
+        self.status_code = status
+        self._body = body
+        self.headers = headers or {}
+        self.content = b"x" if body is not None else b""
+        self.text = json.dumps(body) if body is not None else ""
+
+    def json(self):
+        return self._body
+
+
+class SamsaraClientTests(unittest.TestCase):
+    def _client(self, responses):
+        session = mock.Mock()
+        session.headers = {}
+        session.request.side_effect = responses
+        c = SamsaraClient("tok", session=session, write_min_interval_s=0)
+        return c, session
+
+    def test_pagination(self):
+        c, s = self._client([
+            FakeResponse(200, {"data": [{"id": "1"}], "pagination": {"hasNextPage": True, "endCursor": "c1"}}),
+            FakeResponse(200, {"data": [{"id": "2"}], "pagination": {"hasNextPage": False, "endCursor": ""}}),
+        ])
+        self.assertEqual([v["id"] for v in c.list_vehicles()], ["1", "2"])
+        self.assertEqual(s.request.call_args_list[1][1]["params"]["after"], "c1")
+        self.assertEqual(s.headers["Authorization"], "Bearer tok")
+
+    @mock.patch("samsara_api.time.sleep")
+    def test_retry_on_429_then_create(self, _sleep):
+        c, s = self._client([
+            FakeResponse(429, {"message": "slow down"}, {"Retry-After": "1"}),
+            FakeResponse(200, {"data": {"id": "WO-1", "status": "Open"}}),
+        ])
+        wo = c.create_work_order({"assetId": "A", "description": "d", "priority": None})
+        self.assertEqual(wo["id"], "WO-1")
+        call = s.request.call_args_list[1]
+        self.assertEqual(call[0][0], "POST")
+        self.assertTrue(call[0][1].endswith("/maintenance/work-orders"))
+        self.assertEqual(call[1]["json"], {"assetId": "A", "description": "d"})  # None dropped
+
+    def test_update_puts_id_in_body_and_raises_on_4xx(self):
+        c, s = self._client([FakeResponse(200, {"data": {"id": "WO-1"}}), FakeResponse(404, {"message": "nope"})])
+        c.update_work_order("WO-1", {"status": "Closed"})
+        self.assertEqual(s.request.call_args[0][0], "PATCH")
+        self.assertEqual(s.request.call_args[1]["json"], {"status": "Closed", "id": "WO-1"})
+        with self.assertRaises(SamsaraApiError) as ctx:
+            c.update_work_order("WO-1", {"status": "Closed"})
+        self.assertEqual(ctx.exception.status_code, 404)
+
+
+if __name__ == "__main__":
+    unittest.main()

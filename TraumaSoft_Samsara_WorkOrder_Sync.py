@@ -52,10 +52,14 @@ from samsara_workorders_api import (
     WORK_ORDER_STATUSES,
 )
 
+# Load .env from next to this script first, then from the current directory (first value wins).
+_ENV_FILES = [Path(__file__).resolve().with_name(".env"), Path.cwd() / ".env"]
 try:
     from dotenv import load_dotenv
 
-    load_dotenv(r".env")
+    for _env in _ENV_FILES:
+        if _env.is_file():
+            load_dotenv(_env)
 except ImportError:
     pass
 
@@ -970,7 +974,13 @@ def resolve_source(explicit: Optional[str] = None) -> str:
         return "db"
     if os.getenv("TS_API_BASE_URL") or os.getenv("TS_API_KEY"):
         return "api"
-    raise SystemExit("No work order source configured: set DB_DSN (db), TS_API_BASE_URL/TS_API_KEY (api) or TS_WO_CSV_FILE (csv), or TS_WO_SOURCE.")
+    found = [str(p) for p in _ENV_FILES if p.is_file()]
+    raise SystemExit(
+        "No work order source configured. Set TS_DB_HOST/TS_DB_NAME/TS_DB_USER/TS_DB_PASSWORD or DB_DSN (db), "
+        "TS_API_BASE_URL/TS_API_KEY (api) or TS_WO_CSV_FILE (csv), or TS_WO_SOURCE. "
+        + (f".env files loaded: {found}" if found else f"No .env file found at {[str(p) for p in _ENV_FILES]} "
+           "(if you saved it with Notepad, check it is not named .env.txt).")
+    )
 
 
 def probe_api(api, extra_paths: Optional[List[str]] = None) -> None:

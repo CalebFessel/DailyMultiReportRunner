@@ -42,6 +42,7 @@ pyodbc
 pandas
 openpyxl
 python-dotenv
+requests
 ```
 
 The standard library covers `logging`, `smtplib`, `email`, `ssl`, `pathlib`, etc. [file:1]
@@ -245,3 +246,197 @@ You can safely customize: [file:1]
 - The default DSN, output paths, and Excel table style.  
 
 When modifying SQL, ensure parameter counts still match the number of `?` placeholders so `_expand_params_to_markers` and `pandas.read_sql_query` continue to work correctly. [file:1]
+
+---
+
+## TraumaSoft → Samsara Work Order Sync
+
+`TraumaSoft_Samsara_WorkOrder_Sync.py` mirrors TraumaSoft vehicle maintenance work orders into **Samsara Maintenance → Work Orders**. Work orders can come from any of three sources (`TS_WO_SOURCE`, auto-detected when unset):
+
+| Source | When it's used | Needs |
+|---|---|---|
+| `api` | `TS_API_BASE_URL` / `TS_API_KEY` are set (the same `.env` the API-based reports use) | the project's `traumasoft_api.py` next to the script and `TS_WO_API_PATH` pointing at an endpoint that returns work-order rows. **TraumaSoft's third-party OpenAPI spec (94 paths) currently has no work-order or maintenance endpoint**; `--probe-api` checks candidate paths in case one is added. |
+| `db` | `TS_DB_HOST` (direct MySQL, no ODBC) or `DB_DSN` (ODBC) is set | read access to the TraumaSoft reporting DB from an IP TraumaSoft has whitelisted; reads `vm_work_orders` joined to `sched_vehicles` / `cost_centers` |
+| `csv` | `TS_WO_CSV_FILE` is set | an export of the work order list with at least an id, a vehicle name/number and a description column |
+
+Rows from every source go through the same column resolution and mapping, so `--discover`, `TS_WO_COLUMN_MAP` and the status/priority maps work the same way for all of them.
+
+- New TraumaSoft work orders are created in Samsara (`POST /maintenance/work-orders`).
+- Changes to status, description, priority, odometer, due/completed dates are pushed as updates (`PATCH /maintenance/work-orders`).
+- Every Samsara description starts with `[TS-WO:<id>]`; a ledger maps TraumaSoft ids to Samsara ids so reruns are idempotent. The ledger is either a JSON file (`Reports/State/samsara_workorder_ledger.json`, the default) or a SQL mapping table (see **Mapping table** below). If the ledger is lost, `--rebuild-ledger` reconstructs it from those tags.
+- Vehicles are matched to Samsara assets by **VIN** first, then by name (case/punctuation-insensitive, so `M-12` matches `M 12`), then by `externalIds[SAMSARA_VEHICLE_EXTERNAL_ID_KEY]`. `SAMSARA_VEHICLE_MATCH` changes which is tried first. Work orders whose vehicle isn't found are skipped and listed in the summary email.
+- TraumaSoft statuses/priorities/categories are mapped to Samsara's enums (`Open`, `Assigned`, `In Progress`, `On Hold`, `Pending Parts`, `Pending Approval`, `Completed`, `Closed`, `Cancelled`; `Low/Medium/High/Urgent`; `Annual/Corrective/Damage Repair/Preventive/Recall`). Common text values map automatically; numeric ids or custom labels can be mapped with `TS_WO_STATUS_MAP`, `TS_WO_PRIORITY_MAP`, `TS_WO_CATEGORY_MAP` (JSON).
+- Odometers are converted from TraumaSoft miles (or km when `odometer_type` says so) to Samsara meters; timestamps are emitted as RFC 3339 in `TS_TIMEZONE` (default `America/New_York`).
+
+### Database connection (the `db` source)
+
+Two ways to reach the TraumaSoft MySQL database:
+
+| Setting | Use |
+|---|---|
+| `TS_DB_HOST`, `TS_DB_PORT` (3306), `TS_DB_NAME`, `TS_DB_USER`, `TS_DB_PASSWORD`, `TS_DB_SSL` (true) | Direct connection with the pure-Python `pymysql` driver. Works on Windows and Linux with no ODBC driver or DSN. Preferred. |
+| `DB_DSN` | An ODBC System DSN (needs the MySQL ODBC driver and `pyodbc`). Same variable the report runner uses. |
+
+TraumaSoft only accepts connections from whitelisted static IPs, so the job must run from one. See `RUNBOOK.md` and `deploy/azure/` for the small Azure VM that holds the whitelisted IP: `create-vm.ps1` builds it (no public IP, SSH locked to your address, then moves the existing static IP onto it without starting the old VM) and `setup-vm.sh` installs Python, the code, the `.env` template and an hourly cron job.
+
+### Finding the TraumaSoft work-order endpoint
+
+TraumaSoft's OpenAPI spec (v1.0.0, 94 paths) has no work-order or maintenance endpoint; its `CustomStatus.notify_group` even names a `work_orders` domain with no API. If a later spec adds one, probe for it with the existing client and your `.env`:
+
+```bash
+python TraumaSoft_Samsara_WorkOrder_Sync.py --probe-api
+python TraumaSoft_Samsara_WorkOrder_Sync.py --probe-api --probe-path ThirdParty/Data/SomethingElse
+```
+
+It prints each candidate path with its HTTP status, and for any that answer, the row count and field names. Set `TS_WO_API_PATH` to the one that returns work orders (and `TS_WO_API_PARAMS` as JSON if it needs filters), then run `--discover`. If TraumaSoft confirms there is no work-order endpoint, use the `csv` source with a scheduled export, or the `db` source if Direct Database Access is available.
+
+### Samsara API token
+
+Create an API token in Samsara (Settings → API Tokens) with these scopes: **Read Vehicles**, and **Read Work Orders** + **Write Work Orders** (listed under the *Closed Beta* category — ask your Samsara rep to enable Work Orders API access if they are missing). Put it in `SAMSARA_API_TOKEN`. EU orgs set `SAMSARA_BASE_URL=https://api.eu.samsara.com`.
+
+### First run
+
+The exact `vm_work_orders` columns are not identical across TraumaSoft installs, so the sync discovers them at runtime. Start with:
+
+On Windows, drop `TraumaSoft_Samsara_WorkOrder_Sync.py`, `samsara_workorders_api.py`, `Run-WorkOrderSync.ps1` and the `sql/` folder into the Reports project folder (the one that holds `traumasoft_api.py` and `.env`). If the project's `.venv` is broken (its `python.exe` points at a Python that was uninstalled), recreate it:
+
+```powershell
+winget install --id Python.Python.3.13 -e        # or the python.org installer with "Add to PATH"
+cd "<Reports project folder>"
+Remove-Item -Recurse -Force .venv
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+`Run-WorkOrderSync.ps1` finds Python for you (`PYTHON_EXE`, `.venv`, the `py` launcher, PATH, or the usual install folders) and passes arguments through, e.g. `.\Run-WorkOrderSync.ps1 -Install` then `.\Run-WorkOrderSync.ps1 --discover`. Note that Windows PowerShell 5.1 does not accept `&&`; put commands on separate lines or join them with `;`.
+
+```bash
+# 1. See the real columns, sample rows and distinct status/priority values
+python TraumaSoft_Samsara_WorkOrder_Sync.py --discover
+
+# 2. (If needed) tell the sync which columns to use and how to map values in .env:
+#    TS_WO_COLUMN_MAP={"description": ["complaint"], "status": ["wo_status"]}
+#    TS_WO_STATUS_MAP={"1": "Open", "2": "In Progress", "3": "Completed"}
+
+# 3. Dry run - logs every create/update it would do, writes nothing to Samsara
+python TraumaSoft_Samsara_WorkOrder_Sync.py --dry-run --no-email
+
+# 4. Real run on a handful of work orders
+python TraumaSoft_Samsara_WorkOrder_Sync.py --limit 5
+python TraumaSoft_Samsara_WorkOrder_Sync.py --ts-id 12345
+
+# 5. Normal scheduled run (last TS_WO_LOOKBACK_DAYS days + any open ledger items)
+python TraumaSoft_Samsara_WorkOrder_Sync.py
+```
+
+Other flags: `--source api|db|csv`, `--probe-api`, `--since YYYY-MM-DD`, `--lookback-days N`, `--rebuild-ledger`, `--init-ledger-table`, `--no-email`.
+
+If the default query doesn't fit, point `TS_WO_SQL_FILE` at a `.sql` file. It must take one `?` parameter (the lookback start timestamp) and return the work order columns plus `vehicle_name`, `cost_center_name` and optionally `vehicle_odometer_type` / `vehicle_vin`.
+
+### Endpoint table
+
+Every call the sync makes, in the order it makes them:
+
+| Step | Method | Samsara endpoint | Token scope | Samsara rate limit | What the sync does with it |
+|---|---|---|---|---|---|
+| 1 | `GET` | `/fleet/vehicles?limit=512` (paged via `pagination.endCursor`) | Read Vehicles | 25 req/sec | Builds the vehicle index used to turn a TraumaSoft vehicle into a Samsara `assetId` (by name, `externalIds`, or VIN) |
+| 2 | `POST` | `/maintenance/work-orders` | Write Work Orders | 100 req/min | Creates one Samsara work order per new TraumaSoft work order |
+| 3 | `PATCH` | `/maintenance/work-orders` (work order `id` in the body) | Write Work Orders | 100 req/min | Pushes status / description / priority / odometer / date changes for work orders already in the ledger |
+| – | `GET` | `/maintenance/work-orders` (paged) | Read Work Orders | 5 req/sec | Only with `--rebuild-ledger`: scans descriptions for `[TS-WO:<id>]` to rebuild the ledger |
+
+Base URL is `SAMSARA_BASE_URL` (default `https://api.samsara.com`). All requests send `Authorization: Bearer <SAMSARA_API_TOKEN>`.
+
+TraumaSoft side: one `SELECT` against `TS_WO_TABLE` (default `vm_work_orders`) joined to `sched_vehicles` and `cost_centers`, filtered to rows changed in the last `TS_WO_LOOKBACK_DAYS`, plus a second `SELECT ... WHERE id IN (...)` for ledger work orders that are still open.
+
+### Field mapping (TraumaSoft → Samsara)
+
+| Logical field | TraumaSoft column candidates (first match wins) | Samsara field | Transform |
+|---|---|---|---|
+| id | `id`, `work_order_id`, `wo_id` | `description` prefix | `[TS-WO:<id>]` tag, also the ledger key |
+| vehicle | `vehicle_id` → `sched_vehicles.name` | `assetId` | Name match (punctuation/case-insensitive), or `externalIds[SAMSARA_VEHICLE_EXTERNAL_ID_KEY]`, or VIN |
+| description | `description`, `complaint`, `notes`, `details`, `problem`, `work_description`, `summary`, `title`, `name` | `description` | Prefixed with the tag; trailer adds TraumaSoft WO#, station, raw status |
+| status | `status`, `status_name`, `state`, `wo_status`, else `status_id` | `status` | Text → Samsara enum via built-in map + `TS_WO_STATUS_MAP`; no status but a completed date → `Completed`; unknown → `Open` |
+| priority | `priority`, `priority_name`, `priority_id` | `priority` | Text/number → `Low/Medium/High/Urgent`; default `SAMSARA_DEFAULT_PRIORITY` |
+| category | `category`, `type`, `work_type`, `wo_type`, `service_type` | `category` | Text → `Annual/Corrective/Damage Repair/Preventive/Recall`; omitted if unknown |
+| odometer | `odometer_started`, `odometer`, `mileage`, `odometer_completed` (+ `odometer_type`) | `odometerMeters` | miles × 1609.344, or km × 1000 |
+| engine hours | `engine_hours`, `hours` | `engineHours` | integer |
+| due | `due_date`, `date_due`, `due_at` | `dueAtTime` | RFC 3339 in `TS_TIMEZONE` |
+| started | `date_started`, `started_at`, `start_date`, `date_start` | `startedAtTime` | create only; RFC 3339 |
+| completed | `date_completed`, `completed_at`, `completed`, `date_closed`, `closed_at`, `close_date`, `date_finished` | `completedAtTime` | only when status is Completed/Closed/Cancelled |
+| changed-since filter | `date_updated`, `updated_at`, `modified`, … then `date_created`, … | – | `COALESCE(updated, created, completed) >= lookback` |
+| soft delete | `deleted`, `is_deleted` | – | rows with a non-zero value are excluded |
+| cost center | `cost_center_id` → `cost_centers.name` | `description` trailer | `Station: <name>` |
+
+Run `--discover` to see which real columns were picked; anything that resolved to `None` can be pointed at the right column with `TS_WO_COLUMN_MAP`.
+
+### Mapping table (SQL ledger)
+
+Set `SAMSARA_WO_LEDGER_SQLITE=<file>` to keep the TraumaSoft ↔ Samsara mapping in a SQLite table (simplest, no server), or `SAMSARA_WO_LEDGER_DSN` to keep it in a MySQL / SQL Server database, instead of the JSON file. The table is `samsara_workorder_map` (override with `SAMSARA_WO_LEDGER_TABLE`), one row per synced work order:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `ts_wo_id` | VARCHAR(64), primary key | TraumaSoft work order id (stored as text) |
+| `samsara_wo_id` | VARCHAR(64), unique | Samsara work order id |
+| `samsara_asset_id` | VARCHAR(64) | Samsara vehicle/asset id the work order was created against |
+| `ts_vehicle_id` | INT | TraumaSoft `sched_vehicles.id` |
+| `vehicle_name` | VARCHAR(100) | Vehicle name at sync time |
+| `samsara_status` | VARCHAR(32) | Last status pushed to Samsara |
+| `fingerprint` | CHAR(64) | SHA-256 of the last PATCH payload; unchanged ⇒ no call |
+| `last_action` | VARCHAR(16) | `create`, `update` or `rebuild` |
+| `first_synced_at` / `last_synced_at` | DATETIME | Audit timestamps |
+
+DDL is in `sql/samsara_workorder_map.mysql.sql` and `sql/samsara_workorder_map.mssql.sql`. Either run it yourself or let the script do it:
+
+```bash
+# .env
+SAMSARA_WO_LEDGER_DSN=MyStatusDSN          # any ODBC DSN the job may write to
+SAMSARA_WO_LEDGER_DIALECT=mysql            # mysql | mssql
+# SAMSARA_WO_LEDGER_TABLE=samsara_workorder_map
+
+python TraumaSoft_Samsara_WorkOrder_Sync.py --init-ledger-table   # creates the table if missing
+```
+
+The table is loaded into memory at start-up and every create/update is written through immediately (update-then-insert, committed per work order), so a crash mid-run never loses a Samsara id. Migrating from the JSON ledger: run `--rebuild-ledger` once with the DSN set and it will repopulate the table from the `[TS-WO:<id>]` tags in Samsara.
+
+### Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SAMSARA_API_TOKEN` | – | Bearer token (required for non-dry runs) |
+| `SAMSARA_BASE_URL` | `https://api.samsara.com` | API host |
+| `SAMSARA_VEHICLE_MATCH` | `vin` | Which match to try first: `vin`, `name` or `externalId` (the others are fallbacks) |
+| `SAMSARA_VEHICLE_EXTERNAL_ID_KEY` | `traumasoftVehicleId` | externalIds key holding the TraumaSoft `sched_vehicles.id` |
+| `SAMSARA_DEFAULT_PRIORITY` | `Medium` | Used when TraumaSoft has no priority |
+| `SAMSARA_SEND_INITIAL_STATUS` | `true` | Send status/started/completed on create; falls back to create-then-PATCH if rejected |
+| `TS_WO_SOURCE` | auto | `api`, `db` or `csv` (see table above) |
+| `TS_WO_API_PATH` / `TS_WO_API_PARAMS` | `ThirdParty/Data/WorkOrders` / – | TraumaSoft API endpoint and optional JSON query params for the `api` source |
+| `TS_WO_CSV_FILE` | – | Export file for the `csv` source |
+| `TS_WO_TABLE` | `vm_work_orders` | Source table for the `db` source |
+| `TS_WO_LOOKBACK_DAYS` | `30` | How far back to look for new/changed work orders |
+| `TS_WO_EXCLUDE_VEHICLE_IDS` | `1001,1002,1003` | Placeholder vehicles to ignore (same as the vehicle report) |
+| `TS_WO_COLUMN_MAP` / `TS_WO_STATUS_MAP` / `TS_WO_PRIORITY_MAP` / `TS_WO_CATEGORY_MAP` | – | JSON overrides |
+| `TS_WO_SQL_FILE` | – | Full source-query override |
+| `SAMSARA_WO_LEDGER_FILE` | `OUTPUT_DIR/State/samsara_workorder_ledger.json` | Ledger location |
+| `SAMSARA_WO_LEDGER_SQLITE` | – | Keep the mapping table in a SQLite file (no database server needed); created automatically |
+| `SAMSARA_WO_LEDGER_DSN` / `SAMSARA_WO_LEDGER_TABLE` / `SAMSARA_WO_LEDGER_DIALECT` | – / `samsara_workorder_map` / `mysql` | Keep the mapping table in a MySQL / SQL Server database via ODBC |
+| `TS_DB_HOST` … `TS_DB_PASSWORD` | – | Direct MySQL connection to TraumaSoft (see **Database connection**) |
+| `SYNC_RECIPIENTS` | – | Comma-separated production recipients for the summary email |
+| `TEST_MODE`, `TEST_MODE_RECIPIENT`, `STATUS_EMAIL_RECIPIENT`, `SMTP_*`, `DB_DSN`, `OUTPUT_DIR` | | Shared with the report runner |
+
+The summary email subject gets an `(ATTENTION)` suffix when any work order failed or its vehicle couldn't be matched. Logs go to `OUTPUT_DIR/logs/SamsaraWorkOrderSync_YYYY-MM-DD.log`.
+
+### Scheduling
+
+Run it a few times a day alongside the report runner, e.g.
+
+```cron
+*/30 * * * * /usr/bin/python /path/to/TraumaSoft_Samsara_WorkOrder_Sync.py >> /var/log/samsara_wo_sync.log 2>&1
+```
+
+Samsara limits work order writes to 100/min; the client throttles itself and retries on 429/5xx.
+
+### Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
